@@ -1,0 +1,10 @@
+{
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "supervisor": "./src/deep_data_research_agent/agent.py:graph",
+    "crawl-worker": "./src/deep_data_research_agent/crawl_worker.py:graph"
+  },
+  "env": "./.env"
+}
