@@ -12,6 +12,7 @@ from deep_data_research_agent.backends import (
     create_worker_backend,
 )
 from deep_data_research_agent.config import create_chat_model
+from deep_data_research_agent.identity import user_identity_from_config
 from deep_data_research_agent.model_profile import register_mvp_profile
 from deep_data_research_agent.prompts import CRAWL_WORKER_PROMPT
 from deep_data_research_agent.skill_middleware import (
@@ -57,7 +58,10 @@ async def _ensure_sandbox(
     """Initialize the task sandbox before DeepAgents middleware resolves it."""
 
     thread_id = sandbox_manager.thread_id_from_config(config)
-    await sandbox_manager.SANDBOX_MANAGER.ensure(thread_id)
+    await sandbox_manager.SANDBOX_MANAGER.ensure(
+        thread_id,
+        user_id=user_identity_from_config(config),
+    )
     return {}
 
 

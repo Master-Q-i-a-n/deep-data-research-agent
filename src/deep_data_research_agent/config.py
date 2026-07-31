@@ -47,11 +47,13 @@ class Settings(BaseSettings):
 
     app_env: Literal["development", "production"] = "development"
     local_dev_user_id: str = "local-user"
+    mysql_uri: str = ""
+    auth_session_days: int = Field(default=7, ge=1, le=90)
     mongodb_uri: str = ""
     mongodb_database: str = "deep_data_research_agent"
     mongodb_skill_collection: str = "skill_files"
 
-    artifact_root: Path = Path("data/jobs")
+    artifact_root: Path = Path("data/users")
 
 
 @lru_cache(maxsize=1)

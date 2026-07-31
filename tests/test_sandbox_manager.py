@@ -253,7 +253,13 @@ async def test_export_and_restore_workspace(tmp_path) -> None:
 
     assert exported == 2
     assert (
-        tmp_path / "thread-a" / "crawl-worker" / "workspace" / "report.md"
+        tmp_path
+        / "local-user"
+        / "jobs"
+        / "thread-a"
+        / "crawl-worker"
+        / "workspace"
+        / "report.md"
     ).read_text(encoding="utf-8") == "中文报告"
 
     restored_handle = _handle("sandbox-2")
@@ -277,10 +283,22 @@ async def test_component_workspaces_do_not_collide(tmp_path) -> None:
     await manager.export_workspace("shared", component="supervisor")
 
     assert (
-        tmp_path / "shared" / "crawl-worker" / "workspace" / "report.md"
+        tmp_path
+        / "local-user"
+        / "jobs"
+        / "shared"
+        / "crawl-worker"
+        / "workspace"
+        / "report.md"
     ).read_bytes() == b"crawl"
     assert (
-        tmp_path / "shared" / "supervisor" / "workspace" / "report.md"
+        tmp_path
+        / "local-user"
+        / "jobs"
+        / "shared"
+        / "supervisor"
+        / "workspace"
+        / "report.md"
     ).read_bytes() == b"supervisor"
 
 
@@ -348,6 +366,8 @@ async def test_real_opensandbox_write_execute_and_export(tmp_path) -> None:
         assert await manager.export_workspace(thread_id) == 1
         assert (
             tmp_path
+            / "local-user"
+            / "jobs"
             / thread_id
             / "crawl-worker"
             / "workspace"

@@ -19,6 +19,7 @@ htmlcov/
 coverage/
 build/
 data/
+data/users/
 dist/
 frontend/node_modules/
 frontend/dist/

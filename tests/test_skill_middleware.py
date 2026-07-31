@@ -21,8 +21,9 @@ class FakeManager:
         *,
         component: str,
         network_enabled: bool,
+        user_id: str,
     ) -> None:
-        self.calls.append(("ensure", thread_id, component, network_enabled))
+        self.calls.append(("ensure", thread_id, component, network_enabled, user_id))
 
     async def export_workspace(
         self,
@@ -64,7 +65,7 @@ async def test_supervisor_lifecycle_ensures_and_exports(monkeypatch) -> None:
     await middleware.aafter_agent({}, _runtime())
 
     assert manager.calls == [
-        ("ensure", "thread-a", "supervisor", True),
+        ("ensure", "thread-a", "supervisor", True, "local-user"),
         ("export", "thread-a", "supervisor"),
     ]
 

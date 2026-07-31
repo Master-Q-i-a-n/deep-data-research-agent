@@ -170,20 +170,51 @@ class SandboxManager:
         configured_root = artifact_root or self._settings.artifact_root
         # Resolve once during module initialization, outside ASGI request handling.
         self._artifact_root = configured_root.expanduser().resolve()
-        self._handles: dict[tuple[str, str], _SandboxHandle] = {}
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._handles: dict[tuple[str, str, str], _SandboxHandle] = {}
+        self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._thread_users: dict[str, str] = {}
+
+    def _user_for_thread(self, thread_id: str, user_id: str | None = None) -> str:
+        """Bind a globally unique Agent Protocol thread to one local user path."""
+
+        thread_id = sanitize_thread_id(thread_id)
+        normalized_user = str(user_id or "").strip()
+        existing = self._thread_users.get(thread_id)
+        if normalized_user:
+            if existing is not None and existing != normalized_user:
+                raise RuntimeError("同一 thread_id 不能绑定到不同用户")
+            self._thread_users[thread_id] = normalized_user
+            return normalized_user
+        if existing:
+            return existing
+        fallback = self._settings.local_dev_user_id.strip()
+        if not fallback:
+            raise RuntimeError(f"任务 {thread_id} 尚未绑定用户")
+        self._thread_users[thread_id] = fallback
+        return fallback
 
     def _local_workspace(self, thread_id: str, component: str) -> Path:
         return (
             self._artifact_root
+            / self._user_for_thread(thread_id)
+            / "jobs"
             / sanitize_thread_id(thread_id)
             / component
             / "workspace"
         )
 
-    @staticmethod
-    def _key(thread_id: str, component: str) -> tuple[str, str]:
-        return component, sanitize_thread_id(thread_id)
+    def _key(
+        self,
+        thread_id: str,
+        component: str,
+        user_id: str | None = None,
+    ) -> tuple[str, str, str]:
+        normalized_thread = sanitize_thread_id(thread_id)
+        return (
+            self._user_for_thread(normalized_thread, user_id),
+            component,
+            normalized_thread,
+        )
 
     def _lock_for(self, thread_id: str, component: str) -> asyncio.Lock:
         key = self._key(thread_id, component)
@@ -334,11 +365,12 @@ class SandboxManager:
         *,
         component: str = "crawl-worker",
         network_enabled: bool = False,
+        user_id: str | None = None,
     ) -> OpensandboxBackend:
         """Create, renew, or replace the sandbox for a task."""
 
         thread_id = sanitize_thread_id(thread_id)
-        key = self._key(thread_id, component)
+        key = self._key(thread_id, component, user_id)
         async with self._lock_for(thread_id, component):
             handle = self._handles.get(key)
             if handle is not None:

@@ -13,7 +13,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.store.base import BaseStore
 
 from deep_data_research_agent import sandbox_manager
-from deep_data_research_agent.identity import assigned_skill_namespace
+from deep_data_research_agent.identity import assigned_skill_namespace, user_identity
 
 _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 
@@ -75,6 +75,7 @@ class SandboxLifecycleMiddleware(AgentMiddleware):
             thread_id,
             component=self._component,
             network_enabled=self._network_enabled,
+            user_id=user_identity(runtime),
         )
 
     async def aafter_agent(self, state, runtime):

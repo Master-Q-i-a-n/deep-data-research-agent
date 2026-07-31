@@ -23,11 +23,36 @@ def _server_user_identity(runtime: Any) -> str | None:
     return value or None
 
 
+def user_identity_from_config(config: dict[str, Any] | None) -> str:
+    """Read Agent Server auth fields from a run configuration."""
+
+    configurable = (config or {}).get("configurable", {})
+    identity = configurable.get("langgraph_auth_user_id")
+    if not identity:
+        user = configurable.get("langgraph_auth_user")
+        if isinstance(user, dict):
+            identity = user.get("identity")
+        else:
+            identity = getattr(user, "identity", None)
+    value = str(identity or "").strip()
+    if value:
+        return value
+
+    settings = get_settings()
+    if settings.app_env == "development" and settings.local_dev_user_id.strip():
+        return settings.local_dev_user_id.strip()
+    raise RuntimeError("运行配置未提供经过认证的用户身份")
+
+
 def user_identity(runtime: Any) -> str:
     """Return a trusted identity, with an explicit local-development fallback."""
 
     if identity := _server_user_identity(runtime):
         return identity
+
+    runtime_config = getattr(runtime, "config", None)
+    if runtime_config:
+        return user_identity_from_config(runtime_config)
 
     settings = get_settings()
     if settings.app_env == "development":

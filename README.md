@@ -19,9 +19,10 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
 - 用户动态 Skill 使用 MongoDB `StoreBackend` 按用户和 Agent 隔离，并在每次 run 重新加载。
 - Supervisor 读取 `skill-manage` 后通过 `assign_skill` 一步分配 Skill，不创建 Skill 子智能体。
 - LangSmith 记录 Agent、模型、工具及沙箱生命周期。
-- React 研究工作台，流式展示对话、计划、工具调用和异步任务轨迹。
+- React 三栏研究工作台，左侧显示用户会话，中间流式展示对话，右侧集中显示计划和异步任务轨迹。
+- 可选注册登录；账户、会话、Skill 和检查点按用户隔离，匿名请求使用共享默认账户。
 
-当前不包含通用长期记忆、LangGraph interrupt、登录态网页、Playwright 和完整登录系统。
+当前不包含通用长期记忆、LangGraph interrupt 和 Playwright 网页采集能力。
 
 ## 配置
 
@@ -45,13 +46,23 @@ OPEN_SANDBOX_IMAGE=python:3.13-slim
 APP_ENV=development
 LOCAL_DEV_USER_ID=local-user
 MONGODB_URI=mongodb://127.0.0.1:27017
+MYSQL_URI=mysql+asyncmy://root:your-password@127.0.0.1:3306/deep_data_research_agent?charset=utf8mb4
+AUTH_SESSION_DAYS=7
 ```
 
 不要提交 `.env`，也不要把 API Key 作为命令行参数传递。
 
-动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。开发环境没有认证
-用户时使用 `LOCAL_DEV_USER_ID`；`APP_ENV=production` 时如果 LangGraph Server 没有注入
-认证用户身份，用户级 Skill 读写会明确失败。MongoDB 不配置 TTL 和向量索引。
+首次启动前创建 MySQL 数据库，应用会幂等创建账户、登录令牌和 thread 归属表：
+
+```sql
+CREATE DATABASE deep_data_research_agent
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_0900_ai_ci;
+```
+
+动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。无 Bearer Token 时
+LangGraph Auth 注入共享身份 `local-user`；注册用户使用独立 UUID。MongoDB 不配置 TTL 和
+向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要写入 MySQL。
 
 ## OpenSandbox
 
@@ -65,7 +76,7 @@ OPEN_SANDBOX_TIMEOUT_SECONDS=1800
 ```
 
 每个 thread 按 `supervisor`、`crawl-worker` 组件创建或复用 Agent 沙箱。
-沙箱失效时会创建新实例，并从 `data/jobs/<thread-id>/<component>/workspace/` 恢复上一次
+沙箱失效时会创建新实例，并从 `data/users/<user-id>/jobs/<thread-id>/<component>/workspace/` 恢复上一次
 成功快照。`supervisor` 沙箱已联网（Skill 下载和依赖安装可直接用 `execute`），
 `crawl-worker` 保持断网隔离，Tavily 请求始终由宿主进程完成。
 
@@ -78,10 +89,11 @@ Skill 在 `/skills/main/{name}/` 下创建或下载：下载支持公开 GitHub�
 
 ```powershell
 $env:PYTHONUTF8='1'
-uv run langgraph dev --n-jobs-per-worker 4 --no-browser
+uv run langgraph dev --n-jobs-per-worker 4 --no-browser --no-reload
 ```
 
 Windows 下显式启用 UTF-8，可规避 `langgraph-api` 读取 OpenAPI 文件时使用 GBK 导致的启动错误。
+`--no-reload` 避免 SQLite 的 WAL 文件变化触发开发服务器热重载；修改后端代码后手动重启即可。
 
 同一 `langgraph.json` 只注册两个对外图：
 
@@ -108,7 +120,12 @@ npm run dev
 - 自然语言任务提交与流式 Markdown 报告；
 - DeepAgents todo 计划与 `async_tasks` 任务轨迹；
 - 工具调用输入、结果和运行状态；
-- 停止生成、新建任务及 thread URL 恢复。
+- 停止生成、新建任务及 thread URL 恢复；
+- 当前用户的 Supervisor 会话历史、首条任务标题和历史 thread 切换；
+- 注册、登录、注销和刷新后的登录恢复。
+
+登录、注册或注销后，前端会清除当前 thread 并进入对应身份的新空间。默认账户由所有未登录
+浏览器共享，不会在登录时把其会话或 Skill 复制到个人账户。
 
 ## 交互方式
 
@@ -135,13 +152,15 @@ Skill 流程已简化为一步分配：
 Agent 执行期间文件位于沙箱 `/workspace`；任务成功后按组件合并导出到：
 
 ```text
-data/jobs/<thread-id>/
-├── supervisor/workspace/final_report.md
-└── crawl-worker/workspace/
-    ├── raw/<url-hash>.md
-    ├── *_result.json
-    ├── *_pages.jsonl
-    └── crawl_report.md
+data/users/<user-id>/
+├── checkpoints.sqlite
+└── jobs/<thread-id>/
+    ├── supervisor/workspace/final_report.md
+    └── crawl-worker/workspace/
+        ├── raw/<url-hash>.md
+        ├── *_result.json
+        ├── *_pages.jsonl
+        └── crawl_report.md
 ```
 
 Worker 采集产物位于异步任务 ID 对应的组件目录。`data/` 仅用于本地 MVP，已经加入

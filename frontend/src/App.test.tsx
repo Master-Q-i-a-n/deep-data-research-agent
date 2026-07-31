@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
@@ -66,7 +66,12 @@ vi.mock("@langchain/react", () => ({
 
 beforeEach(() => {
   streamState = createStreamState();
+  window.localStorage.clear();
   vi.spyOn(window, "confirm").mockReturnValue(true);
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => [],
+  }));
 });
 
 afterEach(() => {
@@ -79,9 +84,93 @@ afterEach(() => {
   vi.restoreAllMocks();
   capturedOptions = null;
   window.history.replaceState({}, "", "http://localhost:5174/");
+  window.localStorage.clear();
 });
 
 describe("研究工作台", () => {
+  it("未登录时使用默认账户且不发送认证头", () => {
+    render(<App />);
+
+    expect(screen.getByText("默认账户")).toBeTruthy();
+    expect(capturedOptions?.defaultHeaders).toEqual({});
+  });
+
+  it("注册后保存令牌、切换身份并清空旧 thread", async () => {
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/auth/register")) {
+        return {
+          ok: true,
+          json: async () => ({
+            token: "token-a",
+            user: { id: "user-a", username: "Alice", is_default: false },
+          }),
+        };
+      }
+      if (String(input).endsWith("/auth/me")) {
+        return {
+          ok: true,
+          json: async () => ({ user: { id: "user-a", username: "Alice", is_default: false } }),
+        };
+      }
+      return { ok: true, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "注册" }));
+    fireEvent.change(screen.getByLabelText("用户名"), { target: { value: "Alice" } });
+    fireEvent.change(screen.getByLabelText("密码"), { target: { value: "password8" } });
+    fireEvent.change(screen.getByLabelText("确认密码"), { target: { value: "password8" } });
+    fireEvent.click(screen.getByRole("button", { name: "注册并进入个人空间" }));
+
+    await waitFor(() => expect(window.localStorage.getItem("deep-data-auth-token")).toBe("token-a"));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/auth/register",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(switchThread).toHaveBeenCalledWith(null);
+    await waitFor(() => expect(capturedOptions?.defaultHeaders).toEqual({ Authorization: "Bearer token-a" }));
+  });
+
+  it("列出当前用户的会话并可切换历史 thread", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ([
+        {
+          thread_id: "thread-new",
+          metadata: { kind: "conversation", title: "比较三家产品价格" },
+          status: "idle",
+          updated_at: "2026-08-01T00:10:00Z",
+        },
+        {
+          thread_id: "thread-old",
+          metadata: { kind: "conversation", title: "分析 Tavily 文档" },
+          status: "idle",
+          updated_at: "2026-07-31T23:10:00Z",
+        },
+      ]),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText("比较三家产品价格")).toBeTruthy();
+    expect(screen.getAllByText("分析 Tavily 文档").length).toBeGreaterThan(0);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/threads/search",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const searchOptions = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(searchOptions.body))).toEqual(expect.objectContaining({
+      metadata: { graph_id: "supervisor" },
+      extract: { first_message: "values.messages[0].content" },
+    }));
+
+    fireEvent.click(screen.getByRole("button", { name: /比较三家产品价格/ }));
+    expect(switchThread).toHaveBeenCalledWith("thread-new");
+    expect(window.location.search).toBe("?thread=thread-new");
+  });
+
   it("展示 DeepAgents 计划、异步任务和工具调用", () => {
     render(<App />);
 
@@ -122,6 +211,7 @@ describe("研究工作台", () => {
   });
 
   it("提交自然语言任务到 supervisor", () => {
+    streamState.messages = [];
     render(<App />);
 
     const input = screen.getByLabelText("描述你的网页数据任务");
@@ -131,6 +221,10 @@ describe("研究工作台", () => {
     expect(submit).toHaveBeenCalledWith({
       messages: [{ type: "human", content: "抓取官网并生成报告" }],
     }, {
+      metadata: {
+        kind: "conversation",
+        title: "抓取官网并生成报告",
+      },
       streamResumable: true,
       onDisconnect: "continue",
     });

@@ -1,7 +1,8 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import SessionHistory, { type ConversationThread } from "./SessionHistory";
 import TaskTrace, { type AsyncTask } from "./TaskTrace";
 import TodoPanel, { type TodoItem } from "./TodoPanel";
 import ToolCallCard, { type ToolCard } from "./ToolCallCard";
@@ -26,12 +27,30 @@ type Row =
   | { kind: "tool"; key: string; card: ToolCard };
 
 type SubmitMode = "enqueue" | "interrupt";
+type AuthMode = "login" | "register";
+type AuthUser = {
+  id: string;
+  username: string;
+  is_default: boolean;
+};
+
+const AUTH_TOKEN_KEY = "deep-data-auth-token";
+const DEFAULT_USER: AuthUser = {
+  id: "local-user",
+  username: "默认账户",
+  is_default: true,
+};
 
 const EXAMPLES = [
   "抓取 Tavily Python SDK 文档，整理主要接口和适用场景",
   "搜索近一个月数据分析 Agent 的进展，并比较主要方案",
   "分析指定公开网页中的产品、价格和来源信息",
 ];
+
+function conversationTitle(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 32 ? `${normalized.slice(0, 32)}…` : normalized;
+}
 
 function messageText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -118,13 +137,83 @@ export default function App() {
     () => new URLSearchParams(window.location.search).get("thread") ?? undefined,
   );
   const [input, setInput] = useState("");
+  const [authToken, setAuthToken] = useState<string | null>(
+    () => window.localStorage.getItem(AUTH_TOKEN_KEY),
+  );
+  const [authUser, setAuthUser] = useState<AuthUser>(DEFAULT_USER);
+  const [authMode, setAuthMode] = useState<AuthMode | null>(null);
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authConfirmation, setAuthConfirmation] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [sessions, setSessions] = useState<ConversationThread[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsError, setSessionsError] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
+  const previousLoadingRef = useRef(false);
+  const authHeaders = useMemo<Record<string, string>>(
+    () => {
+      const headers: Record<string, string> = {};
+      if (authToken) headers.Authorization = `Bearer ${authToken}`;
+      return headers;
+    },
+    [authToken],
+  );
+
+  const loadSessions = useCallback(async (signal?: AbortSignal) => {
+    setSessionsLoading(true);
+    setSessionsError("");
+    try {
+      const collected: ConversationThread[] = [];
+      const limit = 100;
+      let offset = 0;
+      while (true) {
+        const response = await fetch(`${apiUrl}/threads/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({
+            metadata: { graph_id: assistantId },
+            limit,
+            offset,
+            sort_by: "updated_at",
+            sort_order: "desc",
+            select: [
+              "thread_id",
+              "created_at",
+              "updated_at",
+              "state_updated_at",
+              "metadata",
+              "status",
+            ],
+            extract: { first_message: "values.messages[0].content" },
+          }),
+          signal,
+        });
+        if (!response.ok) {
+          throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法读取会话记录");
+        }
+        const batch = await response.json() as ConversationThread[];
+        if (!Array.isArray(batch)) throw new Error("会话服务返回了无效数据");
+        collected.push(...batch);
+        if (batch.length < limit) break;
+        offset += limit;
+      }
+      setSessions(collected);
+    } catch (error) {
+      if (signal?.aborted) return;
+      setSessionsError(error instanceof Error ? error.message : "暂时无法读取会话记录");
+    } finally {
+      if (!signal?.aborted) setSessionsLoading(false);
+    }
+  }, [apiUrl, assistantId, authHeaders]);
 
   const stream = useStream<StreamState>({
     apiUrl,
     assistantId,
     threadId,
     reconnectOnMount: true,
+    defaultHeaders: authHeaders,
     onThreadId: (id) => {
       setThreadId(id);
       const url = new URL(window.location.href);
@@ -142,6 +231,46 @@ export default function App() {
   const runningTaskCount = tasks.filter(
     (task) => task.status === "running" || task.status === "pending",
   ).length;
+  const identitySwitchBlocked = stream.isLoading || stream.queue.size > 0 || runningTaskCount > 0;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadSessions(controller.signal);
+    return () => controller.abort();
+  }, [loadSessions]);
+
+  useEffect(() => {
+    if (previousLoadingRef.current && !stream.isLoading) void loadSessions();
+    previousLoadingRef.current = stream.isLoading;
+  }, [loadSessions, stream.isLoading]);
+
+  useEffect(() => {
+    if (!authToken) {
+      setAuthUser(DEFAULT_USER);
+      return;
+    }
+    const controller = new AbortController();
+    void fetch(`${apiUrl}/auth/me`, {
+      headers: authHeaders,
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "账户服务不可用");
+        return response.json() as Promise<{ user: AuthUser }>;
+      })
+      .then(({ user }) => setAuthUser(user))
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        const message = error instanceof Error ? error.message : "账户服务不可用";
+        setAuthError(message);
+        if (message.includes("登录已失效")) {
+          window.localStorage.removeItem(AUTH_TOKEN_KEY);
+          setAuthToken(null);
+          setAuthUser(DEFAULT_USER);
+        }
+      });
+    return () => controller.abort();
+  }, [apiUrl, authHeaders, authToken]);
 
   useEffect(() => {
     // jsdom 等非完整浏览器环境可能不提供 scrollIntoView。
@@ -160,6 +289,12 @@ export default function App() {
       { messages: [{ type: "human", content: value }] },
       {
         ...multitaskOptions,
+        ...(!threadId && stream.messages.length === 0 ? {
+          metadata: {
+            kind: "conversation",
+            title: conversationTitle(value),
+          },
+        } : {}),
         streamResumable: true,
         onDisconnect: "continue",
       },
@@ -219,6 +354,91 @@ export default function App() {
     window.history.replaceState({}, "", window.location.pathname);
   }
 
+  function selectSession(nextThreadId: string) {
+    if (nextThreadId === threadId || stream.isLoading || stream.queue.size > 0) return;
+    stream.switchThread(nextThreadId);
+    setThreadId(nextThreadId);
+    setInput("");
+    const url = new URL(window.location.href);
+    url.searchParams.set("thread", nextThreadId);
+    window.history.replaceState({}, "", url);
+  }
+
+  function resetThreadForIdentityChange() {
+    stream.switchThread(null);
+    setThreadId(undefined);
+    setInput("");
+    window.history.replaceState({}, "", window.location.pathname);
+  }
+
+  function openAuth(mode: AuthMode) {
+    if (identitySwitchBlocked) return;
+    setAuthMode(mode);
+    setAuthUsername("");
+    setAuthPassword("");
+    setAuthConfirmation("");
+    setAuthError("");
+  }
+
+  async function submitAuth(event: FormEvent) {
+    event.preventDefault();
+    if (!authMode) return;
+    setAuthSubmitting(true);
+    setAuthError("");
+    const payload = authMode === "register"
+      ? {
+          username: authUsername,
+          password: authPassword,
+          confirm_password: authConfirmation,
+        }
+      : { username: authUsername, password: authPassword };
+    try {
+      const response = await fetch(`${apiUrl}/auth/${authMode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await response.json() as {
+        token?: string;
+        user?: AuthUser;
+        detail?: string | Array<{ msg?: string }>;
+      };
+      if (!response.ok || !body.token || !body.user) {
+        const detail = Array.isArray(body.detail)
+          ? body.detail.map((item) => item.msg).filter(Boolean).join("；")
+          : body.detail;
+        throw new Error(detail || "账户操作失败，请检查输入后重试");
+      }
+      window.localStorage.setItem(AUTH_TOKEN_KEY, body.token);
+      setAuthToken(body.token);
+      setAuthUser(body.user);
+      setAuthMode(null);
+      resetThreadForIdentityChange();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "账户服务不可用");
+    } finally {
+      setAuthSubmitting(false);
+    }
+  }
+
+  async function logout() {
+    if (!authToken || identitySwitchBlocked) return;
+    setAuthError("");
+    try {
+      const response = await fetch(`${apiUrl}/auth/logout`, {
+        method: "POST",
+        headers: authHeaders,
+      });
+      if (!response.ok) throw new Error("注销失败，请稍后重试");
+      window.localStorage.removeItem(AUTH_TOKEN_KEY);
+      setAuthToken(null);
+      setAuthUser(DEFAULT_USER);
+      resetThreadForIdentityChange();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "账户服务不可用");
+    }
+  }
+
   return (
     <div className="workspace-shell">
       <aside className="sidebar">
@@ -239,14 +459,37 @@ export default function App() {
           <button type="button" onClick={startNewThread}>开始新任务</button>
         </div>
 
-        <TaskTrace
-          tasks={tasks}
-          onCheck={checkTask}
-          onUpdate={updateTask}
-          onCancel={cancelTask}
-          onRefresh={refreshTasks}
+        <SessionHistory
+          sessions={sessions}
+          currentThreadId={threadId}
+          loading={sessionsLoading}
+          error={sessionsError}
+          switchingDisabled={stream.isLoading || stream.queue.size > 0}
+          onSelect={selectSession}
+          onRefresh={() => void loadSessions()}
         />
-        <TodoPanel todos={todos} />
+
+        <section className="account-card" aria-label="当前账户">
+          <div className="account-card__identity">
+            <span aria-hidden="true">{authUser.is_default ? "访" : authUser.username.slice(0, 1).toUpperCase()}</span>
+            <div>
+              <small>{authUser.is_default ? "共享身份" : "个人空间"}</small>
+              <strong>{authUser.username}</strong>
+            </div>
+          </div>
+          {authUser.is_default ? (
+            <div className="account-card__actions">
+              <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("login")}>登录</button>
+              <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("register")}>注册</button>
+            </div>
+          ) : (
+            <button className="account-card__logout" type="button" disabled={identitySwitchBlocked} onClick={() => void logout()}>
+              注销并切回默认账户
+            </button>
+          )}
+          {identitySwitchBlocked ? <p>结束当前运行和后台任务后可切换账户。</p> : null}
+          {!authMode && authError ? <p className="account-card__error">{authError}</p> : null}
+        </section>
 
         <div className="sidebar-foot">
           <span>Agent API</span>
@@ -398,6 +641,92 @@ export default function App() {
           </div>
         </form>
       </main>
+
+      <aside className="operations-rail" aria-label="研究执行状态">
+        <TaskTrace
+          tasks={tasks}
+          onCheck={checkTask}
+          onUpdate={updateTask}
+          onCancel={cancelTask}
+          onRefresh={refreshTasks}
+        />
+        <TodoPanel todos={todos} />
+      </aside>
+
+      {authMode ? (
+        <div className="auth-overlay" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !authSubmitting) setAuthMode(null);
+        }}>
+          <section className="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+            <header>
+              <div>
+                <p className="eyebrow">身份空间</p>
+                <h2 id="auth-title">{authMode === "login" ? "登录深研" : "创建账户"}</h2>
+              </div>
+              <button type="button" disabled={authSubmitting} onClick={() => setAuthMode(null)} aria-label="关闭账户窗口">×</button>
+            </header>
+            <p className="auth-dialog__lead">
+              {authMode === "login"
+                ? "登录后只加载你的会话、Skill 和研究文件。"
+                : "创建独立的数据空间；默认账户内容不会复制进来。"}
+            </p>
+            <form onSubmit={(event) => void submitAuth(event)}>
+              <label>
+                用户名
+                <input
+                  autoFocus
+                  autoComplete="username"
+                  minLength={3}
+                  maxLength={32}
+                  pattern={"[A-Za-z0-9][A-Za-z0-9_\\-]{2,31}"}
+                  value={authUsername}
+                  onChange={(event) => setAuthUsername(event.target.value)}
+                  placeholder="3–32 位英文标识符"
+                  required
+                />
+              </label>
+              <label>
+                密码
+                <input
+                  type="password"
+                  autoComplete={authMode === "login" ? "current-password" : "new-password"}
+                  minLength={authMode === "register" ? 8 : 1}
+                  maxLength={128}
+                  value={authPassword}
+                  onChange={(event) => setAuthPassword(event.target.value)}
+                  placeholder={authMode === "register" ? "至少 8 个字符" : "输入密码"}
+                  required
+                />
+              </label>
+              {authMode === "register" ? (
+                <label>
+                  确认密码
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    minLength={8}
+                    maxLength={128}
+                    value={authConfirmation}
+                    onChange={(event) => setAuthConfirmation(event.target.value)}
+                    placeholder="再次输入密码"
+                    required
+                  />
+                </label>
+              ) : null}
+              {authError ? <p className="auth-dialog__error" role="alert">{authError}</p> : null}
+              <button className="auth-dialog__submit" type="submit" disabled={authSubmitting}>
+                {authSubmitting ? "正在处理…" : authMode === "login" ? "登录并进入个人空间" : "注册并进入个人空间"}
+              </button>
+            </form>
+            <button className="auth-dialog__switch" type="button" disabled={authSubmitting} onClick={() => {
+              setAuthMode(authMode === "login" ? "register" : "login");
+              setAuthError("");
+            }}>
+              {authMode === "login" ? "还没有账户？注册" : "已有账户？登录"}
+            </button>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

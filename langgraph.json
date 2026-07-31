@@ -9,5 +9,25 @@
   "store": {
     "path": "./src/deep_data_research_agent/mongodb_store.py:create_mongodb_store"
   },
+  "checkpointer": {
+    "path": "./src/deep_data_research_agent/user_checkpointer.py:create_user_checkpointer"
+  },
+  "auth": {
+    "path": "./src/deep_data_research_agent/auth.py:auth"
+  },
+  "http": {
+    "app": "./src/deep_data_research_agent/webapp.py:app",
+    "enable_custom_route_auth": true,
+    "middleware_order": "auth_first",
+    "cors": {
+      "allow_origins": [
+        "http://127.0.0.1:5174",
+        "http://localhost:5174"
+      ],
+      "allow_methods": ["*"],
+      "allow_headers": ["Authorization", "Content-Type"],
+      "allow_credentials": false
+    }
+  },
   "env": "./.env"
 }
