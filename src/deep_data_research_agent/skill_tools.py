@@ -3,6 +3,10 @@
 用户在 supervisor 沙箱的 /skills/main/{name}/ 中创建或下载 Skill 并通过 execute 完成测试后，
 调用 assign_skill 一步将其持久化到 MongoDB 并分配给目标 Agent。下一轮对话由
 UserSkillsRestoreMiddleware 从 MongoDB 恢复到 /persisted-skills/。
+
+路径映射：/skills/main/{name}/ 是 VFS 虚拟路径，经 CompositeBackend 的 /skills/main/
+路由映射到沙箱物理路径 /{name}/（前缀被剥掉并重新以 / 开头）。因此 assign_skill
+一律按物理路径 /{name}/ 读取与清理，否则读不到 write_file 真正写入的文件。
 """
 
 from __future__ import annotations
@@ -85,17 +89,96 @@ def _file_store_value(content: bytes) -> dict[str, str]:
     }
 
 
-async def _read_skill_files(backend, root: str) -> list[tuple[str, bytes]]:
-    result = await backend.aglob("**/*", path=root)
-    if result.error:
-        raise RuntimeError(f"无法枚举 Skill 目录：{result.error}")
-    paths = [
-        str(item["path"])
-        for item in result.matches or []
-        if not item.get("is_dir")
+def _physical_staging_dir(name: str) -> str:
+    """返回 Skill 暂存区的物理路径。
+
+    VFS /skills/main/{name} 经 CompositeBackend 的 /skills/main/ 路由剥掉前缀并重新
+    以 / 开头，落在沙箱物理 /{name}。assign_skill 必须按物理路径读写，否则读不到
+    write_file 真正写入的文件。
+    """
+
+    return f"/{name}"
+
+
+def _abs_physical(physical_root: str, relative: str) -> str:
+    """把 aglob 返回的（相对物理根的）路径规整为绝对物理路径。"""
+
+    path = PurePosixPath(relative)
+    if path.is_absolute():
+        return path.as_posix()
+    return (PurePosixPath(physical_root) / path).as_posix()
+
+
+async def _enumerate_physical_files(
+    backend,
+    physical_root: str,
+    vfs_root: str,
+) -> list[str]:
+    """枚举暂存目录下的所有文件（绝对物理路径）。
+
+    优先用 aglob；若 aglob 返回空或报错（曾出现目录有文件但 aglob 为空的情形），
+    改用单值 JSON 输出兜底，仍为空则区分「目录不存在」与「目录为空」报错。
+    """
+
+    result = await backend.aglob("**/*", path=physical_root)
+    paths: list[str] = []
+    if not result.error:
+        for item in result.matches or []:
+            if item.get("is_dir"):
+                continue
+            paths.append(_abs_physical(physical_root, str(item["path"])))
+    if paths:
+        return paths
+
+    # OpenSandbox 当前会直接拼接 stdout 日志块，多行 find 输出可能失去换行。
+    # 改为输出单个 JSON 数组，使文件列表不依赖日志中的行分隔符。
+    script = (
+        "import json, os; "
+        f"root = {physical_root!r}; "
+        "paths = sorted("
+        "os.path.join(base, name) "
+        "for base, _, names in os.walk(root) "
+        "for name in names "
+        "if not os.path.islink(os.path.join(base, name))"
+        "); "
+        "print(json.dumps(paths, ensure_ascii=False))"
+    )
+    probe = await backend.aexecute(
+        f"python3 -c {shlex.quote(script)}",
+        timeout=30,
+    )
+    output = (probe.output or "").strip()
+    try:
+        decoded = json.loads(output) if output else []
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("无法解析沙箱返回的 Skill 文件列表") from exc
+    found = [
+        path
+        for path in decoded
+        if isinstance(path, str) and path.startswith(f"{physical_root}/")
     ]
-    if not paths:
-        raise RuntimeError(f"Skill 目录 {root}/ 不存在或为空")
+    if not found:
+        if probe.exit_code not in {None, 0}:
+            raise RuntimeError(
+                f"Skill 目录不存在：VFS {vfs_root}/（物理 {physical_root}/）"
+            )
+        raise RuntimeError(
+            f"Skill 目录 {vfs_root}/ 不存在或为空（物理 {physical_root}/）"
+        )
+    return found
+
+
+async def _read_skill_files(
+    backend,
+    physical_root: str,
+    vfs_root: str,
+) -> list[tuple[str, bytes]]:
+    """读取 Skill 暂存目录的全部文件，返回 (相对路径, 内容) 列表。
+
+    physical_root 是沙箱物理路径；vfs_root 仅用于错误信息中的 VFS 视图。
+    """
+
+    paths = await _enumerate_physical_files(backend, physical_root, vfs_root)
     responses = await backend.adownload_files(paths)
     files: list[tuple[str, bytes]] = []
     for response in responses:
@@ -104,12 +187,14 @@ async def _read_skill_files(backend, root: str) -> list[tuple[str, bytes]]:
                 f"无法读取 Skill 文件 {response.path}：{response.error or '内容为空'}"
             )
         absolute = PurePosixPath(response.path)
-        if not absolute.is_relative_to(root):
+        if not absolute.is_relative_to(physical_root):
             raise RuntimeError(f"Skill 文件越过根目录：{response.path}")
-        relative = absolute.relative_to(root).as_posix()
+        relative = absolute.relative_to(physical_root).as_posix()
         files.append((relative, response.content))
     if not any(relative == "SKILL.md" for relative, _ in files):
-        raise RuntimeError(f"Skill {root}/ 缺少根级 SKILL.md")
+        raise RuntimeError(
+            f"Skill {vfs_root}/ 缺少根级 SKILL.md（物理 {physical_root}/）"
+        )
     return sorted(files)
 
 
@@ -141,7 +226,8 @@ async def assign_skill(
         component=_COMPONENT,
     )
     source_dir = f"/skills/main/{name}"
-    files = await _read_skill_files(backend, source_dir)
+    physical_dir = _physical_staging_dir(name)
+    files = await _read_skill_files(backend, physical_dir, source_dir)
 
     user_ns = user_hash(runtime)
     for target in normalized_targets:
@@ -167,7 +253,7 @@ async def assign_skill(
         )
 
     cleanup = await backend.aexecute(
-        f"rm -rf {shlex.quote(source_dir)}",
+        f"rm -rf {shlex.quote(physical_dir)}",
         timeout=30,
     )
     if cleanup.exit_code not in {None, 0}:

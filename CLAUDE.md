@@ -111,7 +111,14 @@ create/download under `/skills/main/{name}/` (via `write_file`/`execute` in the 
 sandbox) → test manually (`ls`/`read_file`/`execute`, `pip install` if needed) →
 `assign_skill(name, targets)` persists every file to MongoDB under
 `(user_hash, "skills", "assigned", target)` as `/active/{name}/**` plus a `/manifests/{name}.json`
-marker, then cleans up `/skills/main/{name}`.
+marker, then cleans up the staging dir.
+
+**Path mapping (important):** `/skills/main/{name}/` is a VFS path. The `CompositeBackend` `/skills/main/`
+route strips the prefix and re-roots with `/`, so files actually live at the sandbox's physical `/{name}/`.
+`assign_skill` reads and cleans up by **physical path `/{name}/`** — never read the raw backend with the
+literal `/skills/main/...` path (it won't match what `write_file` wrote). The model's `ls` on
+`/skills/main/{name}` works, but `glob` on that route is unreliable (relative-path remap corruption /
+whole-FS scan) — SKILL.md tells the model to verify with `read_file`/`ls` instead.
 
 Invariants: candidates must live under `/skills/main/`; SKILL.md frontmatter must be exactly
 `{name, description}` with `name == dir name`; the only tool in `skill_tools.py` is `assign_skill`
