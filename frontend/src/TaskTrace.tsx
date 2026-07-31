@@ -20,8 +20,8 @@ export type AsyncTask = {
 
 const STATUS_LABEL: Record<AsyncTaskStatus, string> = {
   pending: "等待启动",
-  running: "采集中",
-  success: "已完成",
+  running: "运行中",
+  success: "运行完成",
   error: "失败",
   cancelled: "已取消",
   timeout: "已超时",
@@ -82,7 +82,7 @@ export default function TaskTrace({
     >
       <div className="side-section__heading">
         <div>
-          <p className="eyebrow">采集轨迹</p>
+          <p className="eyebrow">任务轨迹</p>
           <h2 id="trace-title">任务控制台</h2>
         </div>
         <div className="trace-heading__actions">
@@ -101,7 +101,7 @@ export default function TaskTrace({
       {tasks.length === 0 ? (
         <div className="trace-empty">
           <span className="trace-empty__node" aria-hidden="true" />
-          <p>还没有网页采集任务。</p>
+          <p>还没有后台任务。</p>
         </div>
       ) : (
         <ol className="trace-list">
@@ -143,7 +143,7 @@ export default function TaskTrace({
                     className="task-update"
                     onSubmit={(event) => submitUpdate(event, task.task_id)}
                   >
-                    <label htmlFor={`task-update-${task.task_id}`}>补充采集要求</label>
+                    <label htmlFor={`task-update-${task.task_id}`}>补充任务要求</label>
                     <textarea
                       id={`task-update-${task.task_id}`}
                       rows={3}

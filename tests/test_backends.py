@@ -2,53 +2,93 @@ from types import SimpleNamespace
 
 import pytest
 from blockbuster import blockbuster_ctx
-from deepagents.backends import FilesystemBackend
+from deepagents.backends import StoreBackend
+from deepagents_opensandbox import OpensandboxBackend
 
-from deep_data_research_agent import backends
+from deep_data_research_agent import backends, sandbox_manager
 
 
 def _runtime(thread_id: str) -> SimpleNamespace:
     return SimpleNamespace(
-        config={"configurable": {"thread_id": thread_id}},
+        execution_info=SimpleNamespace(thread_id=thread_id),
         state={},
     )
 
 
-def test_workspace_root_is_scoped_and_sanitized(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(backends, "ARTIFACT_ROOT", tmp_path.resolve())
+def _sandbox_backend(sandbox_id: str) -> OpensandboxBackend:
+    return OpensandboxBackend(sandbox=SimpleNamespace(id=sandbox_id))
 
-    assert backends.workspace_root(_runtime("user/thread:1")) == (
-        tmp_path.resolve() / "user_thread_1" / "workspace"
+
+@pytest.fixture
+def initialized_backends(monkeypatch):
+    values = {
+        "supervisor": _sandbox_backend("supervisor-box"),
+        "crawl-worker": _sandbox_backend("crawl-box"),
+    }
+
+    def get_backend(_thread_id: str, *, component: str = "crawl-worker"):
+        return values[component]
+
+    monkeypatch.setattr(
+        sandbox_manager.SANDBOX_MANAGER,
+        "get_backend",
+        get_backend,
+    )
+    return values
+
+
+def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
+    runtime = _runtime("thread-a")
+
+    supervisor = backends.create_backend(runtime)
+    crawl = backends.create_worker_backend(runtime)
+
+    assert supervisor.default is initialized_backends["supervisor"]
+    assert crawl.default is initialized_backends["crawl-worker"]
+    assert set(supervisor.routes) == {
+        "/state/",
+        "/skills/",
+        "/skills/main/",
+        "/persisted-skills/",
+    }
+    assert set(crawl.routes) == {
+        "/state/",
+        "/skills/",
+        "/skills/main/",
+        "/persisted-skills/",
+    }
+    assert supervisor.routes["/skills/main/"] is supervisor.default
+    assert crawl.routes["/skills/main/"] is crawl.default
+    assert all(
+        backend.artifacts_root == "/state"
+        for backend in (supervisor, crawl)
     )
 
 
-def test_workspace_files_are_isolated_by_thread(tmp_path, monkeypatch) -> None:
-    # FilesystemBackend 在测试进入异步路径前初始化，模拟生产模块加载阶段。
-    filesystem = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
-    monkeypatch.setattr(backends, "_WORKSPACE_FILESYSTEM", filesystem)
+def test_persisted_skill_route_uses_store_backend(initialized_backends) -> None:
+    backend = backends.create_backend(_runtime("thread-a"))
 
-    first = backends.create_backend(_runtime("thread-a"))
-    second = backends.create_backend(_runtime("thread-b"))
-
-    assert first.write("/workspace/report.md", "A").error is None
-    assert second.write("/workspace/report.md", "B").error is None
-    assert (tmp_path / "thread-a" / "workspace" / "report.md").read_text(encoding="utf-8") == "A"
-    assert (tmp_path / "thread-b" / "workspace" / "report.md").read_text(encoding="utf-8") == "B"
+    assert isinstance(backend.routes["/persisted-skills/"], StoreBackend)
+    assert "/user-skills/" not in backend.routes
+    assert "/memories/" not in backend.routes
 
 
 @pytest.mark.asyncio
-async def test_backend_factory_and_async_skill_read_do_not_block_event_loop() -> None:
-    # 与 `langgraph dev` 相同，BlockBuster 会拦截事件循环中的同步文件调用。
+async def test_backend_factory_and_async_skill_read_do_not_block_event_loop(
+    initialized_backends,
+) -> None:
     with blockbuster_ctx(scanned_modules=["deep_data_research_agent"]):
         backend = backends.create_backend(_runtime("thread-async"))
-        result = await backend.als("/skills/worker/")
+        result = await backend.als("/skills/supervisor/")
 
     assert result.error is None
     assert result.entries
-    assert result.entries[0]["path"].endswith("/tavily-crawling/")
+    assert result.entries[0]["path"].endswith("/evidence-reporting/")
 
 
-def test_backend_exposes_worker_and_supervisor_skills() -> None:
+def test_backend_exposes_worker_and_supervisor_skills(
+    initialized_backends,
+) -> None:
     backend = backends.create_backend(_runtime("thread-1"))
 
     assert backend.ls("/skills/worker/").entries[0]["path"].endswith(

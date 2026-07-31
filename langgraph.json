@@ -6,5 +6,8 @@
     "supervisor": "./src/deep_data_research_agent/agent.py:graph",
     "crawl-worker": "./src/deep_data_research_agent/crawl_worker.py:graph"
   },
+  "store": {
+    "path": "./src/deep_data_research_agent/mongodb_store.py:create_mongodb_store"
+  },
   "env": "./.env"
 }

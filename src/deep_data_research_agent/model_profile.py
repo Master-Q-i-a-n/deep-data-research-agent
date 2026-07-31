@@ -13,19 +13,21 @@ from deep_data_research_agent.prompts import (
 
 
 def register_mvp_profile() -> None:
-    """Disable host execution and the implicit synchronous subagent.
-
-    The application uses only the explicitly configured ASGI async worker in
-    this phase. Provider-level registration also works for pre-built
-    ``ChatOpenAI`` instances.
-    """
+    """Register separate Supervisor and crawl-worker harness profiles."""
 
     register_harness_profile(
         "openai",
         HarnessProfile(
             base_system_prompt=BASE_AGENT_PROMPT,
             tool_description_overrides=TOOL_DESCRIPTION_OVERRIDES,
-            excluded_tools=frozenset({"execute"}),
+            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        ),
+    )
+    register_harness_profile(
+        "deep-data-worker",
+        HarnessProfile(
+            base_system_prompt=BASE_AGENT_PROMPT,
+            tool_description_overrides=TOOL_DESCRIPTION_OVERRIDES,
             general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
         ),
     )

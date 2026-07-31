@@ -1,5 +1,5 @@
-import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,17 +16,20 @@ def test_public_url_normalizes_fragment_and_rejects_localhost() -> None:
 
 @pytest.mark.asyncio
 async def test_persist_result_writes_manifest_pages_and_content(
-    tmp_path,
     monkeypatch,
 ) -> None:
-    real_to_thread = asyncio.to_thread
-    offloaded_functions: list[str] = []
+    uploaded: list[tuple[str, bytes]] = []
 
-    async def record_to_thread(function, /, *args, **kwargs):
-        offloaded_functions.append(function.__name__)
-        return await real_to_thread(function, *args, **kwargs)
+    class FakeManager:
+        async def upload_workspace_files(self, thread_id, files) -> None:
+            assert thread_id == "thread-1"
+            uploaded.extend(files)
 
-    monkeypatch.setattr(tavily_tools.asyncio, "to_thread", record_to_thread)
+    monkeypatch.setattr(
+        tavily_tools.sandbox_manager,
+        "SANDBOX_MANAGER",
+        FakeManager(),
+    )
 
     response = {
         "results": [
@@ -46,17 +49,19 @@ async def test_persist_result_writes_manifest_pages_and_content(
         response=response,
         mode="crawl",
         subject="example",
-        root=tmp_path,
+        runtime=SimpleNamespace(
+            config={"configurable": {"thread_id": "thread-1"}},
+        ),
     )
 
     assert manifest["page_count"] == 1
-    assert "mkdir" in offloaded_functions
     assert manifest["pages"][0]["content_path"].startswith("/workspace/raw/")
-    assert (tmp_path / "crawl_pages.jsonl").is_file()
-    assert (tmp_path / "crawl_result.json").is_file()
+    saved_files = {path: content for path, content in uploaded}
+    assert "/workspace/crawl_pages.jsonl" in saved_files
+    assert "/workspace/crawl_result.json" in saved_files
 
-    saved = json.loads((tmp_path / "crawl_result.json").read_text(encoding="utf-8"))
+    saved = json.loads(saved_files["/workspace/crawl_result.json"])
     content_name = saved["pages"][0]["content_path"].split("/")[-1]
-    assert (tmp_path / "raw" / content_name).read_text(encoding="utf-8") == (
+    assert saved_files[f"/workspace/raw/{content_name}"].decode("utf-8") == (
         "# Example\n\n42 rows"
     )

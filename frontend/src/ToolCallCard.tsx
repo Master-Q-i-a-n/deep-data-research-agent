@@ -10,11 +10,12 @@ export type ToolCard = {
 
 const TOOL_LABELS: Record<string, string> = {
   write_todos: "更新研究计划",
-  start_async_task: "启动网页采集",
-  check_async_task: "检查采集进度",
-  update_async_task: "补充采集要求",
+  start_async_task: "启动后台任务",
+  check_async_task: "检查任务进度",
+  update_async_task: "补充任务要求",
   cancel_async_task: "取消采集任务",
   list_async_tasks: "读取任务列表",
+  assign_skill: "分配 Skill",
   write_file: "写入研究产物",
   read_file: "读取研究产物",
   edit_file: "编辑研究产物",

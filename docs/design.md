@@ -1,15 +1,12 @@
 # Deep Data Research Agent 设计说明
 
-> 状态：整体架构草案；当前第一阶段 MVP 使用 Tavily 与单个异步 crawl-worker  
-> 更新日期：2026-07-27  
+> 状态：当前 MVP 使用 Tavily、异步 crawl-worker、Supervisor 直管 Skill、OpenSandbox 与 MongoDB；更新日期：2026-07-31
 > 未确认的技术选型以“暂定”标记，后续讨论后更新。
-
 ## 1. 项目背景
 
 本项目拟建设一个面向多用户的数据研究与分析 Agent。系统以网页数据采集为首要入口，后续扩展 CSV、Excel、Parquet 等本地数据源。Agent 能够理解自然语言任务、制定计划、采集网页、生成并执行数据分析脚本，最终返回简要结论和完整 Markdown 报告。
 
 项目将深度使用 DeepAgents，而不是只使用其工具调用循环：集成 plan/todo、同步与异步子 Agent、Skills、上下文管理、长期记忆、interrupt、文件后端、沙箱和 LangSmith 观测。
-
 参考项目为 `E:\MyWork\Agent\deepagent`。其 LangGraph 服务、DeepAgent、React `useStream`、todo 和工具卡片可复用，但多用户、安全、持久化和异步任务需要重新设计。
 
 ## 2. 建设目标
@@ -45,8 +42,12 @@ flowchart LR
     A --> S["Supervisor DeepAgent"]
     S --> P["site-profiler<br/>同步子 Agent"]
     S --> C["crawl-worker<br/>异步子 Agent"]
+    S --> K["skill-manage<br/>直接工具流程"]
     S --> D["analysis-worker<br/>异步子 Agent"]
-    C --> O["Artifact Store"]
+    S --> X["OpenSandbox<br/>每 thread/组件一个"]
+    C --> X
+    K --> M["MongoDB Skill Store"]
+    X --> O["本地 Artifact 快照"]
     D --> O
     O --> S
     S --> R["简要结论 + Markdown 报告"]
@@ -63,7 +64,7 @@ flowchart LR
 - 与用户交互，使用内置 `write_todos` 创建和更新计划。
 - 将稳定计划写入 task manifest，支持恢复和审计。
 - 调用同步/异步子 Agent，在高风险或高成本动作前触发 interrupt。
-- 汇总结构化结果并生成最终 Markdown，不直接执行大规模采集和分析。
+- 汇总结构化结果并生成最终 Markdown，仅在沙箱执行必要的数据分析脚本。
 
 ### 6.2 site-profiler 同步子 Agent
 
@@ -92,14 +93,14 @@ flowchart LR
 | 能力 | 设计 |
 |---|---|
 | Plan | `write_todos` 展示实时计划，task manifest 保存稳定计划 |
-| Skills | 为不同 Agent 显式分配只读技能，按需加载 |
-| Subagent | site-profiler 使用同步子 Agent |
+| Skills | 内置 Skill 同步到沙箱；MongoDB active Skill 只读恢复并按需加载 |
+| Subagent | site-profiler 后续使用同步子 Agent；Skill 管理不使用子 Agent |
 | Async Subagent | crawl-worker、analysis-worker 使用 Agent Protocol |
 | Context | 对话、state、workspace、artifact、memory 分层管理 |
-| Memory | StoreBackend 保存用户偏好和已确认经验 |
+| Memory | MongoDB StoreBackend 保存用户动态 Skill；通用记忆后续实现 |
 | Interrupt | 审批采集范围、登录态、成本、联网和共享记忆写入 |
-| Backend | CompositeBackend 路由沙箱、skills、memory 和 artifact |
-| Sandbox | 每个任务独立环境，限制资源、文件和网络 |
+| Backend | 全部 Agent 使用 OpenSandbox 默认后端，State/Skills/main/持久化 Skills 独立路由 |
+| Sandbox | Supervisor 联网（Skill 下载/安装）；crawl 禁网；Tavily 请求始终宿主进程 |
 | Streaming | 流式输出消息、todo、工具、进度和 interrupt |
 | Observability | LangSmith 自动 tracing 加业务自定义 spans |
 
@@ -112,7 +113,7 @@ flowchart LR
 - `data-quality-analysis`：缺失、异常、类型和统计验证。
 - `evidence-reporting`：证据引用、局限说明和 Markdown 报告。
 
-Skills 默认由开发者维护并只读；复杂说明放入 `reference/`，`SKILL.md` 保持精简。自定义子 Agent 必须显式配置所需 Skills。
+内置 Skills 随代码只读发布并同步到沙箱；Supervisor 读取统一 `skill-manage` 后在 `/skills/main/` 创建或下载 Skill、用 `execute` 测试，再通过单个 `assign_skill` 一步分配并持久化，不创建 Skill 专用 LangGraph 或子智能体。用户 Skill 写入 MongoDB active 目录，于每轮恢复到目标沙箱。下载依赖已联网的 supervisor 沙箱，解压拒绝路径穿越与链接。
 
 ## 9. 上下文与长期记忆
 
@@ -138,7 +139,7 @@ Skills 默认由开发者维护并只读；复杂说明放入 `reference/`，`SK
 
 ## 11. 多用户、安全与 HITL
 
-- 认证暂定采用 JWT，身份包含 `org_id` 和 `user_id`。
+- 生产身份读取 LangGraph Server 认证用户；开发环境使用显式 `LOCAL_DEV_USER_ID` 回退。
 - Agent Server 按 metadata 校验 thread、run、assistant 和 store 权限。
 - 身份字段由服务端 Runtime Context 注入，禁止模型自行生成。
 - URL 访问必须防止 SSRF、内网地址访问和危险重定向。
@@ -168,10 +169,10 @@ Skills 默认由开发者维护并只读；复杂说明放入 `reference/`，`SK
 - Python 3.13，uv 管理依赖，DeepAgents 暂定 `>=0.6.12,<0.7`。
 - 服务使用 LangGraph Agent Server；开发期使用 `langgraph dev`。
 - 部署暂定 LangSmith Deployment，保留自托管 Agent Server 方案。
-- 沙箱暂定 LangSmith Sandbox，并通过 SandboxBackendProtocol 保持可替换。
+- 沙箱首版采用 OpenSandbox 与官方 `OpensandboxBackend`，不增加自定义协议适配层。
 - 分析使用 DuckDB、Polars、pandas、PyArrow。
 - MVP 采集使用 Tavily Search/Crawl/Extract；自建抓取与 Playwright 后续再评估。
-- 持久化暂定 PostgreSQL checkpointer/store。
+- 用户动态 Skill 使用 MongoDB StoreBackend；checkpointer 仍沿用 Agent Server 默认实现。
 - Artifact 暂定 S3/MinIO 兼容对象存储。
 - 前端已使用 React + `@langchain/react` 的 `useStream`，呈现消息、todo、工具卡片和异步任务轨迹。
 
@@ -180,12 +181,12 @@ Skills 默认由开发者维护并只读；复杂说明放入 `reference/`，`SK
 1. 用户向 Supervisor 提交自然语言网页研究任务。
 2. Supervisor 创建 todo 并异步启动 ASGI crawl-worker。
 3. Supervisor 立即返回完整 task ID，不在当前轮轮询。
-4. crawl-worker 使用 Tavily 搜索、爬取或提取公开网页。
+4. crawl-worker 初始化独立 OpenSandbox，再使用 Tavily 采集公开网页。
 5. crawl-worker 保存来源和正文片段，生成带引用的初步分析。
 6. 用户查询任务状态，Supervisor 获取最新 Worker 结果。
 7. Supervisor 返回简要结论和完整 `final_report.md`。
 8. LangSmith 可分别追踪 Supervisor、Worker、工具和模型。
-9. 本地产物按 graph thread ID 隔离；生产认证与持久化后续实现。
+9. Agent 成功后导出 `/workspace`，本地产物按 thread ID 和组件隔离。
 
 ## 16. 后续待确认
 

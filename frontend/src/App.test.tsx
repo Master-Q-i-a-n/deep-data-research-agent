@@ -89,9 +89,36 @@ describe("研究工作台", () => {
     expect(screen.getByText("Supervisor 入口就绪")).toBeTruthy();
     expect(screen.getByText("50%")).toBeTruthy();
     expect(screen.getByText("任务控制台")).toBeTruthy();
-    expect(screen.getByText("采集中")).toBeTruthy();
-    expect(screen.getByText("启动网页采集")).toBeTruthy();
-    expect(screen.getByText("后台采集：1")).toBeTruthy();
+    expect(screen.getByText("运行中")).toBeTruthy();
+    expect(screen.getByText("启动后台任务")).toBeTruthy();
+    expect(screen.getByText("后台任务：1")).toBeTruthy();
+  });
+
+  it("展示 Supervisor 直接调用的 Skill 管理工具", () => {
+    streamState.messages = [
+      {
+        id: "ai-skill",
+        type: "ai",
+        content: "",
+        tool_calls: [
+          {
+            id: "call-skill",
+            name: "assign_skill",
+            args: { subagent_type: "unused-in-direct-tool-test" },
+          },
+        ],
+      },
+      {
+        id: "tool-skill",
+        type: "tool",
+        tool_call_id: "call-skill",
+        content: "status: assigned",
+      },
+    ];
+
+    render(<App />);
+
+    expect(screen.getByText("分配 Skill")).toBeTruthy();
   });
 
   it("提交自然语言任务到 supervisor", () => {
@@ -160,7 +187,7 @@ describe("研究工作台", () => {
     expect(submit).toHaveBeenCalledWith({
       messages: [{
         type: "human",
-        content: "请调用 check_async_task 检查任务 task-123456789。如果任务已经完成，请读取最新结果并继续生成分析报告。",
+        content: "请调用 check_async_task 检查任务 task-123456789。如果远程运行已经结束，请读取结果第一行的业务 status 并继续处理。",
       }],
     }, {
       streamResumable: true,
@@ -173,7 +200,7 @@ describe("研究工作台", () => {
     render(<App />);
 
     fireEvent.click(screen.getByRole("button", { name: "补充要求" }));
-    fireEvent.change(screen.getByLabelText("补充采集要求"), {
+    fireEvent.change(screen.getByLabelText("补充任务要求"), {
       target: { value: "只保留国内产品并增加价格字段" },
     });
     fireEvent.click(screen.getByRole("button", { name: "立即更新" }));

@@ -180,7 +180,7 @@ export default function App() {
 
   function checkTask(taskId: string) {
     submitText(
-      `请调用 check_async_task 检查任务 ${taskId}。如果任务已经完成，请读取最新结果并继续生成分析报告。`,
+      `请调用 check_async_task 检查任务 ${taskId}。如果远程运行已经结束，请读取结果第一行的业务 status 并继续处理。`,
     );
   }
 
@@ -193,7 +193,7 @@ export default function App() {
 
   function cancelTask(taskId: string) {
     const confirmed = window.confirm(
-      "确定取消这个后台采集任务吗？已经完成的网页请求和文件不会自动删除。",
+      "确定取消这个后台任务吗？已经完成的请求和文件不会自动删除。",
     );
     if (!confirmed) return;
     submitText(`请调用 cancel_async_task 取消任务 ${taskId}。`, "interrupt");
@@ -263,7 +263,7 @@ export default function App() {
           <div className="topbar__status">
             <div className="runtime-stats" aria-label="运行状态">
               <span>Supervisor：{stream.isLoading ? "回答中" : "空闲"}</span>
-              <span>后台采集：{runningTaskCount}</span>
+              <span>后台任务：{runningTaskCount}</span>
               <span>等待处理：{stream.queue.size}</span>
             </div>
             <i className={stream.isLoading ? "is-active" : ""} aria-hidden="true" />

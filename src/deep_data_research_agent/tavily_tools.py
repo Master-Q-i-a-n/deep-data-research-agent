@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-import aiofiles
 from langchain.tools import ToolRuntime, tool
 from tavily import AsyncTavilyClient
 
-from deep_data_research_agent.backends import workspace_root
+from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.config import get_settings
 
 
@@ -34,36 +31,33 @@ async def _persist_result(
     response: dict[str, Any],
     mode: str,
     subject: str,
-    root: Path,
+    runtime: ToolRuntime,
 ) -> dict[str, Any]:
-    """Persist Tavily content and return a context-safe result summary."""
-
-    raw_dir = root / "raw"
-    # pathlib 的目录创建是同步系统调用，放入线程避免阻塞 LangGraph ASGI 事件循环。
-    await asyncio.to_thread(raw_dir.mkdir, parents=True, exist_ok=True)
+    """Persist Tavily content in OpenSandbox and return a compact summary."""
 
     pages: list[dict[str, Any]] = []
+    files: list[tuple[str, bytes]] = []
     for result in response.get("results", []):
         url = str(result.get("url", ""))
         content = result.get("raw_content") or result.get("content") or ""
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-        content_path = raw_dir / f"{digest}.md"
-        async with aiofiles.open(content_path, "w", encoding="utf-8") as file:
-            await file.write(str(content))
+        content_path = f"/workspace/raw/{digest}.md"
+        files.append((content_path, str(content).encode("utf-8")))
 
         pages.append(
             {
                 "title": result.get("title") or url,
                 "url": url,
                 "score": result.get("score"),
-                "content_path": f"/workspace/raw/{content_path.name}",
+                "content_path": content_path,
             }
         )
 
-    pages_path = root / f"{mode}_pages.jsonl"
-    async with aiofiles.open(pages_path, "w", encoding="utf-8") as file:
-        for page in pages:
-            await file.write(json.dumps(page, ensure_ascii=False) + "\n")
+    pages_path = f"/workspace/{mode}_pages.jsonl"
+    pages_content = "".join(
+        json.dumps(page, ensure_ascii=False) + "\n" for page in pages
+    )
+    files.append((pages_path, pages_content.encode("utf-8")))
 
     failed = response.get("failed_results", [])
     manifest = {
@@ -75,13 +69,18 @@ async def _persist_result(
         "failed_results": failed,
         "request_id": response.get("request_id"),
         "usage": response.get("usage", {}),
-        "pages_file": f"/workspace/{pages_path.name}",
+        "pages_file": pages_path,
         "pages": pages,
     }
-    manifest_path = root / f"{mode}_result.json"
-    async with aiofiles.open(manifest_path, "w", encoding="utf-8") as file:
-        await file.write(json.dumps(manifest, ensure_ascii=False, indent=2))
+    files.append(
+        (
+            f"/workspace/{mode}_result.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+    )
 
+    thread_id = sandbox_manager.thread_id_from_runtime(runtime)
+    await sandbox_manager.SANDBOX_MANAGER.upload_workspace_files(thread_id, files)
     return manifest
 
 
@@ -116,7 +115,7 @@ async def tavily_search(
         response=response,
         mode="search",
         subject=query,
-        root=workspace_root(runtime),
+        runtime=runtime,
     )
     return json.dumps(summary, ensure_ascii=False)
 
@@ -151,7 +150,7 @@ async def tavily_crawl(
         response=response,
         mode="crawl",
         subject=normalized_url,
-        root=workspace_root(runtime),
+        runtime=runtime,
     )
     return json.dumps(summary, ensure_ascii=False)
 
@@ -183,7 +182,7 @@ async def tavily_extract(
         response=response,
         mode="extract",
         subject=query,
-        root=workspace_root(runtime),
+        runtime=runtime,
     )
     return json.dumps(summary, ensure_ascii=False)
 
