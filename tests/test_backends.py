@@ -48,17 +48,17 @@ def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
     assert set(supervisor.routes) == {
         "/state/",
         "/skills/",
-        "/skills/main/",
         "/persisted-skills/",
     }
     assert set(crawl.routes) == {
         "/state/",
         "/skills/",
-        "/skills/main/",
         "/persisted-skills/",
     }
-    assert supervisor.routes["/skills/main/"] is supervisor.default
-    assert crawl.routes["/skills/main/"] is crawl.default
+    assert supervisor.routes["/skills/"] is crawl.routes["/skills/"]
+    # /skill-manage/ 不配置路由，直接由默认 OpenSandbox 处理。
+    assert "/skill-manage/" not in supervisor.routes
+    assert "/skill-manage/" not in crawl.routes
     assert all(
         backend.artifacts_root == "/state"
         for backend in (supervisor, crawl)
@@ -74,10 +74,11 @@ def test_persisted_skill_route_uses_store_backend(initialized_backends) -> None:
 
 
 @pytest.mark.asyncio
-async def test_backend_factory_and_async_skill_read_do_not_block_event_loop(
+async def test_async_skill_read_does_not_block_event_loop(
     initialized_backends,
 ) -> None:
     with blockbuster_ctx(scanned_modules=["deep_data_research_agent"]):
+        # 回归：backend factory 在 before_agent 中执行，不能重新解析本地路径。
         backend = backends.create_backend(_runtime("thread-async"))
         result = await backend.als("/skills/supervisor/")
 

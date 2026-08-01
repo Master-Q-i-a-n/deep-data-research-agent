@@ -1,8 +1,7 @@
-"""assign_skill 与 _read_skill_files 的路径映射回归测试。
+"""assign_skill 与 _read_skill_files 的候选目录回归测试。
 
-覆盖根因：VFS /skills/main/{name} 经 CompositeBackend 路由映射到沙箱物理 /{name}，
-assign_skill 必须按物理路径读取与清理；aglob 返回相对路径、adownload_files 需要
-绝对物理路径；aglob 空结果时回退到单个 JSON 数组输出。
+候选目录 /skill-manage/{name} 由默认沙箱直接处理；aglob 返回相对路径时仍需转换为
+绝对路径，空结果时回退到单个 JSON 数组输出。
 """
 
 from types import SimpleNamespace
@@ -75,7 +74,7 @@ def _filled_backend(glob_matches, contents):
 
 
 @pytest.mark.asyncio
-async def test_read_skill_files_resolves_physical_paths() -> None:
+async def test_read_skill_files_resolves_absolute_paths() -> None:
     backend = _filled_backend(
         glob_matches=[
             {"path": "SKILL.md", "is_dir": False},
@@ -83,88 +82,87 @@ async def test_read_skill_files_resolves_physical_paths() -> None:
             {"path": "scripts/run.py", "is_dir": False},
         ],
         contents={
-            "/demo/SKILL.md": SKILL_MD,
-            "/demo/scripts/run.py": b"print('hi')\n",
+            "/skill-manage/demo/SKILL.md": SKILL_MD,
+            "/skill-manage/demo/scripts/run.py": b"print('hi')\n",
         },
     )
 
-    files = await skill_tools._read_skill_files(
-        backend, "/demo", "/skills/main/demo"
-    )
+    files = await skill_tools._read_skill_files(backend, "/skill-manage/demo")
 
     assert files == [
         ("SKILL.md", SKILL_MD),
         ("scripts/run.py", b"print('hi')\n"),
     ]
-    # aglob 收到的是物理路径，下载用绝对物理路径（相对结果被转成绝对路径）。
-    assert backend.glob_calls == [("**/*", "/demo")]
-    assert backend.download_calls == [["/demo/SKILL.md", "/demo/scripts/run.py"]]
+    assert backend.glob_calls == [("**/*", "/skill-manage/demo")]
+    assert backend.download_calls == [[
+        "/skill-manage/demo/SKILL.md",
+        "/skill-manage/demo/scripts/run.py",
+    ]]
 
 
 @pytest.mark.asyncio
 async def test_read_skill_files_requires_root_skill_md() -> None:
     backend = _filled_backend(
         glob_matches=[{"path": "run.py", "is_dir": False}],
-        contents={"/demo/run.py": b"print('hi')\n"},
+        contents={"/skill-manage/demo/run.py": b"print('hi')\n"},
     )
 
     with pytest.raises(RuntimeError, match="缺少根级 SKILL.md"):
-        await skill_tools._read_skill_files(
-            backend, "/demo", "/skills/main/demo"
-        )
+        await skill_tools._read_skill_files(backend, "/skill-manage/demo")
 
 
 @pytest.mark.asyncio
 async def test_read_skill_files_falls_back_to_json_on_empty_glob() -> None:
     """JSON 数组不依赖换行，可规避 OpenSandbox 拼接 stdout 日志块。"""
     backend = _filled_backend(glob_matches=[], contents={})
-    backend.find_output = '["/demo/SKILL.md", "/demo/run.py"]'
+    backend.find_output = (
+        '["/skill-manage/demo/SKILL.md", "/skill-manage/demo/run.py"]'
+    )
     backend.file_contents = {
-        "/demo/SKILL.md": SKILL_MD,
-        "/demo/run.py": b"print('hi')\n",
+        "/skill-manage/demo/SKILL.md": SKILL_MD,
+        "/skill-manage/demo/run.py": b"print('hi')\n",
     }
 
-    files = await skill_tools._read_skill_files(
-        backend, "/demo", "/skills/main/demo"
-    )
+    files = await skill_tools._read_skill_files(backend, "/skill-manage/demo")
 
     assert files == [("SKILL.md", SKILL_MD), ("run.py", b"print('hi')\n")]
-    assert backend.glob_calls == [("**/*", "/demo")]
+    assert backend.glob_calls == [("**/*", "/skill-manage/demo")]
     assert backend.execute_calls[0][0].startswith("python3 -c ")
     assert "json.dumps" in backend.execute_calls[0][0]
-    assert backend.download_calls == [["/demo/SKILL.md", "/demo/run.py"]]
+    assert backend.download_calls == [[
+        "/skill-manage/demo/SKILL.md",
+        "/skill-manage/demo/run.py",
+    ]]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("exit_code", "message"),
     [
-        (1, "Skill 目录不存在：VFS /skills/main/demo/（物理 /demo/）"),
-        (0, "Skill 目录 /skills/main/demo/ 不存在或为空（物理 /demo/）"),
+        (1, "Skill 目录不存在：/skill-manage/demo/"),
+        (0, "Skill 目录 /skill-manage/demo/ 不存在或为空"),
     ],
 )
-async def test_read_skill_files_reports_both_paths(exit_code, message) -> None:
+async def test_read_skill_files_reports_candidate_path(exit_code, message) -> None:
     backend = _filled_backend(glob_matches=[], contents={})
     backend.find_output = ""
     backend.find_exit_code = exit_code
 
     with pytest.raises(RuntimeError, match=message):
-        await skill_tools._read_skill_files(
-            backend, "/demo", "/skills/main/demo"
-        )
+        await skill_tools._read_skill_files(backend, "/skill-manage/demo")
 
 
 def _assign_backend():
     backend = _filled_backend(
         glob_matches=[{"path": "SKILL.md", "is_dir": False}],
-        contents={"/demo-skill/SKILL.md": SKILL_MD},
+        contents={"/skill-manage/demo-skill/SKILL.md": SKILL_MD},
     )
     return backend
 
 
 @pytest.mark.asyncio
-async def test_assign_skill_reads_and_cleans_physical_dir(monkeypatch) -> None:
-    """回归根因：assign_skill 读/清理物理 /{name}，store 写入 /active/。"""
+async def test_assign_skill_reads_and_keeps_candidate_dir(monkeypatch) -> None:
+    """assign_skill 持久化 Skill 后保留候选目录，支持后续继续分配。"""
     backend = _assign_backend()
     monkeypatch.setattr(
         sandbox_manager,
@@ -182,10 +180,11 @@ async def test_assign_skill_reads_and_cleans_physical_dir(monkeypatch) -> None:
 
     assert '"status": "assigned"' in result
     assert '"file_count": 1' in result
-    # 物理路径：不是字面 /skills/main/...
-    assert backend.glob_calls == [("**/*", "/demo-skill")]
-    assert backend.download_calls == [["/demo-skill/SKILL.md"]]
-    assert backend.execute_calls == [("rm -rf /demo-skill", 30)]
+    assert backend.glob_calls == [("**/*", "/skill-manage/demo-skill")]
+    assert backend.download_calls == [[
+        "/skill-manage/demo-skill/SKILL.md"
+    ]]
+    assert backend.execute_calls == []
 
     namespace = (identity.user_hash(runtime), "skills", "assigned", "crawl-worker")
     items = store.search(namespace)
@@ -195,7 +194,7 @@ async def test_assign_skill_reads_and_cleans_physical_dir(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_assign_skill_error_reports_both_paths(monkeypatch) -> None:
+async def test_assign_skill_error_reports_candidate_path(monkeypatch) -> None:
     backend = _filled_backend(glob_matches=[], contents={})
     backend.find_output = ""
     backend.find_exit_code = 0
@@ -208,7 +207,7 @@ async def test_assign_skill_error_reports_both_paths(monkeypatch) -> None:
 
     with pytest.raises(
         RuntimeError,
-        match=r"/skills/main/demo-skill/.*（物理 /demo-skill/）",
+        match=r"/skill-manage/demo-skill/ 不存在或为空",
     ):
         await skill_tools.assign_skill.coroutine(
             skill_name="demo-skill",

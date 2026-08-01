@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import shlex
 from dataclasses import dataclass
@@ -23,6 +24,12 @@ from deep_data_research_agent.config import Settings, get_settings
 
 _SAFE_THREAD_ID = re.compile(r"[^A-Za-z0-9_.-]")
 _WORKSPACE_ROOT = PurePosixPath("/workspace")
+# OpenSandbox 的 Docker 冷启动会同时创建容器、端口和可选 egress sidecar。
+# 整个进程统一串行创建，避免不同 Agent 任务同时争用这些资源。
+_SANDBOX_CREATE_SEMAPHORE = asyncio.Semaphore(1)
+_SANDBOX_CREATE_RETRY_DELAYS = (1.0, 3.0)
+
+logger = logging.getLogger(__name__)
 
 
 def sanitize_thread_id(value: Any) -> str:
@@ -321,15 +328,48 @@ class SandboxManager:
         component: str = "crawl-worker",
         network_enabled: bool = False,
     ) -> _SandboxHandle:
-        try:
-            sandbox = await asyncio.to_thread(
-                self._create_sandbox_sync,
-                thread_id,
-                component,
-                network_enabled,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"无法为任务 {thread_id} 创建 OpenSandbox：{exc}") from exc
+        # 重试期间继续持有进程级信号量，给 Docker 和 egress sidecar 留出恢复时间，
+        # 同时保证所有 SandboxSync.create() 调用都不会交错执行。
+        async with _SANDBOX_CREATE_SEMAPHORE:
+            for attempt in range(len(_SANDBOX_CREATE_RETRY_DELAYS) + 1):
+                try:
+                    sandbox = await asyncio.to_thread(
+                        self._create_sandbox_sync,
+                        thread_id,
+                        component,
+                        network_enabled,
+                    )
+                    break
+                except Exception as exc:
+                    error_code = str(
+                        getattr(getattr(exc, "error", None), "code", "")
+                    )
+                    message = str(exc)
+                    retryable = (
+                        error_code.endswith("SANDBOX_START_FAILED")
+                        or error_code == "READY_TIMEOUT"
+                        or "Egress sidecar container failed to start" in message
+                    )
+                    if (
+                        not retryable
+                        or attempt >= len(_SANDBOX_CREATE_RETRY_DELAYS)
+                    ):
+                        raise RuntimeError(
+                            f"无法为任务 {thread_id} 创建 OpenSandbox：{exc}"
+                        ) from exc
+
+                    delay = _SANDBOX_CREATE_RETRY_DELAYS[attempt]
+                    logger.warning(
+                        "OpenSandbox 冷启动失败，%.0f 秒后重试（任务=%s，组件=%s，"
+                        "第 %d/%d 次重试）：%s",
+                        delay,
+                        thread_id,
+                        component,
+                        attempt + 1,
+                        len(_SANDBOX_CREATE_RETRY_DELAYS),
+                        message,
+                    )
+                    await asyncio.sleep(delay)
 
         handle = _SandboxHandle(
             sandbox=sandbox,

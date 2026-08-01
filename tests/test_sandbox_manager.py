@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 import time
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from deepagents.backends.protocol import (
     GlobResult,
 )
 from deepagents_opensandbox import OpensandboxBackend
+from opensandbox.exceptions import SandboxError, SandboxException
 
 from deep_data_research_agent import backends, sandbox_manager
 from deep_data_research_agent.config import Settings
@@ -240,6 +242,156 @@ async def test_sync_sandbox_creation_is_offloaded_from_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_sandbox_cold_starts_are_serialized_process_wide(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """不同 manager 的 SandboxSync.create 也必须经过同一个进程级信号量。"""
+
+    monkeypatch.setattr(
+        sandbox_manager,
+        "_SANDBOX_CREATE_SEMAPHORE",
+        asyncio.Semaphore(1),
+    )
+    managers = [
+        sandbox_manager.SandboxManager(settings=_settings(tmp_path)),
+        sandbox_manager.SandboxManager(settings=_settings(tmp_path)),
+    ]
+    active = 0
+    peak = 0
+    counter_lock = threading.Lock()
+
+    def blocking_create(thread_id, _component, _network_enabled):
+        nonlocal active, peak
+        with counter_lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.03)
+        with counter_lock:
+            active -= 1
+        return FakeSandbox(f"sandbox-{thread_id}")
+
+    async def ignore_directories(_handle, _directories) -> None:
+        return None
+
+    async def fake_base_distributions(_handle) -> frozenset[str]:
+        return frozenset()
+
+    async def ignore_restore(
+        _thread_id,
+        _handle=None,
+        *,
+        component="crawl-worker",
+    ) -> int:
+        assert component == "crawl-worker"
+        return 0
+
+    for manager in managers:
+        monkeypatch.setattr(manager, "_create_sandbox_sync", blocking_create)
+        monkeypatch.setattr(manager, "_ensure_directories", ignore_directories)
+        monkeypatch.setattr(
+            manager,
+            "_capture_base_distributions",
+            fake_base_distributions,
+        )
+        monkeypatch.setattr(manager, "restore_workspace", ignore_restore)
+
+    await asyncio.gather(
+        managers[0]._create_handle("thread-a"),
+        managers[1]._create_handle("thread-b"),
+    )
+
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_sandbox_start_failure_retries_twice(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    attempts = 0
+    delays: list[float] = []
+
+    def flaky_create(_thread_id, _component, _network_enabled):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise SandboxException(
+                "Create sandbox failed: Egress sidecar container failed to start.",
+                error=SandboxError(
+                    "DOCKER::SANDBOX_START_FAILED",
+                    "Failed to start egress sidecar",
+                ),
+            )
+        return FakeSandbox("sandbox-retried")
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def ignore_directories(_handle, _directories) -> None:
+        return None
+
+    async def fake_base_distributions(_handle) -> frozenset[str]:
+        return frozenset()
+
+    async def ignore_restore(
+        _thread_id,
+        _handle=None,
+        *,
+        component="crawl-worker",
+    ) -> int:
+        return 0
+
+    monkeypatch.setattr(
+        sandbox_manager,
+        "_SANDBOX_CREATE_SEMAPHORE",
+        asyncio.Semaphore(1),
+    )
+    monkeypatch.setattr(manager, "_create_sandbox_sync", flaky_create)
+    monkeypatch.setattr(manager, "_ensure_directories", ignore_directories)
+    monkeypatch.setattr(
+        manager,
+        "_capture_base_distributions",
+        fake_base_distributions,
+    )
+    monkeypatch.setattr(manager, "restore_workspace", ignore_restore)
+    monkeypatch.setattr(sandbox_manager.asyncio, "sleep", fake_sleep)
+
+    handle = await manager._create_handle("thread-a")
+
+    assert handle.backend.id == "sandbox-retried"
+    assert attempts == 3
+    assert delays == [1.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_create_does_not_retry_nontransient_errors(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    attempts = 0
+
+    def invalid_create(_thread_id, _component, _network_enabled):
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("镜像名称无效")
+
+    monkeypatch.setattr(
+        sandbox_manager,
+        "_SANDBOX_CREATE_SEMAPHORE",
+        asyncio.Semaphore(1),
+    )
+    monkeypatch.setattr(manager, "_create_sandbox_sync", invalid_create)
+
+    with pytest.raises(RuntimeError, match="镜像名称无效"):
+        await manager._create_handle("thread-a")
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_export_and_restore_workspace(tmp_path) -> None:
     manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
     handle = _handle("sandbox-1")
@@ -340,7 +492,6 @@ def test_worker_backend_uses_sandbox_as_default(tmp_path, monkeypatch) -> None:
     assert set(backend.routes) == {
         "/state/",
         "/skills/",
-        "/skills/main/",
         "/persisted-skills/",
     }
     assert backend.artifacts_root == "/state"

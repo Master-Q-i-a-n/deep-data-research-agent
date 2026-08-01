@@ -9,8 +9,8 @@ BASE_AGENT_PROMPT = """你是一个能够规划和执行多步骤任务的深度
 - 文件工具（write_file/read_file/edit_file/ls/glob/grep）作用于虚拟文件系统；execute 的
   shell 命令作用于沙箱物理文件系统。路径规则如下：
   - /state/ → 状态与产物存储；
-  - /skills/main/{name}/ 仅用于 Skill 创建、下载和测试，对应临时物理目录 /{name}/；
-    分配完成后不得继续使用该路径；
+  - /skill-manage/{name}/ 仅用于 Skill 创建、下载和测试，由默认沙箱直接处理；
+    文件工具与 execute 使用相同路径，分配完成后不得继续使用；
   - /skills/ → 内置 Skill（只读）；
   - /persisted-skills/active/{name}/ 由 MongoDB 提供，并在每轮模型运行前同步到沙箱
     物理同路径；execute 运行已激活 Skill 脚本时，必须使用
@@ -47,7 +47,7 @@ TOOL_DESCRIPTION_OVERRIDES = {
     "grep": "在虚拟文件中搜索文本或正则表达式。",
     "execute": (
         "在沙箱中执行命令（已联网，可下载资源或安装依赖）。需要操作工作文件时，"
-        "先切换到 /workspace，并明确设置合理的超时时间。"
+        "使用 /workspace；管理候选 Skill 时使用 /skill-manage/{name}。请设置合理的超时时间。"
     ),
     "start_async_task": "启动指定类型的异步子代理，立即返回必须完整保留的 task_id。",
     "check_async_task": "使用完整 task_id 查询异步任务的最新状态和结果。",
@@ -69,13 +69,13 @@ SUPERVISOR_PROMPT = """你是网页数据分析任务的 Supervisor。
 7. 用户要求创建、下载、修改、测试或分配 Skill 时，先用 read_file(limit=1000)
    完整阅读 /skills/supervisor/skill-manage/SKILL.md，再按其流程操作；不得使用
    异步任务工具或子智能体处理 Skill。
-8. Skill 在 /skills/main/{name}/ 创建或下载并通过测试后，调用 assign_skill(name, targets)
+8. Skill 在 /skill-manage/{name}/ 创建或下载并通过测试后，调用 assign_skill(name, targets)
    一步完成分配和持久化；targets 为目标 Agent 名称列表，如 ["supervisor"] 或 ["crawl-worker"]；
-   路径映射见基础规则；不得用 apt/apk 安装 curl、wget、unzip 等系统工具，不得使用
+   不得用 apt/apk 安装 curl、wget、unzip 等系统工具，不得使用
    `curl | sh`；下载和解压统一通过 execute 调用 Python 标准库 urllib.request、zipfile
-   或 tarfile，pip 仅用于安装候选 Skill 测试所需的 Python 依赖。
+   或 tarfile。pip 仅用于安装候选 Skill 测试或采购数据分析、制图所需的 Python 依赖。
 9. Skill 工具出现业务失败时说明原因并继续对话；若目标无效，按返回的“可用目标”向用户确认。
-   assign_skill 失败时，按错误信息给出的虚拟与物理路径定位，不要反复试错。
+   assign_skill 失败时，按错误信息给出的候选路径定位，不要反复试错。
 10. 可以使用 execute 在已联网的沙箱中运行仅限数据清洗、统计和报告生成用途的脚本；
     自行编写的脚本、输入和结果必须位于 /workspace；已激活 Skill 的脚本可以从
     /persisted-skills/active/{name}/ 执行，但输入和结果仍须位于 /workspace。禁止通用软件

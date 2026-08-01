@@ -80,7 +80,7 @@ OPEN_SANDBOX_TIMEOUT_SECONDS=1800
 成功快照。`supervisor` 沙箱已联网（Skill 下载和依赖安装可直接用 `execute`），
 `crawl-worker` 保持断网隔离，Tavily 请求始终由宿主进程完成。
 
-Skill 在 `/skills/main/{name}/` 下创建或下载：下载支持公开 GitHub、HTTPS ZIP/TAR
+Skill 在 `/skill-manage/{name}/` 下创建或下载：下载支持公开 GitHub、HTTPS ZIP/TAR
 压缩包或单个 `SKILL.md`；依赖用根级 `requirements.txt` 声明，测试时在沙箱中
 `pip install`。压缩包按内容识别格式，并限制路径穿越和链接文件。首次运行前还应确认
 相关镜像均已拉取到 Docker。
@@ -141,10 +141,10 @@ Supervisor 支持 DeepAgents 自动提供的 `check_async_task`、`update_async_
 Skill 流程已简化为一步分配：
 
 1. 提交要下载的 URL，或描述要创建的 Skill，并指定分配目标（supervisor / crawl-worker）。
-2. Supervisor 完整读取 `skill-manage`，在 /skills/main/{name}/ 创建或下载 Skill，
+2. Supervisor 完整读取 `skill-manage`，在 /skill-manage/{name}/ 创建或下载 Skill，
    再用 execute 测试，可按实际结果反复修改和重测。
 3. 测试通过后调用 `assign_skill(name, targets)`：文件持久化到 MongoDB active 目录，
-   并清理临时目录。
+   候选目录继续保留，便于检查或分配给其他 Agent。
 4. 目标 Agent 在下一轮对话中自动加载该 Skill（恢复至 /persisted-skills/）。
 
 ## 本地产物

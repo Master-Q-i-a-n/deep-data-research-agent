@@ -99,7 +99,7 @@ flowchart LR
 | Context | 对话、state、workspace、artifact、memory 分层管理 |
 | Memory | MongoDB StoreBackend 保存用户动态 Skill；通用记忆后续实现 |
 | Interrupt | 审批采集范围、登录态、成本、联网和共享记忆写入 |
-| Backend | 全部 Agent 使用 OpenSandbox 默认后端，State/Skills/main/持久化 Skills 独立路由 |
+| Backend | 全部 Agent 使用 OpenSandbox 默认后端，State/内置 Skills/持久化 Skills 独立路由 |
 | Sandbox | Supervisor 联网（Skill 下载/安装）；crawl 禁网；Tavily 请求始终宿主进程 |
 | Streaming | 流式输出消息、todo、工具、进度和 interrupt |
 | Observability | LangSmith 自动 tracing 加业务自定义 spans |
@@ -113,7 +113,7 @@ flowchart LR
 - `data-quality-analysis`：缺失、异常、类型和统计验证。
 - `evidence-reporting`：证据引用、局限说明和 Markdown 报告。
 
-内置 Skills 随代码只读发布并同步到沙箱；Supervisor 读取统一 `skill-manage` 后在 `/skills/main/` 创建或下载 Skill、用 `execute` 测试，再通过单个 `assign_skill` 一步分配并持久化，不创建 Skill 专用 LangGraph 或子智能体。用户 Skill 写入 MongoDB active 目录，于每轮恢复到目标沙箱。下载依赖已联网的 supervisor 沙箱，解压拒绝路径穿越与链接。
+内置 Skills 随代码只读发布并同步到沙箱；Supervisor 读取统一 `skill-manage` 后在默认 OpenSandbox 的 `/skill-manage/` 创建或下载 Skill、用 `execute` 测试，再通过单个 `assign_skill` 一步分配并持久化，不创建 Skill 专用 LangGraph 或子智能体。用户 Skill 写入 MongoDB active 目录，于每轮恢复到目标沙箱。下载依赖已联网的 supervisor 沙箱，解压拒绝路径穿越与链接。
 
 ## 9. 上下文与长期记忆
 

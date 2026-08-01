@@ -8,7 +8,7 @@ DeepAgents-based web-data research agent MVP (Python 3.13, uv, LangGraph Agent S
 natural-language research task; the **supervisor** graph plans it and launches an asynchronous
 **crawl-worker** subagent that uses Tavily Search/Crawl/Extract, works inside an OpenSandbox, and returns a
 cited Markdown analysis. The supervisor also manages user Skills with a single `assign_skill` tool:
-Skills are created/downloaded and tested in the supervisor sandbox under `/skills/main/`, then assigned
+Skills are created/downloaded and tested in the supervisor sandbox under `/skill-manage/`, then assigned
 to target agents and persisted to MongoDB.
 
 UI text, system prompts, and error messages are written in Simplified Chinese; keep that convention when
@@ -71,12 +71,12 @@ graph imports and static tests run without `.env`.
 
 - default → OpenSandbox (`sandbox_manager.SANDBOX_MANAGER.get_backend`)
 - `/state/` → `StateBackend` (artifacts root)
-- `/skills/main/` → writable sandbox (Skill 创建/下载的临时暂存区)
 - `/skills/` → read-only `FilesystemBackend` over `src/.../skills/` (built-in skills)
 - `/persisted-skills/` → `StoreBackend` over MongoDB (user skills), namespaced by `assigned_skill_namespace`
 
-Permissions mirror this: `/skills/main/**` is read/write for Skill staging; `/skills/**` and
-`/persisted-skills/**` are otherwise read-only; `FILESYSTEM_PERMISSIONS` for supervisor vs
+Unmatched paths such as `/workspace/**` and `/skill-manage/**` go directly to the default sandbox;
+there is no special staging route or path remapping. `/skills/**` and `/persisted-skills/**` are
+read-only; `FILESYSTEM_PERMISSIONS` for supervisor vs
 `WORKER_FILESYSTEM_PERMISSIONS` for the worker are identical today.
 
 `sandbox_manager.py` owns one OpenSandbox per `(thread_id, component)`, lazily created and reused (renewed on
@@ -107,20 +107,17 @@ the outer StateGraph's `_ensure_sandbox` node does that).
 The complete flow is driven by `skill-manage/SKILL.md`, which the Supervisor is prompted to read in full
 before touching any Skill. The flow is deliberately simple:
 
-create/download under `/skills/main/{name}/` (via `write_file`/`execute` in the networked supervisor
+create/download under `/skill-manage/{name}/` (via `write_file`/`execute` in the networked supervisor
 sandbox) → test manually (`ls`/`read_file`/`execute`, `pip install` if needed) →
 `assign_skill(name, targets)` persists every file to MongoDB under
 `(user_hash, "skills", "assigned", target)` as `/active/{name}/**` plus a `/manifests/{name}.json`
 marker, then cleans up the staging dir.
 
-**Path mapping (important):** `/skills/main/{name}/` is a VFS path. The `CompositeBackend` `/skills/main/`
-route strips the prefix and re-roots with `/`, so files actually live at the sandbox's physical `/{name}/`.
-`assign_skill` reads and cleans up by **physical path `/{name}/`** — never read the raw backend with the
-literal `/skills/main/...` path (it won't match what `write_file` wrote). The model's `ls` on
-`/skills/main/{name}` works, but `glob` on that route is unreliable (relative-path remap corruption /
-whole-FS scan) — SKILL.md tells the model to verify with `read_file`/`ls` instead.
+`/skill-manage/{name}/` is handled directly by the default OpenSandbox backend. File tools,
+`execute`, and `assign_skill` therefore use the same absolute path, with no virtual-to-physical mapping.
+SKILL.md tells the model to verify candidates with `read_file`/`ls` instead of broad glob scans.
 
-Invariants: candidates must live under `/skills/main/`; SKILL.md frontmatter must be exactly
+Invariants: candidates must live under `/skill-manage/`; SKILL.md frontmatter must be exactly
 `{name, description}` with `name == dir name`; the only tool in `skill_tools.py` is `assign_skill`
 (exported as `ASSIGN_SKILL_TOOL`); available targets are read dynamically from `langgraph.json` graphs
 (supervisor, crawl-worker) and the tool's error lists them on mismatch.

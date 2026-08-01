@@ -16,11 +16,10 @@ from deepagents.backends import (
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.identity import assigned_skill_namespace
 
-# Resolve and initialize the built-in Skill backend once while graph modules are
-# imported, before LangGraph starts handling requests on the ASGI event loop.
-PACKAGE_ROOT = Path(__file__).resolve().parent
-SKILLS_ROOT = PACKAGE_ROOT / "skills"
-_SKILLS_FILESYSTEM = FilesystemBackend(
+SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
+# FilesystemBackend 构造时会同步解析本地路径，必须在模块导入阶段完成，不能在
+# ReloadableSkillsMiddleware.before_agent 的异步请求路径中重复初始化。
+_BUILTIN_SKILLS_BACKEND = FilesystemBackend(
     root_dir=SKILLS_ROOT,
     virtual_mode=True,
 )
@@ -36,7 +35,6 @@ def _sandbox_backend(
     runtime: Any,
     *,
     component: str,
-    agent_name: str | None,
 ) -> CompositeBackend:
     """Build one request-local sandbox backend with stable routed storage."""
 
@@ -46,15 +44,12 @@ def _sandbox_backend(
     )
     routes: dict[str, Any] = {
         "/state/": StateBackend(),
-        # /skills/main/ 是 Skill 创建/下载的临时暂存区，落在可写沙箱上。
-        "/skills/main/": sandbox,
-        "/skills/": _SKILLS_FILESYSTEM,
-    }
-    if agent_name is not None:
-        routes["/persisted-skills/"] = StoreBackend(
-            namespace=lambda rt: assigned_skill_namespace(rt, agent_name),
+        "/skills/": _BUILTIN_SKILLS_BACKEND,
+        "/persisted-skills/": StoreBackend(
+            namespace=lambda rt: assigned_skill_namespace(rt, component),
             file_format="v2",
-        )
+        ),
+    }
 
     return CompositeBackend(
         default=sandbox,
@@ -69,7 +64,6 @@ def create_backend(runtime: Any) -> CompositeBackend:
     return _sandbox_backend(
         runtime,
         component="supervisor",
-        agent_name="supervisor",
     )
 
 
@@ -79,18 +73,12 @@ def create_worker_backend(runtime: Any) -> CompositeBackend:
     return _sandbox_backend(
         runtime,
         component="crawl-worker",
-        agent_name="crawl-worker",
     )
 
 
 # DeepAgents evaluates these rules in order. Unmatched paths, such as
-# /workspace/**, are handled by the isolated default sandbox.
+# /workspace/** and /skill-manage/**, are handled by the isolated default sandbox.
 FILESYSTEM_PERMISSIONS = [
-    FilesystemPermission(
-        operations=["read", "write"],
-        paths=["/skills/main/**"],
-        mode="allow",
-    ),
     FilesystemPermission(
         operations=["write"],
         paths=["/skills/**"],
@@ -121,11 +109,6 @@ FILESYSTEM_PERMISSIONS = [
 
 WORKER_FILESYSTEM_PERMISSIONS = [
     FilesystemPermission(
-        operations=["read", "write"],
-        paths=["/skills/main/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
         operations=["write"],
         paths=["/skills/**"],
         mode="deny",
@@ -151,4 +134,3 @@ WORKER_FILESYSTEM_PERMISSIONS = [
         mode="allow",
     ),
 ]
-
