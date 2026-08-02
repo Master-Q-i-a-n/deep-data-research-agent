@@ -131,6 +131,12 @@ def _workspace_relative(path: str) -> PurePosixPath:
     return candidate
 
 
+def workspace_relative_path(path: str) -> PurePosixPath:
+    """Return a validated path relative to ``/workspace`` for HTTP/tool callers."""
+
+    return _workspace_relative(path)
+
+
 def _sandbox_path(relative: PurePosixPath) -> str:
     return f"/workspace/{relative.as_posix()}"
 
@@ -250,10 +256,18 @@ class SandboxManager:
         self._thread_users[thread_id] = fallback
         return fallback
 
-    def _local_workspace(self, thread_id: str, component: str) -> Path:
+    def local_workspace_path(
+        self,
+        thread_id: str,
+        component: str,
+        *,
+        user_id: str | None = None,
+    ) -> Path:
+        """Return the user-scoped local workspace snapshot directory."""
+
         return (
             self._artifact_root
-            / self._user_for_thread(thread_id)
+            / self._user_for_thread(thread_id, user_id)
             / "jobs"
             / sanitize_thread_id(thread_id)
             / component
@@ -555,7 +569,7 @@ class SandboxManager:
         active_handle = handle or self._get_handle(thread_id, component)
         files = await asyncio.to_thread(
             _load_local_workspace,
-            self._local_workspace(thread_id, component),
+            self.local_workspace_path(thread_id, component),
         )
         if not files:
             return 0
@@ -709,7 +723,7 @@ class SandboxManager:
 
         await asyncio.to_thread(
             _write_local_workspace,
-            self._local_workspace(thread_id, component),
+            self.local_workspace_path(thread_id, component),
             downloaded,
         )
         _add_trace_metadata(

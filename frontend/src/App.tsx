@@ -15,6 +15,7 @@ type Message = {
   content: unknown;
   tool_calls?: RawToolCall[];
   tool_call_id?: string;
+  artifact?: unknown;
 };
 
 type StreamState = {
@@ -30,6 +31,30 @@ type Row =
 type SubmitMode = "enqueue" | "interrupt";
 type AuthMode = "login" | "register";
 type AsyncTaskStatusResponse = { tasks?: AsyncTask[] };
+type DownloadableArtifact = {
+  path: string;
+  filename: string;
+  size: number;
+  mime_type?: string;
+};
+type ArtifactListResponse = { artifacts?: DownloadableArtifact[] };
+type HITLActionRequest = {
+  name: string;
+  args: Record<string, unknown>;
+  description?: string;
+};
+type HITLReviewConfig = {
+  action_name: string;
+  allowed_decisions: Array<"approve" | "reject" | "respond" | "edit">;
+};
+type HITLRequest = {
+  action_requests: HITLActionRequest[];
+  review_configs: HITLReviewConfig[];
+};
+type HITLDecision =
+  | { type: "approve" }
+  | { type: "reject"; message?: string }
+  | { type: "respond"; message: string };
 type AuthUser = {
   id: string;
   username: string;
@@ -48,6 +73,16 @@ const ASYNC_TASK_STATUSES = new Set<AsyncTaskStatus>([
   "timeout",
   "interrupted",
 ]);
+const FAILED_ASYNC_TASK_STATUSES = new Set<AsyncTaskStatus>([
+  "error",
+  "timeout",
+  "interrupted",
+]);
+const TASK_FAILURE_LABEL: Partial<Record<AsyncTaskStatus, string>> = {
+  error: "执行失败",
+  timeout: "执行超时",
+  interrupted: "执行中断",
+};
 const DEFAULT_USER: AuthUser = {
   id: "local-user",
   username: "默认账户",
@@ -87,6 +122,43 @@ function queuedMessageText(values: Partial<StreamState> | null | undefined): str
   const messages = values?.messages;
   if (!Array.isArray(messages) || messages.length === 0) return "等待处理的消息";
   return messageText(messages[messages.length - 1]?.content).trim() || "等待处理的消息";
+}
+
+function hitlRequest(value: unknown): HITLRequest | null {
+  if (typeof value !== "object" || value === null) return null;
+  const raw = value as Partial<HITLRequest>;
+  if (!Array.isArray(raw.action_requests) || !Array.isArray(raw.review_configs)) return null;
+  if (raw.action_requests.length === 0 || raw.action_requests.length !== raw.review_configs.length) {
+    return null;
+  }
+  return {
+    action_requests: raw.action_requests,
+    review_configs: raw.review_configs,
+  };
+}
+
+function fileDownloadArtifact(value: unknown): DownloadableArtifact | null {
+  if (typeof value !== "object" || value === null) return null;
+  const raw = value as Partial<DownloadableArtifact> & { type?: unknown };
+  if (
+    raw.type !== "file_download"
+    || typeof raw.path !== "string"
+    || typeof raw.filename !== "string"
+    || typeof raw.size !== "number"
+  ) {
+    return null;
+  }
+  return { path: raw.path, filename: raw.filename, size: raw.size };
+}
+
+function formatFileSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function taskRunKey(task: AsyncTask): string {
+  return `${task.task_id}:${task.run_id ?? ""}`;
 }
 
 export function buildRows(messages: Message[]): Row[] {
@@ -177,6 +249,123 @@ const MessageCard = memo(function MessageCard({
   && previous.streaming === next.streaming
 ));
 
+function InterruptCard({
+  request,
+  submitting,
+  onResume,
+}: {
+  request: HITLRequest;
+  submitting: boolean;
+  onResume: (decisions: HITLDecision[]) => void;
+}) {
+  const [responses, setResponses] = useState<Record<number, string>>({});
+  const [choices, setChoices] = useState<Record<number, "approve" | "reject">>({});
+
+  const ready = request.action_requests.every((_action, index) => {
+    const allowed = request.review_configs[index]?.allowed_decisions ?? [];
+    if (allowed.includes("respond")) return Boolean(responses[index]?.trim());
+    return Boolean(choices[index]);
+  });
+
+  function submitDecisions() {
+    if (!ready) return;
+    const decisions: HITLDecision[] = request.action_requests.map((_action, index) => {
+      const allowed = request.review_configs[index]?.allowed_decisions ?? [];
+      if (allowed.includes("respond")) {
+        return { type: "respond", message: (responses[index] ?? "").trim() };
+      }
+      const choice = choices[index];
+      return choice === "approve"
+        ? { type: "approve" }
+        : { type: "reject", message: "用户拒绝执行该操作。" };
+    });
+    onResume(decisions);
+  }
+
+  return (
+    <section className="interrupt-card" aria-labelledby="interrupt-title">
+      <header>
+        <div>
+          <p className="eyebrow">需要你的决定</p>
+          <h2 id="interrupt-title">任务已安全暂停</h2>
+        </div>
+      </header>
+      {request.action_requests.map((action, index) => {
+        const allowed = request.review_configs[index]?.allowed_decisions ?? [];
+        const isQuestion = action.name === "ask_user" && allowed.includes("respond");
+        const question = typeof action.args.question === "string"
+          ? action.args.question
+          : action.description ?? "请补充完成任务所需的信息";
+        const missing = Array.isArray(action.args.missing_fields)
+          ? action.args.missing_fields.map(String).join("、")
+          : "";
+        const known = typeof action.args.known_information === "string"
+          ? action.args.known_information
+          : "";
+        const filePath = typeof action.args.file_path === "string"
+          ? action.args.file_path
+          : "/workspace/final_report.md";
+
+        return (
+          <div className="interrupt-card__request" key={`${action.name}-${index}`}>
+            <strong>{isQuestion ? question : "是否允许下载此文件？"}</strong>
+            {isQuestion ? (
+              <>
+                {missing ? <span>待补充：{missing}</span> : null}
+                {known ? <span>已知信息：{known}</span> : null}
+                <textarea
+                  rows={3}
+                  value={responses[index] ?? ""}
+                  onChange={(event) => setResponses((current) => ({
+                    ...current,
+                    [index]: event.target.value,
+                  }))}
+                  placeholder="请输入补充信息"
+                  disabled={submitting}
+                />
+              </>
+            ) : (
+              <>
+                <code>{filePath}</code>
+                <div className="interrupt-card__choices">
+                  {allowed.includes("approve") ? (
+                    <button
+                      type="button"
+                      className={choices[index] === "approve" ? "is-selected" : ""}
+                      onClick={() => setChoices((current) => ({ ...current, [index]: "approve" }))}
+                      disabled={submitting}
+                    >
+                      批准下载
+                    </button>
+                  ) : null}
+                  {allowed.includes("reject") ? (
+                    <button
+                      type="button"
+                      className={choices[index] === "reject" ? "is-rejected" : ""}
+                      onClick={() => setChoices((current) => ({ ...current, [index]: "reject" }))}
+                      disabled={submitting}
+                    >
+                      拒绝
+                    </button>
+                  ) : null}
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        className="interrupt-card__submit"
+        disabled={!ready || submitting}
+        onClick={submitDecisions}
+      >
+        {submitting ? "正在恢复任务…" : "提交并继续"}
+      </button>
+    </section>
+  );
+}
+
 export default function App() {
   const apiUrl = import.meta.env.VITE_LANGGRAPH_API_URL ?? "http://127.0.0.1:2024";
   const assistantId = import.meta.env.VITE_LANGGRAPH_ASSISTANT_ID ?? "supervisor";
@@ -201,11 +390,22 @@ export default function App() {
   const [polledTasks, setPolledTasks] = useState<Record<string, AsyncTask>>({});
   const [tasksRefreshing, setTasksRefreshing] = useState(false);
   const [taskRefreshError, setTaskRefreshError] = useState("");
+  const [dismissedTaskFailures, setDismissedTaskFailures] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [artifacts, setArtifacts] = useState<DownloadableArtifact[]>([]);
+  const [artifactsLoading, setArtifactsLoading] = useState(false);
+  const [artifactError, setArtifactError] = useState("");
+  const [downloadingPath, setDownloadingPath] = useState<string>();
+  const [interruptSubmitting, setInterruptSubmitting] = useState(false);
+  const [interruptError, setInterruptError] = useState("");
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const endRef = useRef<HTMLDivElement>(null);
   const previousLoadingRef = useRef(false);
   const taskPollInFlightRef = useRef(false);
   const autoCollectedTaskRunsRef = useRef<Set<string>>(new Set());
+  const approvedSemanticDownloadRef = useRef(false);
+  const semanticDownloadBaselineRef = useRef<string | null>(null);
   const authHeaders = useMemo<Record<string, string>>(
     () => {
       const headers: Record<string, string> = {};
@@ -262,7 +462,32 @@ export default function App() {
     }
   }, [apiUrl, assistantId, authHeaders]);
 
-  const stream = useStream<StreamState>({
+  const loadArtifacts = useCallback(async (signal?: AbortSignal) => {
+    if (!threadId) {
+      setArtifacts([]);
+      return;
+    }
+    setArtifactsLoading(true);
+    try {
+      const response = await fetch(`${apiUrl}/artifacts/${encodeURIComponent(threadId)}`, {
+        headers: authHeaders,
+        signal,
+      });
+      if (!response.ok) {
+        throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法读取研究产物");
+      }
+      const payload = await response.json() as ArtifactListResponse;
+      setArtifacts(Array.isArray(payload.artifacts) ? payload.artifacts : []);
+      setArtifactError("");
+    } catch (error) {
+      if (signal?.aborted) return;
+      setArtifactError(error instanceof Error ? error.message : "暂时无法读取研究产物");
+    } finally {
+      if (!signal?.aborted) setArtifactsLoading(false);
+    }
+  }, [apiUrl, authHeaders, threadId]);
+
+  const stream = useStream<StreamState, { InterruptType: HITLRequest }>({
     apiUrl,
     assistantId,
     threadId,
@@ -304,10 +529,38 @@ export default function App() {
     }),
     [polledTasks, trackedTasks],
   );
+  const failedTasks = useMemo(
+    () => tasks.filter(
+      (task) => FAILED_ASYNC_TASK_STATUSES.has(task.status)
+        && !dismissedTaskFailures.has(taskRunKey(task)),
+    ),
+    [dismissedTaskFailures, tasks],
+  );
   const runningTaskCount = tasks.filter(
     (task) => task.status === "running" || task.status === "pending",
   ).length;
-  const identitySwitchBlocked = stream.isLoading || stream.queue.size > 0 || runningTaskCount > 0;
+  const pendingInterrupt = useMemo(
+    () => hitlRequest(stream.interrupt?.value),
+    [stream.interrupt?.value],
+  );
+  const latestPreparedDownload = useMemo(() => {
+    for (let index = stream.messages.length - 1; index >= 0; index -= 1) {
+      const message = stream.messages[index] as Message;
+      if (message.type !== "tool") continue;
+      const artifact = fileDownloadArtifact(message.artifact);
+      if (artifact) {
+        return {
+          key: message.tool_call_id ?? message.id ?? `${artifact.path}-${index}`,
+          artifact,
+        };
+      }
+    }
+    return null;
+  }, [stream.messages]);
+  const identitySwitchBlocked = stream.isLoading
+    || stream.queue.size > 0
+    || runningTaskCount > 0
+    || pendingInterrupt !== null;
   const pollingTaskKey = tasks
     .filter((task) => task.status === "running" || task.status === "pending")
     .map((task) => `${task.task_id}:${task.run_id ?? ""}`)
@@ -353,6 +606,36 @@ export default function App() {
     }
   }, [apiUrl, authHeaders, threadId]);
 
+  const downloadArtifact = useCallback(async (artifact: DownloadableArtifact) => {
+    if (!threadId) throw new Error("请先打开包含该文件的会话");
+    setDownloadingPath(artifact.path);
+    setArtifactError("");
+    try {
+      const query = new URLSearchParams({ path: artifact.path });
+      const response = await fetch(
+        `${apiUrl}/artifacts/${encodeURIComponent(threadId)}/download?${query.toString()}`,
+        { headers: authHeaders },
+      );
+      if (!response.ok) {
+        throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "文件下载失败");
+      }
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = artifact.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 0);
+    } catch (error) {
+      setArtifactError(error instanceof Error ? error.message : "文件下载失败");
+      throw error;
+    } finally {
+      setDownloadingPath(undefined);
+    }
+  }, [apiUrl, authHeaders, threadId]);
+
   useEffect(() => {
     const controller = new AbortController();
     void loadSessions(controller.signal);
@@ -360,9 +643,35 @@ export default function App() {
   }, [loadSessions]);
 
   useEffect(() => {
-    if (previousLoadingRef.current && !stream.isLoading) void loadSessions();
+    const controller = new AbortController();
+    void loadArtifacts(controller.signal);
+    return () => controller.abort();
+  }, [loadArtifacts]);
+
+  useEffect(() => {
+    if (!threadId || !latestPreparedDownload) return;
+    if (!approvedSemanticDownloadRef.current) return;
+    if (latestPreparedDownload.key === semanticDownloadBaselineRef.current) return;
+    const storageKey = `deep-data-download:${threadId}:${latestPreparedDownload.key}`;
+    if (window.sessionStorage.getItem(storageKey)) {
+      approvedSemanticDownloadRef.current = false;
+      semanticDownloadBaselineRef.current = null;
+      return;
+    }
+    // 在发起请求前标记，避免密集流式更新触发重复浏览器下载。
+    approvedSemanticDownloadRef.current = false;
+    semanticDownloadBaselineRef.current = null;
+    window.sessionStorage.setItem(storageKey, "1");
+    void downloadArtifact(latestPreparedDownload.artifact).catch(() => undefined);
+  }, [downloadArtifact, latestPreparedDownload, threadId]);
+
+  useEffect(() => {
+    if (previousLoadingRef.current && !stream.isLoading) {
+      void loadSessions();
+      void loadArtifacts();
+    }
     previousLoadingRef.current = stream.isLoading;
-  }, [loadSessions, stream.isLoading]);
+  }, [loadArtifacts, loadSessions, stream.isLoading]);
 
   useEffect(() => {
     if (!authToken) {
@@ -395,8 +704,13 @@ export default function App() {
   useEffect(() => {
     setPolledTasks({});
     setTaskRefreshError("");
+    setDismissedTaskFailures(new Set());
+    setArtifactError("");
+    setInterruptError("");
     setVisibleRowLimit(INITIAL_VISIBLE_ROW_LIMIT);
     autoCollectedTaskRunsRef.current.clear();
+    approvedSemanticDownloadRef.current = false;
+    semanticDownloadBaselineRef.current = null;
   }, [threadId]);
 
   useEffect(() => {
@@ -481,6 +795,30 @@ export default function App() {
     );
   }
 
+  async function resumeInterrupt(decisions: HITLDecision[]) {
+    setInterruptSubmitting(true);
+    setInterruptError("");
+    approvedSemanticDownloadRef.current = decisions.some(
+      (decision) => decision.type === "approve",
+    );
+    semanticDownloadBaselineRef.current = approvedSemanticDownloadRef.current
+      ? latestPreparedDownload?.key ?? null
+      : null;
+    try {
+      await stream.submit(null, {
+        command: { resume: { decisions } },
+        streamResumable: true,
+        onDisconnect: "continue",
+      });
+    } catch (error) {
+      approvedSemanticDownloadRef.current = false;
+      semanticDownloadBaselineRef.current = null;
+      setInterruptError(error instanceof Error ? error.message : "暂时无法恢复任务");
+    } finally {
+      setInterruptSubmitting(false);
+    }
+  }
+
   function onSubmit(event: FormEvent) {
     event.preventDefault();
     submitText(input);
@@ -519,7 +857,10 @@ export default function App() {
   }
 
   function startNewThread() {
-    const activeWorkCount = runningTaskCount + stream.queue.size + Number(stream.isLoading);
+    const activeWorkCount = runningTaskCount
+      + stream.queue.size
+      + Number(stream.isLoading)
+      + Number(pendingInterrupt !== null);
     if (
       activeWorkCount > 0
       && !window.confirm(
@@ -767,6 +1108,88 @@ export default function App() {
             ),
           )}
 
+          {failedTasks.length > 0 ? (
+            <section className="task-failure-alert" role="alert" aria-live="assertive">
+              <header>
+                <div>
+                  <p className="eyebrow">后台采集异常</p>
+                  <h2>有 {failedTasks.length} 个任务未正常完成</h2>
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭后台任务失败提醒"
+                  onClick={() => setDismissedTaskFailures((current) => {
+                    const next = new Set(current);
+                    failedTasks.forEach((task) => next.add(taskRunKey(task)));
+                    return next;
+                  })}
+                >
+                  知道了
+                </button>
+              </header>
+              <ul>
+                {failedTasks.map((task) => (
+                  <li key={taskRunKey(task)}>
+                    <strong>
+                      {task.agent_name ?? "crawl-worker"} · {TASK_FAILURE_LABEL[task.status]}
+                    </strong>
+                    <code>{task.task_id}</code>
+                    <span>{task.error_summary ?? "子任务未正常完成，请检查任务详情。"}</span>
+                  </li>
+                ))}
+              </ul>
+              <p>系统不会自动原样重试，请先根据错误原因调整任务或服务配置。</p>
+            </section>
+          ) : null}
+
+          {pendingInterrupt ? (
+            <InterruptCard
+              key={stream.interrupt?.id ?? "current-interrupt"}
+              request={pendingInterrupt}
+              submitting={interruptSubmitting}
+              onResume={(decisions) => void resumeInterrupt(decisions)}
+            />
+          ) : null}
+
+          {interruptError ? (
+            <div className="error-card" role="alert">
+              <strong>无法恢复任务</strong>
+              <span>{interruptError}</span>
+            </div>
+          ) : null}
+
+          {artifactsLoading || artifacts.length > 0 || artifactError ? (
+            <section className="artifact-card" aria-labelledby="artifact-title">
+              <header>
+                <div>
+                  <p className="eyebrow">当前会话</p>
+                  <h2 id="artifact-title">研究产物</h2>
+                </div>
+                {artifactsLoading ? <span>正在同步…</span> : null}
+              </header>
+              {artifacts.length > 0 ? (
+                <ul>
+                  {artifacts.map((artifact) => (
+                    <li key={artifact.path}>
+                      <div>
+                        <strong>{artifact.filename}</strong>
+                        <span>{formatFileSize(artifact.size)} · {artifact.path}</span>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={downloadingPath === artifact.path}
+                        onClick={() => void downloadArtifact(artifact).catch(() => undefined)}
+                      >
+                        {downloadingPath === artifact.path ? "下载中…" : "下载"}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {artifactError ? <p className="artifact-card__error">{artifactError}</p> : null}
+            </section>
+          ) : null}
+
           {stream.queue.size > 0 ? (
             <section className="queue-card" aria-labelledby="queue-title">
               <header>
@@ -818,7 +1241,11 @@ export default function App() {
         <form className="composer" onSubmit={onSubmit}>
           <div className="composer__field">
             <label htmlFor="research-input">
-              {stream.isLoading ? "补充要求或纠正方向" : "描述你的网页数据任务"}
+              {pendingInterrupt
+                ? "请先处理上方待确认事项"
+                : stream.isLoading
+                  ? "补充要求或纠正方向"
+                  : "描述你的网页数据任务"}
             </label>
             <textarea
               id="research-input"
@@ -827,9 +1254,12 @@ export default function App() {
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onComposerKeyDown}
               placeholder="例如：抓取某个公开站点的产品页面，比较价格并列出来源……"
+              disabled={pendingInterrupt !== null}
             />
             <span>
-              {stream.isLoading
+              {pendingInterrupt
+                ? "任务已暂停，提交决定后将从原位置继续"
+                : stream.isLoading
                 ? "Enter 排队发送 · Shift + Enter 换行"
                 : "Enter 发送 · Shift + Enter 换行"}
             </span>
@@ -838,13 +1268,13 @@ export default function App() {
             <button
               className="send-button"
               type="submit"
-              disabled={!input.trim()}
+              disabled={!input.trim() || pendingInterrupt !== null}
               aria-label={stream.isLoading ? "排队发送消息" : "发送研究任务"}
             >
               <span>{stream.isLoading ? "排队发送" : "发送任务"}</span>
               <i aria-hidden="true">↗</i>
             </button>
-            {stream.isLoading ? (
+            {stream.isLoading && !pendingInterrupt ? (
               <button
                 className="interrupt-button"
                 type="button"

@@ -3,25 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from langgraph_sdk import get_client
 from pydantic import BaseModel, Field
 
-from deep_data_research_agent import database
+from deep_data_research_agent import database, sandbox_manager
 from deep_data_research_agent.auth import bearer_token
+from deep_data_research_agent.interaction_tools import DOWNLOADABLE_SUFFIXES
 from deep_data_research_agent.memory import start_memory_worker
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
 _PASSWORD_HASHER = PasswordHasher()
-_TERMINAL_TASK_STATUSES = frozenset(
-    {"cancelled", "success", "error", "timeout", "interrupted"}
-)
+_FAILED_TASK_STATUSES = frozenset({"error", "timeout", "interrupted"})
 
 
 class RegisterRequest(BaseModel):
@@ -39,6 +41,102 @@ class AsyncTaskStatusRequest(BaseModel):
     """Identify the owning Supervisor thread; task IDs come from its state."""
 
     thread_id: str = Field(min_length=1, max_length=64)
+
+
+def _sanitized_task_error(status: str, error: object = None) -> str | None:
+    """Convert remote run failures to safe, user-facing summaries."""
+
+    if status == "timeout":
+        return "子任务执行超时，请缩小任务范围后重试。"
+    if status == "interrupted":
+        return "子任务已中断，需要恢复或重新发起。"
+    if status != "error":
+        return None
+
+    # Only classify known exception categories. Never expose traceback paths,
+    # request content, provider responses, credentials, or arbitrary messages.
+    raw = str(error or "")
+    if "TypeError" in raw:
+        return "子任务发生内部类型错误，原样重试通常不会成功。"
+    if "ValidationError" in raw or "JSONDecodeError" in raw:
+        return "子任务结果格式或数据校验失败。"
+    if any(name in raw for name in ("ConnectError", "ConnectionError")):
+        return "子任务无法连接所需服务。"
+    if "Timeout" in raw:
+        return "子任务访问外部服务或执行过程超时。"
+    if "PermissionError" in raw:
+        return "子任务访问所需资源时权限不足。"
+    return "子任务执行失败，详细诊断信息已保留在 LangSmith。"
+
+
+async def _authenticated_user_id(authorization: str | None) -> str:
+    """Resolve the current user without silently accepting an invalid token."""
+
+    token = bearer_token(authorization)
+    if token is None:
+        return database.DEFAULT_USER_ID
+    user = await database.resolve_login_session(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+    return user.id
+
+
+def _workspace_artifacts(root: Path) -> list[dict[str, object]]:
+    """List user-facing artifacts without following links outside the snapshot."""
+
+    if not root.is_dir():
+        return []
+    resolved_root = root.resolve()
+    artifacts: list[dict[str, object]] = []
+    for candidate in resolved_root.rglob("*"):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(resolved_root):
+            continue
+        relative = resolved.relative_to(resolved_root)
+        if relative.parts[0] == "raw":
+            continue
+        if resolved.suffix.lower() not in DOWNLOADABLE_SUFFIXES:
+            continue
+        mime_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        artifacts.append(
+            {
+                "path": f"/workspace/{relative.as_posix()}",
+                "filename": resolved.name,
+                "size": resolved.stat().st_size,
+                "mime_type": mime_type,
+            }
+        )
+    return sorted(
+        artifacts,
+        key=lambda item: (
+            item["path"] != "/workspace/final_report.md",
+            str(item["path"]),
+        ),
+    )
+
+
+def _download_path(root: Path, virtual_path: str) -> Path:
+    """Resolve one virtual workspace path while rejecting traversal and links."""
+
+    try:
+        relative = sandbox_manager.workspace_relative_path(virtual_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if relative.suffix.lower() not in DOWNLOADABLE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="下载文件类型不受支持")
+
+    resolved_root = root.resolve()
+    candidate = resolved_root / Path(*relative.parts)
+    if candidate.is_symlink():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    target = candidate.resolve()
+    if not target.is_relative_to(resolved_root):
+        raise HTTPException(status_code=400, detail="下载路径越过工作区")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return target
 
 
 def _user_payload(user: database.UserRecord) -> dict[str, object]:
@@ -138,6 +236,45 @@ async def current_user(
     return {"user": _user_payload(user)}
 
 
+@app.get("/artifacts/{thread_id}")
+async def list_artifacts(
+    thread_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    """List downloadable Supervisor files owned by the current user."""
+
+    user_id = await _authenticated_user_id(authorization)
+    if await database.get_thread_owner(thread_id) != user_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+        thread_id,
+        "supervisor",
+        user_id=user_id,
+    )
+    return {"artifacts": await asyncio.to_thread(_workspace_artifacts, root)}
+
+
+@app.get("/artifacts/{thread_id}/download")
+async def download_artifact(
+    thread_id: str,
+    path: str = Query(..., min_length=1),
+    authorization: str | None = Header(default=None),
+) -> FileResponse:
+    """Download one authenticated file from a Supervisor workspace snapshot."""
+
+    user_id = await _authenticated_user_id(authorization)
+    if await database.get_thread_owner(thread_id) != user_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+        thread_id,
+        "supervisor",
+        user_id=user_id,
+    )
+    target = await asyncio.to_thread(_download_path, root, path)
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return FileResponse(target, media_type=media_type, filename=target.name)
+
+
 @app.post("/async-tasks/status")
 async def async_task_status(
     payload: AsyncTaskStatusRequest,
@@ -173,24 +310,38 @@ async def async_task_status(
 
     async def inspect_task(task_id: str, raw_task: object) -> dict[str, object]:
         if not isinstance(raw_task, dict):
-            return {"task_id": task_id, "status": "error", "poll_error": "任务记录格式无效"}
+            return {
+                "task_id": task_id,
+                "status": "error",
+                "error_summary": "后台任务记录无效。",
+            }
 
         task = dict(raw_task)
         task["task_id"] = str(task.get("task_id") or task_id)
         cached_status = str(task.get("status") or "running")
-        if cached_status in _TERMINAL_TASK_STATUSES:
+        if cached_status in {"success", "cancelled"}:
             return task
 
         child_thread_id = str(task.get("thread_id") or task["task_id"])
         run_id = str(task.get("run_id") or "")
         if not run_id:
-            task["poll_error"] = "任务缺少 run_id"
+            if cached_status in _FAILED_TASK_STATUSES:
+                task["error_summary"] = _sanitized_task_error(cached_status)
+            else:
+                task["poll_error"] = "任务缺少 run_id"
             return task
         try:
             run = await client.runs.get(thread_id=child_thread_id, run_id=run_id)
-            task["status"] = str(run.get("status") or cached_status)
+            live_status = str(run.get("status") or cached_status)
+            task["status"] = live_status
+            error_summary = _sanitized_task_error(live_status, run.get("error"))
+            if error_summary is not None:
+                task["error_summary"] = error_summary
         except Exception:  # noqa: BLE001 - keep the last known state on polling errors.
-            task["poll_error"] = "暂时无法获取实时状态"
+            if cached_status in _FAILED_TASK_STATUSES:
+                task["error_summary"] = _sanitized_task_error(cached_status)
+            else:
+                task["poll_error"] = "暂时无法获取实时状态"
         return task
 
     tasks = await asyncio.gather(

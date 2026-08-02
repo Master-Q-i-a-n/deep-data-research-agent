@@ -110,6 +110,59 @@ async def test_async_task_status_queries_child_run_without_model(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_async_task_status_returns_sanitized_failure(monkeypatch) -> None:
+    async def get_owner(_thread_id: str) -> str:
+        return database.DEFAULT_USER_ID
+
+    class Threads:
+        async def get(self, *, thread_id: str) -> dict[str, object]:
+            assert thread_id == "parent-thread"
+            return {
+                "values": {
+                    "async_tasks": {
+                        "child-thread": {
+                            "task_id": "child-thread",
+                            "thread_id": "child-thread",
+                            "run_id": "run-1",
+                            "agent_name": "crawl-worker",
+                            "status": "running",
+                        }
+                    }
+                }
+            }
+
+    class Runs:
+        async def get(self, *, thread_id: str, run_id: str) -> dict[str, str]:
+            assert (thread_id, run_id) == ("child-thread", "run-1")
+            return {
+                "status": "error",
+                "error": (
+                    "TypeError: failure in C:\\private\\workspace "
+                    "with token secret-value"
+                ),
+            }
+
+    monkeypatch.setattr(database, "get_thread_owner", get_owner)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(agent_client=SimpleNamespace(threads=Threads(), runs=Runs()))
+        )
+    )
+
+    result = await webapp.async_task_status(
+        webapp.AsyncTaskStatusRequest(thread_id="parent-thread"),
+        request,
+        None,
+    )
+
+    task = result["tasks"][0]
+    assert task["status"] == "error"
+    assert task["error_summary"] == "子任务发生内部类型错误，原样重试通常不会成功。"
+    assert "private" not in task["error_summary"]
+    assert "secret-value" not in task["error_summary"]
+
+
+@pytest.mark.asyncio
 async def test_async_task_status_hides_other_users_thread(monkeypatch) -> None:
     async def get_owner(_thread_id: str) -> str:
         return "another-user"

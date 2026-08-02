@@ -16,6 +16,8 @@ const TOOL_LABELS: Record<string, string> = {
   cancel_async_task: "取消采集任务",
   list_async_tasks: "读取任务列表",
   assign_skill: "分配 Skill",
+  ask_user: "请求补充信息",
+  request_report_download: "准备报告下载",
   write_file: "写入研究产物",
   read_file: "读取研究产物",
   edit_file: "编辑研究产物",

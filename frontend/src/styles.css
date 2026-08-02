@@ -470,6 +470,31 @@ code, pre {
 .working-card button { padding: 6px 9px; color: var(--muted); cursor: pointer; border: 1px solid var(--line); border-radius: 7px; background: transparent; font-size: 0.68rem; }
 .error-card { align-items: flex-start; flex-direction: column; border-color: rgba(180, 74, 74, 0.3); }
 .error-card strong { color: var(--danger); }
+.task-failure-alert {
+  margin: 20px 0;
+  padding: 16px 18px;
+  border: 1px solid rgba(180, 74, 74, 0.42);
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(180, 74, 74, 0.12), rgba(255, 255, 255, 0.78));
+  box-shadow: 0 12px 28px rgba(110, 36, 36, 0.08);
+}
+.task-failure-alert > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.task-failure-alert h2 { margin: 2px 0 0; color: var(--danger); font-size: 0.92rem; }
+.task-failure-alert > header button {
+  padding: 5px 9px;
+  color: var(--danger);
+  cursor: pointer;
+  border: 1px solid rgba(180, 74, 74, 0.26);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.55);
+  font-size: 0.66rem;
+}
+.task-failure-alert ul { margin: 13px 0 0; padding: 0; list-style: none; }
+.task-failure-alert li { display: grid; gap: 3px; padding: 9px 0; border-top: 1px solid rgba(180, 74, 74, 0.14); }
+.task-failure-alert li strong { color: #9e3838; font-size: 0.75rem; }
+.task-failure-alert li code { overflow-wrap: anywhere; color: var(--muted); font-size: 0.62rem; }
+.task-failure-alert li span, .task-failure-alert > p { color: #76565a; font-size: 0.69rem; line-height: 1.5; }
+.task-failure-alert > p { margin: 8px 0 0; }
 
 .queue-card {
   margin: 20px 0;
@@ -504,6 +529,64 @@ code, pre {
   font-size: 0.74rem;
 }
 .queue-card li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.interrupt-card,
+.artifact-card {
+  margin: 20px 0;
+  padding: 18px;
+  border: 1px solid rgba(54, 89, 217, 0.24);
+  border-radius: 14px 3px 14px 14px;
+  background: rgba(251, 252, 253, 0.92);
+  box-shadow: 0 12px 34px rgba(32, 58, 69, 0.07);
+}
+.interrupt-card > header,
+.artifact-card > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.interrupt-card h2,
+.artifact-card h2 { margin: 0; font-size: 0.92rem; }
+.interrupt-card__request { margin-top: 14px; display: grid; gap: 9px; }
+.interrupt-card__request > strong { font-size: 0.8rem; }
+.interrupt-card__request > span { color: var(--muted); font-size: 0.7rem; }
+.interrupt-card__request code {
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+  border-radius: 8px;
+  background: rgba(23, 49, 61, 0.06);
+  font-size: 0.72rem;
+}
+.interrupt-card__request textarea {
+  width: 100%;
+  padding: 10px 12px;
+  resize: vertical;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: white;
+}
+.interrupt-card__choices { display: flex; gap: 9px; }
+.interrupt-card__choices button,
+.interrupt-card__submit,
+.artifact-card li button {
+  min-height: 34px;
+  padding: 0 13px;
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  cursor: pointer;
+}
+.interrupt-card__choices .is-selected,
+.interrupt-card__submit:not(:disabled) { color: white; border-color: var(--cobalt); background: var(--cobalt); }
+.interrupt-card__choices .is-rejected { color: white; border-color: var(--danger); background: var(--danger); }
+.interrupt-card__submit { margin-top: 15px; }
+.interrupt-card button:disabled,
+.artifact-card button:disabled { cursor: not-allowed; opacity: 0.55; }
+.artifact-card > header > span { color: var(--muted); font-size: 0.68rem; }
+.artifact-card ul { margin: 12px 0 0; padding: 0; list-style: none; }
+.artifact-card li { padding: 10px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid rgba(206, 219, 225, 0.7); }
+.artifact-card li > div { min-width: 0; display: grid; gap: 3px; }
+.artifact-card li strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.76rem; }
+.artifact-card li span { overflow-wrap: anywhere; color: var(--muted); font-size: 0.64rem; }
+.artifact-card__error { margin: 12px 0 0; color: var(--danger); font-size: 0.7rem; }
 
 .composer { position: fixed; right: 318px; bottom: 0; left: 282px; z-index: 5; padding: 18px clamp(24px, 3vw, 48px) 24px; display: flex; align-items: stretch; justify-content: center; gap: 12px; border-top: 1px solid rgba(23, 49, 61, 0.1); background: linear-gradient(180deg, rgba(234, 240, 243, 0.55), rgba(234, 240, 243, 0.98) 24%); backdrop-filter: blur(14px); }
 .composer__field { width: min(760px, 100%); padding: 11px 14px 8px; border: 1px solid #bdccd3; border-radius: 14px 3px 14px 14px; background: var(--paper); box-shadow: 0 12px 36px rgba(32, 58, 69, 0.08); }

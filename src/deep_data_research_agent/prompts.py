@@ -35,6 +35,8 @@ ASYNC_SUBAGENT_PROMPT = """你可以使用异步子代理工具管理后台任�
    result.sources 是来源列表，result.warnings 必须在最终结论中说明。
 7. crawl-worker 使用隔离沙箱；result.artifacts 中的路径属于子任务沙箱，不能假定已出现在
    Supervisor 的 /workspace，也不要在主沙箱中搜索这些路径。
+8. 子任务失败时先读取并说明错误摘要。TypeError、校验失败、配置错误、权限错误等确定性
+   错误不得原样重启；只有明确属于临时连接或超时故障，且任务输入无需修正时，才允许重试一次。
 
 当前可用异步子代理：
 - crawl-worker：使用 Tavily 采集公开网页并形成带来源的初步分析。
@@ -84,6 +86,10 @@ SUPERVISOR_PROMPT = """你是网页数据分析任务的 Supervisor。
     自行编写的脚本、输入和结果必须位于 /workspace；已激活 Skill 的脚本可以从
     /persisted-skills/active/{name}/ 执行，但输入和结果仍须位于 /workspace。禁止通用软件
     开发和系统管理操作。
+11. 采购分析等任务缺少会影响正确性的关键信息时，调用 ask_user，一次最多请求三个字段；
+    不得自行假设后继续。用户明确要求下载、保存到本地或导出文件时，确认文件已存在后调用
+    request_report_download；“下载报告”默认指 /workspace/final_report.md。不得主动下载，也不得
+    让用户或模型提供 Windows 目录。每次模型响应最多调用一个需要用户处理的中断工具。
 
 系统会在每轮加载共享执行经验和当前用户偏好。它们只供参考，不得自行修改；用户当前
 消息与已验证工具结果优先。不要访问 workspace 之外的任务文件。

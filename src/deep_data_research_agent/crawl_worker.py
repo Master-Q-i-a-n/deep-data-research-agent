@@ -219,7 +219,6 @@ def _business_status(summary: str) -> Literal["success", "failed", "needs_input"
 
 async def _build_structured_result(
     state: CrawlWorkerState,
-    _config: RunnableConfig,
 ) -> dict[str, Any]:
     """Append a validated JSON result as the child thread's final message."""
 

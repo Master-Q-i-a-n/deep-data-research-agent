@@ -8,6 +8,7 @@ from deep_data_research_agent.backends import (
     create_backend,
 )
 from deep_data_research_agent.config import create_chat_model
+from deep_data_research_agent.interaction_tools import INTERACTION_TOOLS
 from deep_data_research_agent.memory import (
     AGENT_MEMORY_PATHS,
     USER_PREFERENCES_PATH,
@@ -33,7 +34,7 @@ graph = create_deep_agent(
     name="supervisor",
     model=create_chat_model(),
     system_prompt=SUPERVISOR_PROMPT,
-    tools=ASSIGN_SKILL_TOOL,
+    tools=[*ASSIGN_SKILL_TOOL, *INTERACTION_TOOLS],
     middleware=[
         SandboxLifecycleMiddleware(
             component="supervisor",
@@ -85,4 +86,10 @@ graph = create_deep_agent(
     ],
     backend=create_backend,
     permissions=FILESYSTEM_PERMISSIONS,
+    interrupt_on={
+        "ask_user": {"allowed_decisions": ["respond"]},
+        "request_report_download": {
+            "allowed_decisions": ["approve", "reject"],
+        },
+    },
 )

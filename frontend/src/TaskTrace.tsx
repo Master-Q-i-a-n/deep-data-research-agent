@@ -18,6 +18,7 @@ export type AsyncTask = {
   created_at?: string;
   last_checked_at?: string;
   last_updated_at?: string;
+  error_summary?: string;
   poll_error?: string;
 };
 
@@ -124,6 +125,9 @@ export default function TaskTrace({
                 </div>
                 <code title={task.task_id}>{shortId(task.task_id)}</code>
                 <small>{formatCheckedAt(task.last_checked_at)}</small>
+                {task.error_summary ? (
+                  <small className="trace-item__error">{task.error_summary}</small>
+                ) : null}
                 {task.poll_error ? <small className="trace-item__error">{task.poll_error}</small> : null}
 
                 <div className="trace-item__actions">

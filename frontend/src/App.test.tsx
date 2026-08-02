@@ -41,6 +41,16 @@ function createStreamState() {
     ],
     isLoading: false,
     error: null,
+    interrupt: undefined as {
+      id?: string;
+      value?: {
+        action_requests: Array<{ name: string; args: Record<string, unknown> }>;
+        review_configs: Array<{
+          action_name: string;
+          allowed_decisions: Array<"approve" | "reject" | "respond">;
+        }>;
+      };
+    } | undefined,
     submit,
     stop,
     switchThread,
@@ -69,6 +79,7 @@ vi.mock("@langchain/react", () => ({
 beforeEach(() => {
   streamState = createStreamState();
   window.localStorage.clear();
+  window.sessionStorage.clear();
   vi.spyOn(window, "confirm").mockReturnValue(true);
   vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => ({
     ok: true,
@@ -87,6 +98,7 @@ afterEach(() => {
   capturedOptions = null;
   window.history.replaceState({}, "", "http://localhost:5174/");
   window.localStorage.clear();
+  window.sessionStorage.clear();
 });
 
 describe("研究工作台", () => {
@@ -318,6 +330,41 @@ describe("研究工作台", () => {
     expect(submit).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["error", "子任务发生内部类型错误，原样重试通常不会成功。", "执行失败"],
+    ["timeout", "子任务执行超时，请缩小任务范围后重试。", "执行超时"],
+    ["interrupted", "子任务已中断，需要恢复或重新发起。", "执行中断"],
+  ] as const)("任务状态为 %s 时显示本地提醒且不启动模型", async (
+    status,
+    errorSummary,
+    statusLabel,
+  ) => {
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => ({
+      ok: true,
+      json: async () => (String(input).endsWith("/async-tasks/status")
+        ? {
+            tasks: [{
+              ...streamState.values.async_tasks["task-123456789"],
+              status,
+              error_summary: errorSummary,
+            }],
+          }
+        : []),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("有 1 个任务未正常完成")).toBeTruthy());
+    expect(screen.getAllByText(errorSummary).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(`crawl-worker · ${statusLabel}`)).toBeTruthy();
+    expect(submit).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭后台任务失败提醒" }));
+    expect(screen.queryByText("有 1 个任务未正常完成")).toBeNull();
+  });
+
   it("Supervisor 忙碌时保持输入可用并把普通消息排队", () => {
     streamState.isLoading = true;
     render(<App />);
@@ -441,6 +488,150 @@ describe("研究工作台", () => {
     });
 
     expect(window.location.search).toBe("?thread=thread-abc");
+  });
+
+  it("采购信息不足时提交 respond 恢复原任务", async () => {
+    streamState.interrupt = {
+      id: "interrupt-ask",
+      value: {
+        action_requests: [{
+          name: "ask_user",
+          args: {
+            question: "本次采购数量是多少？",
+            missing_fields: ["采购数量"],
+            known_information: "型号为 A100",
+          },
+        }],
+        review_configs: [{
+          action_name: "ask_user",
+          allowed_decisions: ["respond"],
+        }],
+      },
+    };
+    render(<App />);
+
+    fireEvent.change(screen.getByPlaceholderText("请输入补充信息"), {
+      target: { value: "采购 500 件，交付到上海" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "提交并继续" }));
+
+    await waitFor(() => expect(submit).toHaveBeenCalledWith(null, {
+      command: {
+        resume: {
+          decisions: [{ type: "respond", message: "采购 500 件，交付到上海" }],
+        },
+      },
+      streamResumable: true,
+      onDisconnect: "continue",
+    }));
+    expect(
+      (screen.getByLabelText("请先处理上方待确认事项") as HTMLTextAreaElement).disabled,
+    ).toBe(true);
+  });
+
+  it("语义下载要求批准后恢复下载工具", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-a");
+    const createObjectURL = vi.fn().mockReturnValue("blob:semantic-report");
+    Object.defineProperty(window.URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(window.URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/artifacts/thread-a/download")) {
+        return { ok: true, blob: async () => new Blob(["# 报告"]) };
+      }
+      if (url.endsWith("/artifacts/thread-a")) {
+        return { ok: true, json: async () => ({ artifacts: [] }) };
+      }
+      return { ok: true, json: async () => [] };
+    }));
+    streamState.interrupt = {
+      id: "interrupt-download",
+      value: {
+        action_requests: [{
+          name: "request_report_download",
+          args: { file_path: "/workspace/final_report.md" },
+        }],
+        review_configs: [{
+          action_name: "request_report_download",
+          allowed_decisions: ["approve", "reject"],
+        }],
+      },
+    };
+    const rendered = render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "批准下载" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交并继续" }));
+
+    await waitFor(() => expect(submit).toHaveBeenCalledWith(null, {
+      command: { resume: { decisions: [{ type: "approve" }] } },
+      streamResumable: true,
+      onDisconnect: "continue",
+    }));
+
+    streamState.interrupt = undefined;
+    const mutableStream = streamState as unknown as {
+      messages: Array<Record<string, unknown>>;
+    };
+    mutableStream.messages = [
+      ...mutableStream.messages,
+      {
+        id: "tool-download",
+        type: "tool",
+        tool_call_id: "call-download",
+        content: "文件已准备下载",
+        artifact: {
+          type: "file_download",
+          path: "/workspace/final_report.md",
+          filename: "final_report.md",
+          size: 8,
+        },
+      },
+    ];
+    rendered.rerender(<App />);
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+  });
+
+  it("研究产物按钮通过鉴权接口下载文件", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-a");
+    const createObjectURL = vi.fn().mockReturnValue("blob:report");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(window.URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(window.URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/artifacts/thread-a/download")) {
+        return { ok: true, blob: async () => new Blob(["# 报告"]) };
+      }
+      if (url.endsWith("/artifacts/thread-a")) {
+        return {
+          ok: true,
+          json: async () => ({
+            artifacts: [{
+              path: "/workspace/final_report.md",
+              filename: "final_report.md",
+              size: 8,
+              mime_type: "text/markdown",
+            }],
+          }),
+        };
+      }
+      return { ok: true, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("final_report.md")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "下载" }));
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+    expect(anchorClick).toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/artifacts/thread-a/download?path=%2Fworkspace%2Ffinal_report.md",
+      { headers: {} },
+    );
   });
 
   it("开始新任务时清空草稿并切换到空 thread", () => {

@@ -5,10 +5,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from deep_data_research_agent.agent import graph as supervisor_graph
-from deep_data_research_agent.crawl_worker import (
-    _build_structured_result,
-    crawl_agent,
-)
+from deep_data_research_agent.crawl_worker import crawl_agent
 from deep_data_research_agent.crawl_worker import graph as worker_graph
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +16,8 @@ def test_supervisor_exposes_assign_skill_and_async_crawl_tools() -> None:
 
     assert supervisor_graph.name == "supervisor"
     assert "assign_skill" in tools
+    assert "ask_user" in tools
+    assert "request_report_download" in tools
     assert "start_async_task" in tools
     assert "check_async_task" in tools
     assert "task" not in tools
@@ -42,7 +41,9 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
 
 @pytest.mark.asyncio
 async def test_crawl_worker_builds_validated_artifact_result() -> None:
-    update = await _build_structured_result(
+    # Invoke the node as compiled by LangGraph so argument-injection mistakes
+    # cannot be hidden by manually supplying extra Python function arguments.
+    update = await worker_graph.nodes["build_result"].ainvoke(
         {
             "messages": [
                 AIMessage(
