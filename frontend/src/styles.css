@@ -186,6 +186,8 @@ code, pre {
 
 .trace-empty { position: relative; display: grid; grid-template-columns: 13px 1fr; gap: 10px; margin-top: 14px; color: rgba(238, 246, 247, 0.47); font-size: 0.75rem; }
 .trace-empty p { margin: 0; }
+.trace-refresh-error, .trace-item__body .trace-item__error { color: #f0a09a; }
+.trace-refresh-error { margin: -8px 0 14px; font-size: 0.7rem; line-height: 1.5; }
 .trace-empty__node { width: 9px; height: 9px; margin-top: 3px; border: 2px dashed rgba(190, 215, 218, 0.35); border-radius: 50%; }
 .trace-item { position: relative; display: grid; grid-template-columns: 13px 1fr; gap: 10px; padding-bottom: 17px; }
 .trace-item__body { min-width: 0; }
@@ -398,6 +400,9 @@ code, pre {
 .topbar__status i.is-active { background: linear-gradient(90deg, var(--cobalt), var(--aqua)); animation: status-breathe 1.5s ease-in-out infinite; }
 
 .conversation { width: min(920px, calc(100% - 48px)); flex: 1; margin: 0 auto; padding: 48px 0 180px; }
+.message, .tool-card { content-visibility: auto; contain-intrinsic-size: auto 180px; }
+.load-earlier { width: 100%; margin: 0 0 24px; padding: 10px 14px; color: var(--muted); border: 1px solid var(--line); border-radius: 9px; background: rgba(251, 252, 253, 0.72); cursor: pointer; }
+.load-earlier:hover { color: var(--ink); border-color: rgba(54, 89, 217, 0.28); }
 .empty-state { padding: clamp(30px, 5vw, 64px) 0 24px; }
 .empty-state__index { margin: 0 0 26px; color: var(--cobalt); font: 600 0.66rem "Cascadia Code", monospace; letter-spacing: 0.16em; text-transform: uppercase; }
 .empty-state h2 { max-width: 680px; margin: 0; font-family: "Songti SC", "Noto Serif SC", Georgia, serif; font-size: clamp(2.35rem, 6vw, 5.4rem); font-weight: 600; line-height: 1.04; letter-spacing: -0.055em; }
@@ -411,6 +416,7 @@ code, pre {
 .message > header { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; color: var(--muted); font-size: 0.67rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; }
 .message > header i { width: 22px; height: 1px; background: currentColor; opacity: 0.45; }
 .markdown-body { padding: 20px 22px; border: 1px solid var(--line); border-radius: 4px 18px 18px 18px; background: rgba(251, 252, 253, 0.92); box-shadow: 0 10px 30px rgba(33, 58, 70, 0.04); line-height: 1.78; }
+.markdown-body--streaming { white-space: pre-wrap; overflow-wrap: anywhere; }
 .message--human {
   width: fit-content;
   max-width: min(72%, 680px);

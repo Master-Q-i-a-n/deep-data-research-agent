@@ -96,6 +96,42 @@ def _handle(sandbox_id: str, *, healthy: bool = True):
     )
 
 
+def test_opensandbox_backend_preserves_multiline_json_output() -> None:
+    """DeepAgents glob must receive one parseable JSON object per line."""
+
+    class FakeCommands:
+        def run(self, _command, *, opts):
+            assert opts is not None
+            return SimpleNamespace(
+                id="command-1",
+                logs=SimpleNamespace(
+                    stdout=[
+                        SimpleNamespace(
+                            text='{"path": "report.md", "is_dir": false}'
+                        ),
+                        SimpleNamespace(
+                            text='{"path": "raw", "is_dir": true}'
+                        ),
+                    ],
+                    stderr=[],
+                ),
+            )
+
+        def get_command_status(self, _command_id):
+            return SimpleNamespace(exit_code=0)
+
+    sandbox = SimpleNamespace(id="sandbox-lines", commands=FakeCommands())
+    backend = sandbox_manager._LinePreservingOpensandboxBackend(sandbox=sandbox)
+
+    result = backend.glob("**/*", path="/workspace")
+
+    assert result.error is None
+    assert result.matches == [
+        {"path": "report.md", "is_dir": False},
+        {"path": "raw", "is_dir": True},
+    ]
+
+
 def test_runtime_thread_id_prefers_execution_info() -> None:
     runtime = SimpleNamespace(
         execution_info=SimpleNamespace(thread_id="graph-thread"),
@@ -403,7 +439,11 @@ async def test_export_and_restore_workspace(tmp_path) -> None:
 
     exported = await manager.export_workspace("thread-a")
 
-    assert exported == 2
+    assert len(exported) == 2
+    assert {item["path"] for item in exported} == {
+        "/workspace/report.md",
+        "/workspace/raw/page.md",
+    }
     assert (
         tmp_path
         / "local-user"
@@ -516,7 +556,7 @@ async def test_real_opensandbox_write_execute_and_export(tmp_path) -> None:
         result = await backend.aexecute("cd /workspace && python hello.py")
         assert result.exit_code == 0
         assert "sandbox-ok" in result.output
-        assert await manager.export_workspace(thread_id) == 1
+        assert len(await manager.export_workspace(thread_id)) == 1
         assert (
             tmp_path
             / "local-user"

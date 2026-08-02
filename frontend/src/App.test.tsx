@@ -19,6 +19,8 @@ function createStreamState() {
       async_tasks: {
         "task-123456789": {
           task_id: "task-123456789",
+          thread_id: "task-123456789",
+          run_id: "run-123456789",
           agent_name: "crawl-worker",
           status: "running" as const,
           last_checked_at: "2026-07-28T11:42:10Z",
@@ -68,10 +70,10 @@ beforeEach(() => {
   streamState = createStreamState();
   window.localStorage.clear();
   vi.spyOn(window, "confirm").mockReturnValue(true);
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => ({
     ok: true,
-    json: async () => [],
-  }));
+    json: async () => (String(input).endsWith("/async-tasks/status") ? { tasks: [] } : []),
+  })));
 });
 
 afterEach(() => {
@@ -266,6 +268,54 @@ describe("研究工作台", () => {
     render(<App />);
 
     expect(capturedOptions?.reconnectOnMount).toBe(true);
+    expect(capturedOptions?.throttle).toBe(60);
+  });
+
+  it("直接轮询后台任务状态而不启动 Supervisor run", async () => {
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => ({
+      ok: true,
+      json: async () => (String(input).endsWith("/async-tasks/status")
+        ? { tasks: [{ ...streamState.values.async_tasks["task-123456789"], status: "running" }] }
+        : []),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
+
+    render(<App />);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/async-tasks/status",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ thread_id: "parent-thread" }),
+      }),
+    ));
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("任务完成后只启动一次 Supervisor run 自动读取结果", async () => {
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => ({
+      ok: true,
+      json: async () => (String(input).endsWith("/async-tasks/status")
+        ? { tasks: [{ ...streamState.values.async_tasks["task-123456789"], status: "success" }] }
+        : []),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
+
+    render(<App />);
+
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
+      messages: [{
+        type: "human",
+        name: "async-task-monitor",
+        content: "后台任务 task-123456789 已完成。请调用 check_async_task 读取结果并继续处理，不要重新启动任务。",
+      }],
+    }, {
+      streamResumable: true,
+      onDisconnect: "continue",
+    }));
+    expect(submit).toHaveBeenCalledTimes(1);
   });
 
   it("Supervisor 忙碌时保持输入可用并把普通消息排队", () => {

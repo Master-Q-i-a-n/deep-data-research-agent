@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 export type ToolCard = {
   callId: string;
@@ -21,6 +21,8 @@ const TOOL_LABELS: Record<string, string> = {
   edit_file: "编辑研究产物",
 };
 
+const TOOL_PREVIEW_LIMIT = 8_000;
+
 function formatValue(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2);
@@ -29,9 +31,23 @@ function formatValue(value: unknown): string {
   }
 }
 
-export default function ToolCallCard({ card }: { card: ToolCard }) {
+function previewValue(value: string): string {
+  if (value.length <= TOOL_PREVIEW_LIMIT) return value;
+  return `${value.slice(0, TOOL_PREVIEW_LIMIT)}\n\n…内容过长，仅显示前 ${TOOL_PREVIEW_LIMIT} 个字符。`;
+}
+
+function ToolCallCard({ card }: { card: ToolCard }) {
   const [open, setOpen] = useState(card.status === "pending");
   const previousStatus = useRef(card.status);
+  // 折叠时不序列化或挂载大结果，避免每个流式 token 都处理完整网页正文。
+  const argsPreview = useMemo(
+    () => (open ? previewValue(formatValue(card.args)) : ""),
+    [card.args, open],
+  );
+  const resultPreview = useMemo(
+    () => (open && card.result !== null ? previewValue(card.result) : null),
+    [card.result, open],
+  );
 
   useEffect(() => {
     if (previousStatus.current === "pending" && card.status === "done") {
@@ -53,18 +69,28 @@ export default function ToolCallCard({ card }: { card: ToolCard }) {
           {card.status === "pending" ? "执行中" : "已完成"}
         </span>
       </summary>
-      <div className="tool-card__details">
-        <div>
-          <span className="tool-card__label">输入</span>
-          <pre>{formatValue(card.args)}</pre>
-        </div>
-        {card.result !== null ? (
+      {open ? (
+        <div className="tool-card__details">
           <div>
-            <span className="tool-card__label">结果</span>
-            <pre>{card.result}</pre>
+            <span className="tool-card__label">输入</span>
+            <pre>{argsPreview}</pre>
           </div>
-        ) : null}
-      </div>
+          {resultPreview !== null ? (
+            <div>
+              <span className="tool-card__label">结果</span>
+              <pre>{resultPreview}</pre>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </details>
   );
 }
+
+
+export default memo(ToolCallCard, (previous, next) => (
+  previous.card.callId === next.card.callId
+  && previous.card.status === next.card.status
+  && previous.card.args === next.card.args
+  && previous.card.result === next.card.result
+));

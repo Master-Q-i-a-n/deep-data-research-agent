@@ -1,8 +1,14 @@
 import json
 from pathlib import Path
 
+import pytest
+from langchain_core.messages import AIMessage
+
 from deep_data_research_agent.agent import graph as supervisor_graph
-from deep_data_research_agent.crawl_worker import crawl_agent
+from deep_data_research_agent.crawl_worker import (
+    _build_structured_result,
+    crawl_agent,
+)
 from deep_data_research_agent.crawl_worker import graph as worker_graph
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,10 +33,40 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
         "ensure_sandbox",
         "crawl_agent",
         "export_workspace",
+        "build_result",
     } <= set(worker_graph.nodes)
     assert {"tavily_search", "tavily_crawl", "tavily_extract"} <= set(tools)
     assert "execute" in tools
     assert "task" not in tools
+
+
+@pytest.mark.asyncio
+async def test_crawl_worker_builds_validated_artifact_result() -> None:
+    update = await _build_structured_result(
+        {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "status: success\n发现 3 个有效来源。\n"
+                        "[示例来源](https://example.com/report)"
+                    )
+                )
+            ],
+            "exported_artifacts": [
+                {"path": "/workspace/crawl_report.md", "size": 128},
+                {"path": "/workspace/raw/page.md", "size": 64},
+            ],
+        },
+        {},
+    )
+
+    result = json.loads(update["messages"][0].content)
+    assert result["status"] == "success"
+    assert result["artifacts"][0]["type"] == "report"
+    assert result["artifacts"][1]["type"] == "source"
+    assert result["sources"] == [
+        {"title": "示例来源", "url": "https://example.com/report"}
+    ]
 
 
 def test_agents_enable_the_expected_memory_sources() -> None:

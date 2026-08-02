@@ -12,7 +12,7 @@ from deep_data_research_agent.memory import (
     AGENT_MEMORY_PATHS,
     USER_PREFERENCES_PATH,
     AgentExperienceEnqueueMiddleware,
-    AsyncTaskPreferenceForwardingMiddleware,
+    AsyncTaskBridgeMiddleware,
     MemoryRefreshMiddleware,
     UserPreferenceUpdateMiddleware,
 )
@@ -72,7 +72,7 @@ graph = create_deep_agent(
                 ),
             ],
         ),
-        AsyncTaskPreferenceForwardingMiddleware(),
+        AsyncTaskBridgeMiddleware(),
         ReloadableSkillsMiddleware(
             backend=create_backend,
             sources=[

@@ -12,12 +12,14 @@ from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from deepagents.backends.protocol import ExecuteResponse
 from deepagents_opensandbox import OpensandboxBackend
 from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
 from opensandbox import SandboxSync
 from opensandbox.config import ConnectionConfigSync
 from opensandbox.exceptions import SandboxException
+from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import NetworkPolicy
 
 from deep_data_research_agent.config import Settings, get_settings
@@ -78,6 +80,14 @@ def _trace_backend_output(
 
 def _trace_file_count(output: int) -> dict[str, int]:
     return {"file_count": output}
+
+
+def _trace_export_output(
+    output: list[dict[str, Any]] | None,
+) -> dict[str, int]:
+    """Keep artifact contents out of traces while exposing the export count."""
+
+    return {"file_count": len(output or [])}
 
 
 def _trace_sync_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -153,6 +163,46 @@ def _write_local_workspace(
             raise ValueError(f"拒绝导出工作区之外的文件：{relative}")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+
+
+class _LinePreservingOpensandboxBackend(OpensandboxBackend):
+    """Preserve boundaries between OpenSandbox stdout/stderr messages.
+
+    ``deepagents-opensandbox==1.0.2`` concatenates output messages without a
+    delimiter. DeepAgents' ``ls`` and ``glob`` emit one JSON object per line,
+    so concatenation makes a valid multi-line response impossible to parse.
+    """
+
+    def execute(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+    ) -> ExecuteResponse:
+        opts = RunCommandOpts()
+        if timeout is not None:
+            opts = RunCommandOpts(timeout=timedelta(seconds=timeout))
+
+        execution = self._sandbox.commands.run(command, opts=opts)
+        stdout = "\n".join(
+            message.text.rstrip("\n") for message in execution.logs.stdout
+        )
+        stderr = "\n".join(
+            message.text.rstrip("\n") for message in execution.logs.stderr
+        )
+        output = stdout
+        if stderr:
+            output = f"{output}\n{stderr}" if output else stderr
+
+        exit_code: int | None = None
+        if execution.id:
+            status = self._sandbox.commands.get_command_status(execution.id)
+            exit_code = status.exit_code
+        return ExecuteResponse(
+            output=output,
+            exit_code=exit_code,
+            truncated=False,
+        )
 
 
 @dataclass(slots=True)
@@ -373,7 +423,7 @@ class SandboxManager:
 
         handle = _SandboxHandle(
             sandbox=sandbox,
-            backend=OpensandboxBackend(sandbox=sandbox),
+            backend=_LinePreservingOpensandboxBackend(sandbox=sandbox),
             component=component,
             network_enabled=network_enabled,
         )
@@ -617,15 +667,15 @@ class SandboxManager:
         name="sandbox.export",
         run_type="chain",
         process_inputs=_trace_inputs,
-        process_outputs=_trace_file_count,
+        process_outputs=_trace_export_output,
     )
     async def export_workspace(
         self,
         thread_id: str,
         *,
         component: str = "crawl-worker",
-    ) -> int:
-        """Merge all sandbox workspace files into the local artifact directory."""
+    ) -> list[dict[str, Any]]:
+        """Export the workspace and return a content-free artifact manifest."""
 
         thread_id = sanitize_thread_id(thread_id)
         handle = self._get_handle(thread_id, component)
@@ -641,7 +691,7 @@ class SandboxManager:
             paths.append((_sandbox_path(relative), relative))
 
         if not paths:
-            return 0
+            return []
 
         responses = await handle.backend.adownload_files(
             [sandbox_path for sandbox_path, _relative in paths]
@@ -667,7 +717,13 @@ class SandboxManager:
             sandbox_id=handle.backend.id,
             image=self._settings.open_sandbox_image,
         )
-        return len(downloaded)
+        return [
+            {
+                "path": _sandbox_path(relative),
+                "size": len(content),
+            }
+            for relative, content in downloaded
+        ]
 
 
 SANDBOX_MANAGER = SandboxManager()

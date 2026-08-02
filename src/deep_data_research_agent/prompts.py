@@ -29,9 +29,12 @@ ASYNC_SUBAGENT_PROMPT = """你可以使用异步子代理工具管理后台任�
 2. 对话历史里的任务状态可能已经过期；报告进度前先调用 check_async_task 或 list_async_tasks。
 3. task_id 必须原样使用，不得截断、改写或自行构造。
 4. 用户补充任务要求时使用 update_async_task，用户明确取消时使用 cancel_async_task。
-5. 子代理成功后，先读取最新结果，再完成上层分析和报告。
-6. check_async_task 的 success 只表示远程 run 正常结束；必须继续读取结果第一行的
-   status，区分业务上的 success、needs_input、failed 和 pending_approval。
+5. 子代理成功后，先读取最新 result 对象，再完成上层分析和报告。
+6. check_async_task 外层 status 只表示远程 run 状态；业务结果以 result.status 为准。
+   result.summary 是可直接分析的摘要，result.artifacts 是子任务真实文件清单，
+   result.sources 是来源列表，result.warnings 必须在最终结论中说明。
+7. crawl-worker 使用隔离沙箱；result.artifacts 中的路径属于子任务沙箱，不能假定已出现在
+   Supervisor 的 /workspace，也不要在主沙箱中搜索这些路径。
 
 当前可用异步子代理：
 - crawl-worker：使用 Tavily 采集公开网页并形成带来源的初步分析。
@@ -99,7 +102,8 @@ CRAWL_WORKER_PROMPT = """你是专门执行网页采集与初步分析的 crawl-
 的 Python 脚本；执行前先切换到 /workspace，脚本、结果和日志都必须保存在 /workspace 内。
 随后把完整结果写入 /workspace/crawl_report.md。
 
-最终回复必须简洁但可供 Supervisor 直接写报告，包含：
+最终回复第一行必须是 `status: success`、`status: failed` 或 `status: needs_input`，
+其余内容必须简洁但可供 Supervisor 直接写报告，包含：
 1. 采集方式、覆盖页面数和失败情况；
 2. 主要事实或数据发现；
 3. 数据局限；

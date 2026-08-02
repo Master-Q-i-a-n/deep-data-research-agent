@@ -30,6 +30,7 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
+from langgraph.types import Command
 from langsmith import traceable
 from openai import APIConnectionError, APIStatusError, RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -563,11 +564,14 @@ class UserPreferenceUpdateMiddleware(AgentMiddleware):
             logger.exception("更新用户偏好失败，已跳过本轮偏好写入")
 
 
-class AsyncTaskPreferenceForwardingMiddleware(AgentMiddleware):
-    """Attach Supervisor preferences to crawl-worker start and update requests."""
+class AsyncTaskBridgeMiddleware(AgentMiddleware):
+    """Forward preferences and normalize crawl-worker's structured result."""
 
     async def awrap_tool_call(self, request, handler):
         tool_name = getattr(request.tool, "name", "")
+        if tool_name == "check_async_task":
+            response = await handler(request)
+            return self._normalize_check_response(response)
         if tool_name not in {"start_async_task", "update_async_task"}:
             return await handler(request)
 
@@ -589,6 +593,53 @@ class AsyncTaskPreferenceForwardingMiddleware(AgentMiddleware):
         tool_call = dict(request.tool_call)
         tool_call["args"] = arguments
         return await handler(request.override(tool_call=tool_call))
+
+    @staticmethod
+    def _normalize_check_response(response: Any) -> Any:
+        """Parse the child JSON once so the Supervisor receives an object."""
+
+        if not isinstance(response, Command) or not isinstance(response.update, dict):
+            return response
+
+        changed = False
+        messages: list[Any] = []
+        for message in response.update.get("messages", []):
+            if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
+                messages.append(message)
+                continue
+            try:
+                outer = json.loads(message.content)
+                inner = json.loads(outer.get("result", ""))
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                messages.append(message)
+                continue
+            if not isinstance(inner, dict) or not {
+                "status",
+                "summary",
+                "artifacts",
+                "sources",
+                "warnings",
+            } <= inner.keys():
+                messages.append(message)
+                continue
+            outer["result"] = inner
+            messages.append(
+                message.model_copy(
+                    update={"content": json.dumps(outer, ensure_ascii=False)}
+                )
+            )
+            changed = True
+
+        if not changed:
+            return response
+        update = dict(response.update)
+        update["messages"] = messages
+        return Command(
+            graph=response.graph,
+            update=update,
+            resume=response.resume,
+            goto=response.goto,
+        )
 
     @staticmethod
     def _is_crawl_worker_call(tool_name: str, arguments: dict[str, Any], state: Any) -> bool:

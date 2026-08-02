@@ -1,9 +1,11 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.store.memory import InMemoryStore
+from langgraph.types import Command
 from pydantic import ValidationError
 
 from deep_data_research_agent import memory
@@ -196,10 +198,43 @@ async def test_async_task_forwarding_adds_preferences_once() -> None:
         seen.append(modified.tool_call["args"]["description"])
         return "ok"
 
-    middleware = memory.AsyncTaskPreferenceForwardingMiddleware()
+    middleware = memory.AsyncTaskBridgeMiddleware()
     assert await middleware.awrap_tool_call(request, handler) == "ok"
     assert seen[0].count("<user_preferences>") == 1
     assert "preferred_currency: CNY" in seen[0]
+
+
+def test_async_task_bridge_parses_structured_child_result() -> None:
+    child_result = {
+        "status": "success",
+        "summary": "采集完成",
+        "artifacts": [],
+        "sources": [],
+        "warnings": [],
+    }
+    outer = {
+        "status": "success",
+        "thread_id": "child-thread",
+        "result": json.dumps(child_result, ensure_ascii=False),
+    }
+    response = Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=json.dumps(outer, ensure_ascii=False),
+                    tool_call_id="call-check",
+                )
+            ],
+            "async_tasks": {},
+        }
+    )
+
+    normalized = memory.AsyncTaskBridgeMiddleware._normalize_check_response(
+        response
+    )
+    payload = json.loads(normalized.update["messages"][0].content)
+
+    assert payload["result"] == child_result
 
 
 def test_experience_payload_is_bounded_and_redacted() -> None:

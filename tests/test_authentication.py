@@ -4,7 +4,7 @@ import pytest
 from starlette.requests import Request
 
 from deep_data_research_agent import auth as auth_module
-from deep_data_research_agent import database
+from deep_data_research_agent import database, webapp
 
 
 def _request(authorization: str | None = None) -> Request:
@@ -65,3 +65,61 @@ async def test_thread_create_stamps_and_claims_owner(monkeypatch) -> None:
     assert value["metadata"]["owner"] == "user-a"
     assert claims == [("thread-a", "user-a")]
 
+
+@pytest.mark.asyncio
+async def test_async_task_status_queries_child_run_without_model(monkeypatch) -> None:
+    async def get_owner(_thread_id: str) -> str:
+        return database.DEFAULT_USER_ID
+
+    class Threads:
+        async def get(self, *, thread_id: str) -> dict[str, object]:
+            assert thread_id == "parent-thread"
+            return {
+                "values": {
+                    "async_tasks": {
+                        "child-thread": {
+                            "task_id": "child-thread",
+                            "thread_id": "child-thread",
+                            "run_id": "run-1",
+                            "agent_name": "crawl-worker",
+                            "status": "running",
+                        }
+                    }
+                }
+            }
+
+    class Runs:
+        async def get(self, *, thread_id: str, run_id: str) -> dict[str, str]:
+            assert (thread_id, run_id) == ("child-thread", "run-1")
+            return {"status": "success"}
+
+    monkeypatch.setattr(database, "get_thread_owner", get_owner)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(agent_client=SimpleNamespace(threads=Threads(), runs=Runs()))
+        )
+    )
+
+    result = await webapp.async_task_status(
+        webapp.AsyncTaskStatusRequest(thread_id="parent-thread"),
+        request,
+        None,
+    )
+
+    assert result["tasks"][0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_async_task_status_hides_other_users_thread(monkeypatch) -> None:
+    async def get_owner(_thread_id: str) -> str:
+        return "another-user"
+
+    monkeypatch.setattr(database, "get_thread_owner", get_owner)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+    with pytest.raises(Exception, match="会话不存在"):
+        await webapp.async_task_status(
+            webapp.AsyncTaskStatusRequest(thread_id="private-thread"),
+            request,
+            None,
+        )

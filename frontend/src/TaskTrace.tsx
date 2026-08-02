@@ -12,10 +12,13 @@ export type AsyncTaskStatus =
 export type AsyncTask = {
   task_id: string;
   agent_name?: string;
+  thread_id?: string;
+  run_id?: string;
   status: AsyncTaskStatus;
   created_at?: string;
   last_checked_at?: string;
   last_updated_at?: string;
+  poll_error?: string;
 };
 
 const STATUS_LABEL: Record<AsyncTaskStatus, string> = {
@@ -49,6 +52,8 @@ type TaskTraceProps = {
   onUpdate: (taskId: string, message: string) => void;
   onCancel: (taskId: string) => void;
   onRefresh: () => void;
+  refreshing?: boolean;
+  refreshError?: string;
 };
 
 export default function TaskTrace({
@@ -57,6 +62,8 @@ export default function TaskTrace({
   onUpdate,
   onCancel,
   onRefresh,
+  refreshing = false,
+  refreshError = "",
 }: TaskTraceProps) {
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
   const [updateText, setUpdateText] = useState("");
@@ -91,12 +98,14 @@ export default function TaskTrace({
             type="button"
             className="trace-refresh"
             onClick={onRefresh}
-            disabled={tasks.length === 0}
+            disabled={tasks.length === 0 || refreshing}
           >
-            刷新
+            {refreshing ? "刷新中" : "刷新"}
           </button>
         </div>
       </div>
+
+      {refreshError ? <p className="trace-refresh-error">{refreshError}</p> : null}
 
       {tasks.length === 0 ? (
         <div className="trace-empty">
@@ -115,6 +124,7 @@ export default function TaskTrace({
                 </div>
                 <code title={task.task_id}>{shortId(task.task_id)}</code>
                 <small>{formatCheckedAt(task.last_checked_at)}</small>
+                {task.poll_error ? <small className="trace-item__error">{task.poll_error}</small> : null}
 
                 <div className="trace-item__actions">
                   {task.status !== "cancelled" ? (

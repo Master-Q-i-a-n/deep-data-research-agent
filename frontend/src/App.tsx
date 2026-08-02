@@ -1,15 +1,16 @@
-import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import SessionHistory, { type ConversationThread } from "./SessionHistory";
-import TaskTrace, { type AsyncTask } from "./TaskTrace";
+import TaskTrace, { type AsyncTask, type AsyncTaskStatus } from "./TaskTrace";
 import TodoPanel, { type TodoItem } from "./TodoPanel";
 import ToolCallCard, { type ToolCard } from "./ToolCallCard";
 
 type RawToolCall = { id?: string; name?: string; args?: unknown };
 type Message = {
   id?: string;
+  name?: string;
   type: string;
   content: unknown;
   tool_calls?: RawToolCall[];
@@ -28,6 +29,7 @@ type Row =
 
 type SubmitMode = "enqueue" | "interrupt";
 type AuthMode = "login" | "register";
+type AsyncTaskStatusResponse = { tasks?: AsyncTask[] };
 type AuthUser = {
   id: string;
   username: string;
@@ -35,6 +37,17 @@ type AuthUser = {
 };
 
 const AUTH_TOKEN_KEY = "deep-data-auth-token";
+const TASK_POLL_INTERVAL_MS = 4_000;
+const INITIAL_VISIBLE_ROW_LIMIT = 60;
+const ASYNC_TASK_STATUSES = new Set<AsyncTaskStatus>([
+  "pending",
+  "running",
+  "success",
+  "error",
+  "cancelled",
+  "timeout",
+  "interrupted",
+]);
 const DEFAULT_USER: AuthUser = {
   id: "local-user",
   username: "默认账户",
@@ -83,7 +96,8 @@ export function buildRows(messages: Message[]): Row[] {
   for (const message of messages) {
     if (message.type === "human" || message.type === "ai") {
       const body = messageText(message.content).trim();
-      if (body) {
+      const hiddenTaskMonitorMessage = message.type === "human" && message.name === "async-task-monitor";
+      if (body && !hiddenTaskMonitorMessage) {
         rows.push({
           kind: "message",
           key: message.id ?? `${message.type}-${rows.length}`,
@@ -130,6 +144,39 @@ function BrandMark() {
   );
 }
 
+type MessageCardProps = {
+  messageKey: string;
+  role: "human" | "ai";
+  body: string;
+  report: boolean;
+  streaming: boolean;
+};
+
+const MessageCard = memo(function MessageCard({
+  role,
+  body,
+  report,
+  streaming,
+}: MessageCardProps) {
+  return (
+    <article className={`message message--${role}${report ? " message--report" : ""}`}>
+      <header>
+        <span>{role === "human" ? "你" : report ? "研究报告" : "Supervisor"}</span>
+        <i aria-hidden="true" />
+      </header>
+      <div className={`markdown-body${streaming ? " markdown-body--streaming" : ""}`}>
+        {streaming ? body : <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>}
+      </div>
+    </article>
+  );
+}, (previous, next) => (
+  previous.messageKey === next.messageKey
+  && previous.role === next.role
+  && previous.body === next.body
+  && previous.report === next.report
+  && previous.streaming === next.streaming
+));
+
 export default function App() {
   const apiUrl = import.meta.env.VITE_LANGGRAPH_API_URL ?? "http://127.0.0.1:2024";
   const assistantId = import.meta.env.VITE_LANGGRAPH_ASSISTANT_ID ?? "supervisor";
@@ -151,8 +198,14 @@ export default function App() {
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState("");
   const [deletingThreadId, setDeletingThreadId] = useState<string>();
+  const [polledTasks, setPolledTasks] = useState<Record<string, AsyncTask>>({});
+  const [tasksRefreshing, setTasksRefreshing] = useState(false);
+  const [taskRefreshError, setTaskRefreshError] = useState("");
+  const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const endRef = useRef<HTMLDivElement>(null);
   const previousLoadingRef = useRef(false);
+  const taskPollInFlightRef = useRef(false);
+  const autoCollectedTaskRunsRef = useRef<Set<string>>(new Set());
   const authHeaders = useMemo<Record<string, string>>(
     () => {
       const headers: Record<string, string> = {};
@@ -213,6 +266,8 @@ export default function App() {
     apiUrl,
     assistantId,
     threadId,
+    // 合并密集 token/state 事件，避免每个事件都触发整页 React 渲染。
+    throttle: 60,
     reconnectOnMount: true,
     defaultHeaders: authHeaders,
     onThreadId: (id) => {
@@ -224,15 +279,79 @@ export default function App() {
   });
 
   const rows = useMemo(() => buildRows(stream.messages as Message[]), [stream.messages]);
+  const visibleRows = useMemo(
+    () => rows.slice(Math.max(0, rows.length - visibleRowLimit)),
+    [rows, visibleRowLimit],
+  );
+  const hiddenRowCount = rows.length - visibleRows.length;
+  const lastMessageKey = useMemo(() => {
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      const row = rows[index];
+      if (row?.kind === "message") return row.key;
+    }
+    return undefined;
+  }, [rows]);
   const todos = Array.isArray(stream.values?.todos) ? stream.values.todos : [];
-  const tasks = useMemo(
+  const trackedTasks = useMemo(
     () => Object.values(stream.values?.async_tasks ?? {}).reverse(),
     [stream.values?.async_tasks],
+  );
+  const tasks = useMemo(
+    () => trackedTasks.map((task) => {
+      const live = polledTasks[task.task_id];
+      if (!live || (live.run_id && task.run_id && live.run_id !== task.run_id)) return task;
+      return { ...task, ...live };
+    }),
+    [polledTasks, trackedTasks],
   );
   const runningTaskCount = tasks.filter(
     (task) => task.status === "running" || task.status === "pending",
   ).length;
   const identitySwitchBlocked = stream.isLoading || stream.queue.size > 0 || runningTaskCount > 0;
+  const pollingTaskKey = tasks
+    .filter((task) => task.status === "running" || task.status === "pending")
+    .map((task) => `${task.task_id}:${task.run_id ?? ""}`)
+    .sort()
+    .join("|");
+
+  const refreshTaskStatuses = useCallback(async (
+    signal?: AbortSignal,
+    showLoading = false,
+  ) => {
+    if (!threadId || taskPollInFlightRef.current) return;
+    taskPollInFlightRef.current = true;
+    if (showLoading) setTasksRefreshing(true);
+    try {
+      const response = await fetch(`${apiUrl}/async-tasks/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify({ thread_id: threadId }),
+        signal,
+      });
+      if (!response.ok) {
+        throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法刷新后台任务");
+      }
+      const payload = await response.json() as AsyncTaskStatusResponse;
+      if (!Array.isArray(payload.tasks)) throw new Error("任务状态服务返回了无效数据");
+
+      const checkedAt = new Date().toISOString();
+      setPolledTasks((current) => {
+        const next = { ...current };
+        for (const task of payload.tasks ?? []) {
+          if (!task?.task_id || !ASYNC_TASK_STATUSES.has(task.status)) continue;
+          next[task.task_id] = { ...task, last_checked_at: checkedAt };
+        }
+        return next;
+      });
+      setTaskRefreshError("");
+    } catch (error) {
+      if (signal?.aborted) return;
+      setTaskRefreshError(error instanceof Error ? error.message : "暂时无法刷新后台任务");
+    } finally {
+      taskPollInFlightRef.current = false;
+      if (showLoading && !signal?.aborted) setTasksRefreshing(false);
+    }
+  }, [apiUrl, authHeaders, threadId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -274,8 +393,68 @@ export default function App() {
   }, [apiUrl, authHeaders, authToken]);
 
   useEffect(() => {
+    setPolledTasks({});
+    setTaskRefreshError("");
+    setVisibleRowLimit(INITIAL_VISIBLE_ROW_LIMIT);
+    autoCollectedTaskRunsRef.current.clear();
+  }, [threadId]);
+
+  useEffect(() => {
+    if (!threadId || !pollingTaskKey) return undefined;
+    const controller = new AbortController();
+    const poll = () => {
+      if (!document.hidden) void refreshTaskStatuses(controller.signal);
+    };
+    const onVisibilityChange = () => {
+      if (!document.hidden) poll();
+    };
+
+    poll();
+    const intervalId = window.setInterval(poll, TASK_POLL_INTERVAL_MS);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      controller.abort();
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [pollingTaskKey, refreshTaskStatuses, threadId]);
+
+  useEffect(() => {
+    if (stream.isLoading || stream.queue.size > 0) return;
+    const trackedById = new Map(trackedTasks.map((task) => [task.task_id, task]));
+    const completed = tasks.filter((task) => {
+      const tracked = trackedById.get(task.task_id);
+      const runKey = `${task.task_id}:${task.run_id ?? ""}`;
+      return task.status === "success"
+        && tracked?.status !== "success"
+        && !autoCollectedTaskRunsRef.current.has(runKey);
+    });
+    if (completed.length === 0) return;
+
+    const runKeys = completed.map((task) => `${task.task_id}:${task.run_id ?? ""}`);
+    runKeys.forEach((key) => autoCollectedTaskRunsRef.current.add(key));
+    const taskIds = completed.map((task) => task.task_id).join("、");
+    void Promise.resolve(stream.submit(
+      {
+        messages: [{
+          type: "human",
+          name: "async-task-monitor",
+          content: `后台任务 ${taskIds} 已完成。请调用 check_async_task 读取结果并继续处理，不要重新启动任务。`,
+        }],
+      },
+      { streamResumable: true, onDisconnect: "continue" },
+    )).catch(() => {
+      runKeys.forEach((key) => autoCollectedTaskRunsRef.current.delete(key));
+      setTaskRefreshError("任务已完成，但自动读取结果失败，请点击“读取结果”重试");
+    });
+  }, [stream.isLoading, stream.queue.size, stream.submit, tasks, trackedTasks]);
+
+  useEffect(() => {
     // jsdom 等非完整浏览器环境可能不提供 scrollIntoView。
-    endRef.current?.scrollIntoView?.({ behavior: "smooth", block: "end" });
+    endRef.current?.scrollIntoView?.({
+      behavior: stream.isLoading ? "auto" : "smooth",
+      block: "end",
+    });
   }, [rows.length, stream.isLoading]);
 
   function submitText(text: string, mode: SubmitMode = "enqueue") {
@@ -336,7 +515,7 @@ export default function App() {
   }
 
   function refreshTasks() {
-    submitText("请调用 list_async_tasks，刷新当前会话所有异步任务的最新状态。");
+    void refreshTaskStatuses(undefined, true);
   }
 
   function startNewThread() {
@@ -563,22 +742,28 @@ export default function App() {
             </div>
           ) : null}
 
-          {rows.map((row) =>
+          {hiddenRowCount > 0 ? (
+            <button
+              type="button"
+              className="load-earlier"
+              onClick={() => setVisibleRowLimit((current) => current + INITIAL_VISIBLE_ROW_LIMIT)}
+            >
+              加载更早记录（还有 {hiddenRowCount} 条）
+            </button>
+          ) : null}
+
+          {visibleRows.map((row) =>
             row.kind === "tool" ? (
               <ToolCallCard key={row.key} card={row.card} />
             ) : (
-              <article
+              <MessageCard
                 key={row.key}
-                className={`message message--${row.role}${row.report ? " message--report" : ""}`}
-              >
-                <header>
-                  <span>{row.role === "human" ? "你" : row.report ? "研究报告" : "Supervisor"}</span>
-                  <i aria-hidden="true" />
-                </header>
-                <div className="markdown-body">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{row.body}</ReactMarkdown>
-                </div>
-              </article>
+                messageKey={row.key}
+                role={row.role}
+                body={row.body}
+                report={row.report}
+                streaming={stream.isLoading && row.role === "ai" && row.key === lastMessageKey}
+              />
             ),
           )}
 
@@ -680,6 +865,8 @@ export default function App() {
           onUpdate={updateTask}
           onCancel={cancelTask}
           onRefresh={refreshTasks}
+          refreshing={tasksRefreshing}
+          refreshError={taskRefreshError}
         />
         <TodoPanel todos={todos} />
       </aside>
