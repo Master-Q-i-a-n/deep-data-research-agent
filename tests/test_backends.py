@@ -49,11 +49,15 @@ def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
         "/state/",
         "/skills/",
         "/persisted-skills/",
+        "/memories/agent/",
+        "/memories/user/",
     }
     assert set(crawl.routes) == {
         "/state/",
         "/skills/",
         "/persisted-skills/",
+        "/memories/agent/",
+        "/memories/user/",
     }
     assert supervisor.routes["/skills/"] is crawl.routes["/skills/"]
     # /skill-manage/ 不配置路由，直接由默认 OpenSandbox 处理。
@@ -70,7 +74,8 @@ def test_persisted_skill_route_uses_store_backend(initialized_backends) -> None:
 
     assert isinstance(backend.routes["/persisted-skills/"], StoreBackend)
     assert "/user-skills/" not in backend.routes
-    assert "/memories/" not in backend.routes
+    assert "/memories/agent/" in backend.routes
+    assert isinstance(backend.routes["/memories/user/"], StoreBackend)
 
 
 @pytest.mark.asyncio

@@ -493,6 +493,8 @@ def test_worker_backend_uses_sandbox_as_default(tmp_path, monkeypatch) -> None:
         "/state/",
         "/skills/",
         "/persisted-skills/",
+        "/memories/agent/",
+        "/memories/user/",
     }
     assert backend.artifacts_root == "/state"
 

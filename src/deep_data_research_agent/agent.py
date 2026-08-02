@@ -8,6 +8,14 @@ from deep_data_research_agent.backends import (
     create_backend,
 )
 from deep_data_research_agent.config import create_chat_model
+from deep_data_research_agent.memory import (
+    AGENT_MEMORY_PATHS,
+    USER_PREFERENCES_PATH,
+    AgentExperienceEnqueueMiddleware,
+    AsyncTaskPreferenceForwardingMiddleware,
+    MemoryRefreshMiddleware,
+    UserPreferenceUpdateMiddleware,
+)
 from deep_data_research_agent.model_profile import register_mvp_profile
 from deep_data_research_agent.prompts import ASYNC_SUBAGENT_PROMPT, SUPERVISOR_PROMPT
 from deep_data_research_agent.skill_middleware import (
@@ -31,6 +39,13 @@ graph = create_deep_agent(
             component="supervisor",
             # Skill 的下载与依赖测试需要联网，supervisor 沙箱打开网络。
             network_enabled=True,
+        ),
+        # Directly configure DeepAgents' memory middleware with a read-only
+        # prompt, while refreshing checkpoint-cached contents every run.
+        MemoryRefreshMiddleware(
+            backend_factory=create_backend,
+            sources=[AGENT_MEMORY_PATHS["supervisor"], USER_PREFERENCES_PATH],
+            initialize_preferences=True,
         ),
         SkillsSyncMiddleware(
             component="supervisor",
@@ -57,6 +72,7 @@ graph = create_deep_agent(
                 ),
             ],
         ),
+        AsyncTaskPreferenceForwardingMiddleware(),
         ReloadableSkillsMiddleware(
             backend=create_backend,
             sources=[
@@ -64,6 +80,8 @@ graph = create_deep_agent(
                 ("/persisted-skills/active/", "用户"),
             ],
         ),
+        AgentExperienceEnqueueMiddleware(agent_name="supervisor"),
+        UserPreferenceUpdateMiddleware(),
     ],
     backend=create_backend,
     permissions=FILESYSTEM_PERMISSIONS,

@@ -33,6 +33,18 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
     assert "task" not in tools
 
 
+def test_agents_enable_the_expected_memory_sources() -> None:
+    supervisor_names = set(supervisor_graph.get_graph().nodes)
+    worker_names = set(crawl_agent.get_graph().nodes)
+
+    assert "MemoryRefreshMiddleware.before_agent" in supervisor_names
+    assert "MemoryRefreshMiddleware.before_agent" in worker_names
+    # The custom subclass replaces the duplicate memory= middleware and owns
+    # both refresh and read-only prompt injection.
+    assert "MemoryMiddleware.before_agent" not in supervisor_names
+    assert "MemoryMiddleware.before_agent" not in worker_names
+
+
 def test_supervisor_sandbox_lifecycle_precedes_skill_loading() -> None:
     edges = {
         (edge.source, edge.target)
@@ -41,6 +53,10 @@ def test_supervisor_sandbox_lifecycle_precedes_skill_loading() -> None:
 
     assert (
         "SandboxLifecycleMiddleware.before_agent",
+        "MemoryRefreshMiddleware.before_agent",
+    ) in edges
+    assert (
+        "MemoryRefreshMiddleware.before_agent",
         "SkillsSyncMiddleware.before_agent",
     ) in edges
     assert (
@@ -51,6 +67,7 @@ def test_supervisor_sandbox_lifecycle_precedes_skill_loading() -> None:
         "UserSkillsRestoreMiddleware.before_agent",
         "ReloadableSkillsMiddleware.before_agent",
     ) in edges
+    assert ("ReloadableSkillsMiddleware.before_agent", "model") in edges
 
 
 def test_only_supervisor_and_crawl_worker_are_public_graphs() -> None:

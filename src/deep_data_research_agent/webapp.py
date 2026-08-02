@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from deep_data_research_agent import database
 from deep_data_research_agent.auth import bearer_token
+from deep_data_research_agent.memory import start_memory_worker
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
 _PASSWORD_HASHER = PasswordHasher()
@@ -48,9 +49,12 @@ async def _issue_token(user: database.UserRecord) -> dict[str, object]:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await database.ensure_schema()
+    memory_worker = await start_memory_worker()
     try:
         yield
     finally:
+        if memory_worker is not None:
+            await memory_worker.stop()
         await database.close_database()
 
 
@@ -117,4 +121,3 @@ async def current_user(
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
     return {"user": _user_payload(user)}
-

@@ -66,3 +66,23 @@ async def test_config_user_claims_thread_before_checkpoint_write(monkeypatch, tm
     assert user_id == "user-a"
     assert claims == [("thread-a", "user-a")]
 
+
+@pytest.mark.asyncio
+async def test_delete_thread_removes_checkpoint_and_owner_claim(monkeypatch, tmp_path) -> None:
+    deleted_claims: list[tuple[str, str]] = []
+
+    async def get_owner(_thread_id: str) -> str:
+        return "user-a"
+
+    async def delete_claim(thread_id: str, user_id: str) -> None:
+        deleted_claims.append((thread_id, user_id))
+
+    monkeypatch.setattr(database, "get_thread_owner", get_owner)
+    monkeypatch.setattr(database, "delete_thread_claim", delete_claim)
+    checkpointer = UserScopedSqliteCheckpointer(tmp_path)
+    try:
+        await checkpointer.adelete_thread("thread-a")
+    finally:
+        await checkpointer.aclose()
+
+    assert deleted_claims == [("thread-a", "user-a")]

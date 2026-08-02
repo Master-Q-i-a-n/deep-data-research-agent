@@ -15,12 +15,22 @@ from deepagents.backends import (
 
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.identity import assigned_skill_namespace
+from deep_data_research_agent.memory import (
+    AGENT_MEMORY_ROOT,
+    user_preferences_namespace,
+)
 
 SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 # FilesystemBackend 构造时会同步解析本地路径，必须在模块导入阶段完成，不能在
 # ReloadableSkillsMiddleware.before_agent 的异步请求路径中重复初始化。
 _BUILTIN_SKILLS_BACKEND = FilesystemBackend(
     root_dir=SKILLS_ROOT,
+    virtual_mode=True,
+)
+# Shared Agent experience is managed only by system middleware.  The virtual
+# route keeps it outside sandboxes while still letting DeepAgents memory load it.
+_AGENT_MEMORY_BACKEND = FilesystemBackend(
+    root_dir=AGENT_MEMORY_ROOT,
     virtual_mode=True,
 )
 
@@ -47,6 +57,11 @@ def _sandbox_backend(
         "/skills/": _BUILTIN_SKILLS_BACKEND,
         "/persisted-skills/": StoreBackend(
             namespace=lambda rt: assigned_skill_namespace(rt, component),
+            file_format="v2",
+        ),
+        "/memories/agent/": _AGENT_MEMORY_BACKEND,
+        "/memories/user/": StoreBackend(
+            namespace=user_preferences_namespace,
             file_format="v2",
         ),
     }
@@ -104,6 +119,16 @@ FILESYSTEM_PERMISSIONS = [
         paths=["/persisted-skills/**"],
         mode="allow",
     ),
+    FilesystemPermission(
+        operations=["write"],
+        paths=["/memories/**"],
+        mode="deny",
+    ),
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/memories/**"],
+        mode="allow",
+    ),
 ]
 
 
@@ -131,6 +156,16 @@ WORKER_FILESYSTEM_PERMISSIONS = [
     FilesystemPermission(
         operations=["read"],
         paths=["/persisted-skills/**"],
+        mode="allow",
+    ),
+    FilesystemPermission(
+        operations=["write"],
+        paths=["/memories/**"],
+        mode="deny",
+    ),
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/memories/**"],
         mode="allow",
     ),
 ]

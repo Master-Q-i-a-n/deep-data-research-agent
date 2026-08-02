@@ -150,6 +150,7 @@ export default function App() {
   const [sessions, setSessions] = useState<ConversationThread[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState("");
+  const [deletingThreadId, setDeletingThreadId] = useState<string>();
   const endRef = useRef<HTMLDivElement>(null);
   const previousLoadingRef = useRef(false);
   const authHeaders = useMemo<Record<string, string>>(
@@ -364,6 +365,33 @@ export default function App() {
     window.history.replaceState({}, "", url);
   }
 
+  async function deleteSession(targetThreadId: string) {
+    if (deletingThreadId || (targetThreadId === threadId && identitySwitchBlocked)) return;
+    setDeletingThreadId(targetThreadId);
+    setSessionsError("");
+    try {
+      const response = await fetch(`${apiUrl}/threads/${encodeURIComponent(targetThreadId)}`, {
+        method: "DELETE",
+        headers: authHeaders,
+      });
+      if (!response.ok) {
+        throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "删除会话失败，请稍后重试");
+      }
+      setSessions((current) => current.filter((session) => session.thread_id !== targetThreadId));
+      if (targetThreadId === threadId) {
+        // 删除当前会话后直接进入空白会话，不保留已经删除的 URL。
+        stream.switchThread(null);
+        setThreadId(undefined);
+        setInput("");
+        window.history.replaceState({}, "", window.location.pathname);
+      }
+    } catch (error) {
+      setSessionsError(error instanceof Error ? error.message : "删除会话失败，请稍后重试");
+    } finally {
+      setDeletingThreadId(undefined);
+    }
+  }
+
   function resetThreadForIdentityChange() {
     stream.switchThread(null);
     setThreadId(undefined);
@@ -465,7 +493,10 @@ export default function App() {
           loading={sessionsLoading}
           error={sessionsError}
           switchingDisabled={stream.isLoading || stream.queue.size > 0}
+          deletingThreadId={deletingThreadId}
+          deleteCurrentDisabled={identitySwitchBlocked}
           onSelect={selectSession}
+          onDelete={(targetThreadId) => void deleteSession(targetThreadId)}
           onRefresh={() => void loadSessions()}
         />
 

@@ -15,6 +15,7 @@ BASE_AGENT_PROMPT = """你是一个能够规划和执行多步骤任务的深度
   - /persisted-skills/active/{name}/ 由 MongoDB 提供，并在每轮模型运行前同步到沙箱
     物理同路径；execute 运行已激活 Skill 脚本时，必须使用
     /persisted-skills/active/{name}/...。
+  - /memories/ → 长期记忆（只读，由系统自动维护，绝不调用 write_file 或 edit_file 修改）。
 - 只使用系统提供的工具，不声称执行了未实际调用的工具。
 - 工具失败时如实说明，不猜测工具结果或网页内容。
 - 最终回答使用用户的语言，优先给出清晰结论和可核验依据。
@@ -81,7 +82,8 @@ SUPERVISOR_PROMPT = """你是网页数据分析任务的 Supervisor。
     /persisted-skills/active/{name}/ 执行，但输入和结果仍须位于 /workspace。禁止通用软件
     开发和系统管理操作。
 
-Supervisor 没有长期记忆。不要访问 workspace 之外的任务文件。
+系统会在每轮加载共享执行经验和当前用户偏好。它们只供参考，不得自行修改；用户当前
+消息与已验证工具结果优先。不要访问 workspace 之外的任务文件。
 """
 
 
@@ -103,5 +105,6 @@ CRAWL_WORKER_PROMPT = """你是专门执行网页采集与初步分析的 crawl-
 3. 数据局限；
 4. 使用 [1]、[2] 编号的来源清单，每个编号对应一个 URL。
 
+系统会加载 crawl-worker 的共享执行经验；它只供参考，禁止自行修改 /memories/。
 不要返回整页原文，不要使用 Tavily 之外的联网方式，不要编写或执行通用软件开发代码。
 """

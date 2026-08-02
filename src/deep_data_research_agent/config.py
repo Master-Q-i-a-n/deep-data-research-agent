@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     mongodb_uri: str = ""
     mongodb_database: str = "deep_data_research_agent"
     mongodb_skill_collection: str = "skill_files"
+    mongodb_user_preferences_collection: str = "user_preferences"
+    mongodb_memory_job_collection: str = "memory_update_jobs"
+
+    # Long-term memory uses a small non-streaming JSON extraction call.  It can
+    # use a dedicated cheaper model, otherwise it reuses OPENAI_MODEL.
+    memory_model: str | None = None
+    memory_update_timeout_seconds: float = Field(default=10.0, ge=1, le=30)
+    memory_experience_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
 
     artifact_root: Path = Path("data/users")
 
@@ -87,4 +95,27 @@ def create_chat_model(
         timeout=settings.openai_timeout_seconds,
         max_retries=2,
         streaming=False if worker else settings.openai_streaming,
+    )
+
+
+@lru_cache(maxsize=2)
+def create_memory_model(*, background: bool = False) -> ChatOpenAI:
+    """Create a non-streaming model for preference or background extraction."""
+
+    settings = get_settings()
+    timeout = (
+        settings.memory_experience_timeout_seconds
+        if background
+        else settings.memory_update_timeout_seconds
+    )
+    return ChatOpenAI(
+        model=settings.memory_model or settings.openai_model,
+        api_key=settings.openai_api_key or "not-configured",
+        base_url=settings.openai_base_url,
+        temperature=0,
+        timeout=timeout,
+        # User-facing work must not wait behind model retries.  Background
+        # experience jobs have their own durable retry policy.
+        max_retries=0,
+        streaming=False,
     )

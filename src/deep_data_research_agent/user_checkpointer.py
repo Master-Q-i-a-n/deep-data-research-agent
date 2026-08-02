@@ -169,6 +169,7 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         if owner is None:
             return
         await (await self._saver(owner)).adelete_thread(thread_id)
+        await database.delete_thread_claim(thread_id, owner)
 
     async def adelete_for_runs(self, run_ids: Sequence[str]) -> None:
         # AsyncSqliteSaver 3.x does not expose run-to-thread routing.
@@ -219,4 +220,3 @@ async def create_user_checkpointer() -> AsyncIterator[UserScopedSqliteCheckpoint
         yield checkpointer
     finally:
         await checkpointer.aclose()
-

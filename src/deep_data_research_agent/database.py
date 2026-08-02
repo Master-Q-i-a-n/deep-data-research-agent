@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -279,3 +279,16 @@ async def get_thread_owner(thread_id: str) -> str | None:
         thread = await session.get(AgentThread, str(thread_id))
         return thread.user_id if thread is not None else None
 
+
+async def delete_thread_claim(thread_id: str, user_id: str) -> None:
+    """Remove the ownership row after the Agent Server deletes its checkpoint."""
+
+    await ensure_schema()
+    async with session_factory()() as session:
+        await session.execute(
+            delete(AgentThread).where(
+                AgentThread.thread_id == str(thread_id),
+                AgentThread.user_id == user_id,
+            )
+        )
+        await session.commit()

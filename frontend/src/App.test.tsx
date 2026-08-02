@@ -166,9 +166,41 @@ describe("研究工作台", () => {
       extract: { first_message: "values.messages[0].content" },
     }));
 
-    fireEvent.click(screen.getByRole("button", { name: /比较三家产品价格/ }));
+    fireEvent.click(screen.getByRole("button", { name: "打开会话：比较三家产品价格" }));
     expect(switchThread).toHaveBeenCalledWith("thread-new");
     expect(window.location.search).toBe("?thread=thread-new");
+  });
+
+  it("无需确认即可删除会话，删除当前会话后切换到新任务", async () => {
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-delete");
+    const fetchMock = vi.fn().mockImplementation(async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        return { ok: true, status: 204 };
+      }
+      return {
+        ok: true,
+        json: async () => ([{
+          thread_id: "thread-delete",
+          metadata: { kind: "conversation", title: "待删除的采购会话" },
+          status: "idle",
+          updated_at: "2026-08-01T00:10:00Z",
+        }]),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "删除会话：待删除的采购会话" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/threads/thread-delete",
+      expect.objectContaining({ method: "DELETE" }),
+    ));
+    expect(window.confirm).not.toHaveBeenCalled();
+    expect(switchThread).toHaveBeenCalledWith(null);
+    expect(window.location.search).toBe("");
+    expect(screen.queryByText("待删除的采购会话")).toBeNull();
   });
 
   it("展示 DeepAgents 计划、异步任务和工具调用", () => {

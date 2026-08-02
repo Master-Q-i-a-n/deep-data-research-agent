@@ -39,7 +39,10 @@ type SessionHistoryProps = {
   loading: boolean;
   error: string;
   switchingDisabled: boolean;
+  deletingThreadId?: string;
+  deleteCurrentDisabled: boolean;
   onSelect: (threadId: string) => void;
+  onDelete: (threadId: string) => void;
   onRefresh: () => void;
 };
 
@@ -49,7 +52,10 @@ export default function SessionHistory({
   loading,
   error,
   switchingDisabled,
+  deletingThreadId,
+  deleteCurrentDisabled,
   onSelect,
+  onDelete,
   onRefresh,
 }: SessionHistoryProps) {
   return (
@@ -75,20 +81,33 @@ export default function SessionHistory({
       <ol className="session-history__list">
         {sessions.map((session) => {
           const active = session.thread_id === currentThreadId;
+          const title = sessionTitle(session);
+          const deleting = session.thread_id === deletingThreadId;
           return (
             <li key={session.thread_id}>
               <button
                 type="button"
-                className={active ? "is-active" : ""}
+                className={`session-history__select${active ? " is-active" : ""}`}
                 disabled={switchingDisabled && !active}
                 onClick={() => onSelect(session.thread_id)}
                 aria-current={active ? "page" : undefined}
+                aria-label={`打开会话：${title}`}
               >
                 <span className={`session-history__status session-history__status--${session.status ?? "idle"}`} aria-hidden="true" />
                 <span className="session-history__content">
-                  <strong>{sessionTitle(session)}</strong>
+                  <strong>{title}</strong>
                   <small>{formatSessionTime(session)}</small>
                 </span>
+              </button>
+              <button
+                type="button"
+                className="session-history__delete"
+                disabled={Boolean(deletingThreadId) || (active && deleteCurrentDisabled)}
+                onClick={() => onDelete(session.thread_id)}
+                aria-label={`删除会话：${title}`}
+                title="删除会话"
+              >
+                {deleting ? "…" : "×"}
               </button>
             </li>
           );
