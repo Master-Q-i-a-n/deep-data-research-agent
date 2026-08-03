@@ -94,6 +94,18 @@ def create_worker_backend(runtime: Any) -> CompositeBackend:
 # DeepAgents evaluates these rules in order. Unmatched paths, such as
 # /workspace/** and /skill-manage/**, are handled by the isolated default sandbox.
 FILESYSTEM_PERMISSIONS = [
+    # HTTP 上传绕过 Agent 文件工具；模型只能读取原始输入，不能用
+    # write_file/edit_file 静默覆盖用户文件。
+    FilesystemPermission(
+        operations=["write"],
+        paths=["/workspace/input/**"],
+        mode="deny",
+    ),
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/workspace/input/**"],
+        mode="allow",
+    ),
     FilesystemPermission(
         operations=["write"],
         paths=["/skills/**"],

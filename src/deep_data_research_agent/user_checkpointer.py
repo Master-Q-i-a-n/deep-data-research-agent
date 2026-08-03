@@ -21,7 +21,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from deep_data_research_agent import database
+from deep_data_research_agent import database, sandbox_manager
 from deep_data_research_agent.config import get_settings
 
 _SAFE_DIRECTORY = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -169,6 +169,12 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         if owner is None:
             return
         await (await self._saver(owner)).adelete_thread(thread_id)
+        # Thread deletion is explicit user intent, so remove its uploaded files,
+        # generated artifacts and any still-live sandbox before dropping ownership.
+        await sandbox_manager.SANDBOX_MANAGER.delete_thread_resources(
+            thread_id,
+            user_id=owner,
+        )
         await database.delete_thread_claim(thread_id, owner)
 
     async def adelete_for_runs(self, run_ids: Sequence[str]) -> None:

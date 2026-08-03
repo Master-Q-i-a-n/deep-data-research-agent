@@ -39,3 +39,5 @@ Thumbs.db
 
 # 本地启动命令备忘，正式命令已记录在 README
 order.txt
+
+docker/

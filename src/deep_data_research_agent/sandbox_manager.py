@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import shlex
+import shutil
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
@@ -169,6 +170,36 @@ def _write_local_workspace(
             raise ValueError(f"拒绝导出工作区之外的文件：{relative}")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+
+
+def _delete_local_workspace_file(root: Path, relative: PurePosixPath) -> None:
+    """Delete one snapshot file without following links outside the workspace."""
+
+    resolved_root = root.resolve()
+    target = (root.joinpath(*relative.parts)).resolve()
+    if not target.is_relative_to(resolved_root):
+        raise ValueError(f"拒绝删除工作区之外的文件：{relative}")
+    if target.is_file() or target.is_symlink():
+        target.unlink()
+
+    # Remove empty parent directories but never remove the workspace root here.
+    parent = target.parent
+    while parent != resolved_root:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def _delete_local_job_root(root: Path, user_id: str, thread_id: str) -> None:
+    """Delete exactly one user's thread workspace tree."""
+
+    jobs_root = (root / user_id / "jobs").resolve()
+    target = (jobs_root / sanitize_thread_id(thread_id)).resolve()
+    if not target.is_relative_to(jobs_root):
+        raise ValueError("拒绝删除用户任务目录之外的路径")
+    shutil.rmtree(target, ignore_errors=True)
 
 
 class _LinePreservingOpensandboxBackend(OpensandboxBackend):
@@ -597,8 +628,9 @@ class SandboxManager:
         files: list[tuple[str, bytes]],
         *,
         component: str = "crawl-worker",
+        persist: bool = False,
     ) -> None:
-        """Upload and overwrite task files within the sandbox workspace."""
+        """Upload task files and optionally merge them into the local snapshot."""
 
         handle = self._get_handle(thread_id, component)
         normalized: list[tuple[str, bytes]] = []
@@ -614,6 +646,87 @@ class SandboxManager:
         failures = [response.path for response in responses if response.error]
         if failures:
             raise RuntimeError(f"写入沙箱文件失败：{'、'.join(failures)}")
+        if persist:
+            snapshot_files = [
+                (_workspace_relative(path), content)
+                for path, content in normalized
+            ]
+            await asyncio.to_thread(
+                _write_local_workspace,
+                self.local_workspace_path(thread_id, component),
+                snapshot_files,
+            )
+
+    async def delete_workspace_file(
+        self,
+        thread_id: str,
+        path: str,
+        *,
+        component: str = "crawl-worker",
+    ) -> None:
+        """Delete one workspace file from both sandbox and local snapshot."""
+
+        relative = _workspace_relative(path)
+        sandbox_path = _sandbox_path(relative)
+        handle = self._get_handle(thread_id, component)
+        code = (
+            "from pathlib import Path; "
+            f"target=Path({sandbox_path!r}); "
+            "target.unlink(missing_ok=True)"
+        )
+        result = await handle.backend.aexecute(
+            "python -c " + shlex.quote(code),
+        )
+        if result.exit_code not in {None, 0}:
+            detail = result.output.strip() or f"退出码 {result.exit_code}"
+            raise RuntimeError(f"删除沙箱文件失败：{detail}")
+        await asyncio.to_thread(
+            _delete_local_workspace_file,
+            self.local_workspace_path(thread_id, component),
+            relative,
+        )
+
+    async def delete_thread_resources(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+    ) -> None:
+        """Destroy active sandboxes and delete one thread's local workspaces."""
+
+        normalized_thread = sanitize_thread_id(thread_id)
+        matching_keys = [
+            key
+            for key in self._handles
+            if key[0] == user_id and key[2] == normalized_thread
+        ]
+        destroy_errors: list[str] = []
+        for key in matching_keys:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            async with lock:
+                handle = self._handles.pop(key, None)
+                if handle is not None:
+                    try:
+                        await asyncio.to_thread(handle.sandbox.destroy)
+                    except Exception as exc:  # noqa: BLE001 - finish local cleanup.
+                        destroy_errors.append(str(exc))
+            self._locks.pop(key, None)
+
+        await asyncio.to_thread(
+            _delete_local_job_root,
+            self._artifact_root,
+            user_id,
+            normalized_thread,
+        )
+        if self._thread_users.get(normalized_thread) == user_id:
+            self._thread_users.pop(normalized_thread, None)
+        if destroy_errors:
+            raise RuntimeError(
+                "销毁任务沙箱失败：" + "；".join(destroy_errors)
+            )
 
     @traceable(
         name="sandbox.skills.sync",

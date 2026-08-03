@@ -38,6 +38,7 @@ dependencies = [
     "pydantic-settings>=2,<3",
     "pyyaml>=6,<7",
     "python-dotenv>=1,<2",
+    "python-multipart>=0.0.20,<1",
     "selectolax>=0.4.11",
     "sqlalchemy>=2.0.46,<3",
     "tabulate>=0.10.0",

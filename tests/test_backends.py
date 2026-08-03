@@ -103,3 +103,16 @@ def test_backend_exposes_worker_and_supervisor_skills(
     assert backend.ls("/skills/supervisor/").entries[0]["path"].endswith(
         "/evidence-reporting/"
     )
+
+
+def test_supervisor_file_tools_cannot_overwrite_uploaded_inputs() -> None:
+    assert backends.FILESYSTEM_PERMISSIONS[0].__dict__ == {
+        "operations": ["write"],
+        "paths": ["/workspace/input/**"],
+        "mode": "deny",
+    }
+    assert backends.FILESYSTEM_PERMISSIONS[1].__dict__ == {
+        "operations": ["read"],
+        "paths": ["/workspace/input/**"],
+        "mode": "allow",
+    }

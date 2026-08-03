@@ -260,9 +260,9 @@ describe("研究工作台", () => {
     streamState.messages = [];
     render(<App />);
 
-    const input = screen.getByLabelText("描述你的网页数据任务");
+    const input = screen.getByLabelText("描述你的网页或文件分析任务");
     fireEvent.change(input, { target: { value: "抓取官网并生成报告" } });
-    fireEvent.click(screen.getByRole("button", { name: "发送研究任务" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送分析任务" }));
 
     expect(submit).toHaveBeenCalledWith({
       messages: [{ type: "human", content: "抓取官网并生成报告" }],
@@ -274,6 +274,107 @@ describe("研究工作台", () => {
       streamResumable: true,
       onDisconnect: "continue",
     });
+  });
+
+  it("空白会话选择文件后建 thread、顺序上传并把真实路径发给 Agent", async () => {
+    streamState.messages = [];
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    const threadId = "11111111-1111-4111-8111-111111111111";
+    vi.spyOn(window.crypto, "randomUUID")
+      .mockReturnValueOnce("22222222-2222-4222-8222-222222222222")
+      .mockReturnValueOnce(threadId);
+    const uploaded = {
+      name: "orders.csv",
+      path: "/workspace/input/orders.csv",
+      size: 24,
+      media_type: "text/csv",
+    };
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/threads/search")) return { ok: true, json: async () => [] };
+      if (url.endsWith("/threads") && init?.method === "POST") {
+        return { ok: true, json: async () => ({ thread_id: threadId }) };
+      }
+      if (url.endsWith(`/files/${threadId}`) && init?.method === "POST") {
+        return { ok: true, json: async () => ({ files: [uploaded] }) };
+      }
+      if (url.endsWith(`/files/${threadId}`)) {
+        return { ok: true, json: async () => ({ files: [uploaded] }) };
+      }
+      if (url.includes(`/artifacts/${threadId}`)) {
+        return { ok: true, json: async () => ({ artifacts: [] }) };
+      }
+      return { ok: true, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    const file = new File(["id,amount\n001,10\n"], "orders.csv", { type: "text/csv" });
+    fireEvent.change(screen.getByLabelText("选择本地表格文件"), {
+      target: { files: [file] },
+    });
+
+    await waitFor(() => expect(screen.getByText(/已上传/)).toBeTruthy());
+    expect(switchThread).toHaveBeenCalledWith(threadId);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:2024/files/${threadId}`,
+      expect.objectContaining({ method: "POST", body: expect.any(FormData) }),
+    );
+
+    const input = screen.getByLabelText("描述你的网页或文件分析任务");
+    fireEvent.change(input, { target: { value: "分析月度趋势" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送分析任务" }));
+
+    expect(submit).toHaveBeenCalledWith({
+      messages: [{
+        type: "human",
+        content: "分析月度趋势\n\n已上传文件：\n- /workspace/input/orders.csv",
+      }],
+    }, {
+      streamResumable: true,
+      onDisconnect: "continue",
+    });
+  });
+
+  it("刷新会话时恢复附件并可从服务端删除", async () => {
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-files");
+    let deleted = false;
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/files/thread-files?") && init?.method === "DELETE") {
+        deleted = true;
+        return { ok: true, json: async () => ({ status: "deleted" }) };
+      }
+      if (url.endsWith("/files/thread-files")) {
+        return {
+          ok: true,
+          json: async () => ({
+            files: deleted ? [] : [{
+              name: "history.xlsx",
+              path: "/workspace/input/history.xlsx",
+              size: 2048,
+              media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            }],
+          }),
+        };
+      }
+      if (url.endsWith("/artifacts/thread-files")) {
+        return { ok: true, json: async () => ({ artifacts: [] }) };
+      }
+      return { ok: true, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText("history.xlsx")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "删除附件：history.xlsx" }));
+
+    await waitFor(() => expect(screen.queryByText("history.xlsx")).toBeNull());
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/files/thread-files?path=%2Fworkspace%2Finput%2Fhistory.xlsx",
+      { method: "DELETE", headers: {} },
+    );
   });
 
   it("配置刷新恢复当前活动流", () => {
@@ -637,7 +738,7 @@ describe("研究工作台", () => {
   it("开始新任务时清空草稿并切换到空 thread", () => {
     render(<App />);
 
-    const input = screen.getByLabelText("描述你的网页数据任务") as HTMLTextAreaElement;
+    const input = screen.getByLabelText("描述你的网页或文件分析任务") as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: "尚未提交的研究任务" } });
     fireEvent.click(screen.getByRole("button", { name: "开始新任务" }));
 

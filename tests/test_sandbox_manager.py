@@ -24,6 +24,7 @@ class FakeSandbox:
         self.healthy = healthy
         self.renew_count = 0
         self.closed = False
+        self.destroyed = False
 
     def is_healthy(self) -> bool:
         return self.healthy
@@ -33,6 +34,9 @@ class FakeSandbox:
 
     def close(self) -> None:
         self.closed = True
+
+    def destroy(self) -> None:
+        self.destroyed = True
 
 
 class FakeBackend:
@@ -570,6 +574,76 @@ async def test_real_opensandbox_write_execute_and_export(tmp_path) -> None:
         handle = manager._handles.get(manager._key(thread_id, "crawl-worker"))
         if handle is not None:
             await asyncio.to_thread(handle.sandbox.destroy)
+
+
+@pytest.mark.asyncio
+async def test_upload_can_persist_exact_file_into_local_snapshot(tmp_path) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    key = manager._key("thread-upload", "supervisor", "user-a")
+    handle = _handle("sandbox-upload")
+    manager._handles[key] = handle
+
+    await manager.upload_workspace_files(
+        "thread-upload",
+        [("/workspace/input/orders.csv", b"id,amount\n001,20\n")],
+        component="supervisor",
+        persist=True,
+    )
+
+    snapshot = manager.local_workspace_path(
+        "thread-upload",
+        "supervisor",
+        user_id="user-a",
+    )
+    assert (snapshot / "input" / "orders.csv").read_bytes() == b"id,amount\n001,20\n"
+    assert handle.backend.files["/workspace/input/orders.csv"] == b"id,amount\n001,20\n"
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_file_removes_local_snapshot(tmp_path) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    key = manager._key("thread-delete-file", "supervisor", "user-a")
+    manager._handles[key] = _handle("sandbox-delete-file")
+    snapshot = manager.local_workspace_path(
+        "thread-delete-file",
+        "supervisor",
+        user_id="user-a",
+    )
+    target = snapshot / "input" / "orders.csv"
+    target.parent.mkdir(parents=True)
+    target.write_text("id\n1\n", encoding="utf-8")
+
+    await manager.delete_workspace_file(
+        "thread-delete-file",
+        "/workspace/input/orders.csv",
+        component="supervisor",
+    )
+
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_thread_resources_is_user_and_thread_scoped(tmp_path) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    target_key = manager._key("thread-a", "supervisor", "user-a")
+    sibling_key = manager._key("thread-b", "supervisor", "user-a")
+    target = _handle("target")
+    sibling = _handle("sibling")
+    manager._handles[target_key] = target
+    manager._handles[sibling_key] = sibling
+    target_job = tmp_path / "user-a" / "jobs" / "thread-a"
+    sibling_job = tmp_path / "user-a" / "jobs" / "thread-b"
+    (target_job / "supervisor" / "workspace").mkdir(parents=True)
+    (sibling_job / "supervisor" / "workspace").mkdir(parents=True)
+
+    await manager.delete_thread_resources("thread-a", user_id="user-a")
+
+    assert target.sandbox.destroyed is True
+    assert sibling.sandbox.destroyed is False
+    assert target_key not in manager._handles
+    assert sibling_key in manager._handles
+    assert not target_job.exists()
+    assert sibling_job.exists()
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -38,6 +38,19 @@ type DownloadableArtifact = {
   mime_type?: string;
 };
 type ArtifactListResponse = { artifacts?: DownloadableArtifact[] };
+type UploadedTableFile = {
+  key: string;
+  name: string;
+  path?: string;
+  size: number;
+  media_type?: string;
+  status: "uploading" | "ready" | "deleting" | "error";
+  error?: string;
+  source?: File;
+};
+type FileListResponse = {
+  files?: Array<Pick<UploadedTableFile, "name" | "path" | "size" | "media_type">>;
+};
 type HITLActionRequest = {
   name: string;
   args: Record<string, unknown>;
@@ -64,6 +77,10 @@ type AuthUser = {
 const AUTH_TOKEN_KEY = "deep-data-auth-token";
 const TASK_POLL_INTERVAL_MS = 4_000;
 const INITIAL_VISIBLE_ROW_LIMIT = 60;
+const MAX_UPLOAD_FILES = 5;
+const MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
+const TABLE_FILE_PATTERN = /\.(csv|tsv|xlsx)$/i;
 const ASYNC_TASK_STATUSES = new Set<AsyncTaskStatus>([
   "pending",
   "running",
@@ -92,7 +109,7 @@ const DEFAULT_USER: AuthUser = {
 const EXAMPLES = [
   "抓取 Tavily Python SDK 文档，整理主要接口和适用场景",
   "搜索近一个月数据分析 Agent 的进展，并比较主要方案",
-  "分析指定公开网页中的产品、价格和来源信息",
+  "上传 Excel 或 CSV，分析趋势、异常值并生成图表",
 ];
 
 function conversationTitle(value: string): string {
@@ -397,6 +414,10 @@ export default function App() {
   const [artifactsLoading, setArtifactsLoading] = useState(false);
   const [artifactError, setArtifactError] = useState("");
   const [downloadingPath, setDownloadingPath] = useState<string>();
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedTableFile[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesUploading, setFilesUploading] = useState(false);
+  const [fileError, setFileError] = useState("");
   const [interruptSubmitting, setInterruptSubmitting] = useState(false);
   const [interruptError, setInterruptError] = useState("");
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
@@ -406,6 +427,7 @@ export default function App() {
   const autoCollectedTaskRunsRef = useRef<Set<string>>(new Set());
   const approvedSemanticDownloadRef = useRef(false);
   const semanticDownloadBaselineRef = useRef<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const authHeaders = useMemo<Record<string, string>>(
     () => {
       const headers: Record<string, string> = {};
@@ -487,6 +509,43 @@ export default function App() {
     }
   }, [apiUrl, authHeaders, threadId]);
 
+  const loadUploadedFiles = useCallback(async (signal?: AbortSignal) => {
+    if (!threadId) {
+      setUploadedFiles([]);
+      return;
+    }
+    setFilesLoading(true);
+    try {
+      const response = await fetch(`${apiUrl}/files/${encodeURIComponent(threadId)}`, {
+        headers: authHeaders,
+        signal,
+      });
+      if (!response.ok) {
+        throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法读取已上传文件");
+      }
+      const payload = await response.json() as FileListResponse;
+      const files = Array.isArray(payload.files) ? payload.files : [];
+      const restored = files.map((file) => ({
+        ...file,
+        key: file.path ?? `${file.name}-${file.size}`,
+        status: "ready" as const,
+      }));
+      const restoredNames = new Set(restored.map((file) => file.name.toLocaleLowerCase()));
+      setUploadedFiles((current) => [
+        ...restored,
+        ...current.filter(
+          (file) => file.status === "error" && !restoredNames.has(file.name.toLocaleLowerCase()),
+        ),
+      ]);
+      setFileError("");
+    } catch (error) {
+      if (signal?.aborted) return;
+      setFileError(error instanceof Error ? error.message : "暂时无法读取已上传文件");
+    } finally {
+      if (!signal?.aborted) setFilesLoading(false);
+    }
+  }, [apiUrl, authHeaders, threadId]);
+
   const stream = useStream<StreamState, { InterruptType: HITLRequest }>({
     apiUrl,
     assistantId,
@@ -560,7 +619,10 @@ export default function App() {
   const identitySwitchBlocked = stream.isLoading
     || stream.queue.size > 0
     || runningTaskCount > 0
-    || pendingInterrupt !== null;
+    || pendingInterrupt !== null
+    || filesUploading;
+  const filesReadyForAnalysis = !filesLoading
+    && uploadedFiles.every((file) => file.status === "ready");
   const pollingTaskKey = tasks
     .filter((task) => task.status === "running" || task.status === "pending")
     .map((task) => `${task.task_id}:${task.run_id ?? ""}`)
@@ -649,6 +711,13 @@ export default function App() {
   }, [loadArtifacts]);
 
   useEffect(() => {
+    if (filesUploading) return undefined;
+    const controller = new AbortController();
+    void loadUploadedFiles(controller.signal);
+    return () => controller.abort();
+  }, [filesUploading, loadUploadedFiles]);
+
+  useEffect(() => {
     if (!threadId || !latestPreparedDownload) return;
     if (!approvedSemanticDownloadRef.current) return;
     if (latestPreparedDownload.key === semanticDownloadBaselineRef.current) return;
@@ -706,6 +775,7 @@ export default function App() {
     setTaskRefreshError("");
     setDismissedTaskFailures(new Set());
     setArtifactError("");
+    setFileError("");
     setInterruptError("");
     setVisibleRowLimit(INITIAL_VISIBLE_ROW_LIMIT);
     autoCollectedTaskRunsRef.current.clear();
@@ -771,16 +841,192 @@ export default function App() {
     });
   }, [rows.length, stream.isLoading]);
 
+  async function createThreadForUpload(firstFilename: string): Promise<string> {
+    const nextThreadId = window.crypto.randomUUID();
+    const response = await fetch(`${apiUrl}/threads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        thread_id: nextThreadId,
+        metadata: {
+          graph_id: assistantId,
+          kind: "conversation",
+          title: `分析文件：${firstFilename}`,
+        },
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "创建文件分析会话失败");
+    }
+    stream.switchThread(nextThreadId);
+    setThreadId(nextThreadId);
+    const url = new URL(window.location.href);
+    url.searchParams.set("thread", nextThreadId);
+    window.history.replaceState({}, "", url);
+    void loadSessions();
+    return nextThreadId;
+  }
+
+  async function uploadOneFile(targetThreadId: string, item: UploadedTableFile): Promise<void> {
+    if (!item.source) throw new Error("浏览器中已没有原始文件，请重新选择");
+    const form = new FormData();
+    form.append("files", item.source, item.name);
+    const response = await fetch(`${apiUrl}/files/${encodeURIComponent(targetThreadId)}`, {
+      method: "POST",
+      headers: authHeaders,
+      body: form,
+    });
+    const payload = await response.json().catch(() => ({})) as FileListResponse & { detail?: string };
+    const uploaded = payload.files?.[0];
+    if (!response.ok || !uploaded?.path) {
+      throw new Error(payload.detail || "文件上传失败，请稍后重试");
+    }
+    setUploadedFiles((current) => current.map((file) => (
+      file.key === item.key
+        ? { ...uploaded, key: item.key, status: "ready" as const }
+        : file
+    )));
+  }
+
+  async function onFilesSelected(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (selected.length === 0) return;
+    setFileError("");
+
+    const currentReady = uploadedFiles.filter((file) => file.status === "ready");
+    if (currentReady.length + selected.length > MAX_UPLOAD_FILES) {
+      setFileError("当前会话最多保留 5 个上传文件");
+      return;
+    }
+    const names = new Set(currentReady.map((file) => file.name.toLocaleLowerCase()));
+    let selectedTotal = 0;
+    for (const file of selected) {
+      const folded = file.name.toLocaleLowerCase();
+      if (!TABLE_FILE_PATTERN.test(file.name)) {
+        setFileError(`仅支持 CSV、TSV 和 XLSX 文件：${file.name}`);
+        return;
+      }
+      if (file.size > MAX_UPLOAD_FILE_BYTES) {
+        setFileError(`单个文件不能超过 50 MB：${file.name}`);
+        return;
+      }
+      if (names.has(folded)) {
+        setFileError(`文件已存在或本次重复选择：${file.name}`);
+        return;
+      }
+      names.add(folded);
+      selectedTotal += file.size;
+    }
+    const currentTotal = currentReady.reduce((total, file) => total + file.size, 0);
+    if (currentTotal + selectedTotal > MAX_UPLOAD_TOTAL_BYTES) {
+      setFileError("当前会话上传文件总计不能超过 100 MB");
+      return;
+    }
+
+    const pending: UploadedTableFile[] = selected.map((file) => ({
+      key: window.crypto.randomUUID(),
+      name: file.name,
+      size: file.size,
+      status: "uploading",
+      source: file,
+    }));
+    setUploadedFiles((current) => [...current, ...pending]);
+    setFilesUploading(true);
+    let targetThreadId = threadId;
+    try {
+      targetThreadId ??= await createThreadForUpload(selected[0].name);
+      for (const item of pending) {
+        try {
+          await uploadOneFile(targetThreadId, item);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "文件上传失败，请稍后重试";
+          setUploadedFiles((current) => current.map((file) => (
+            file.key === item.key ? { ...file, status: "error", error: message } : file
+          )));
+          setFileError(message);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "创建文件分析会话失败";
+      const failedKeys = new Set(pending.map((file) => file.key));
+      setUploadedFiles((current) => current.map((file) => (
+        failedKeys.has(file.key) ? { ...file, status: "error", error: message } : file
+      )));
+      setFileError(message);
+    } finally {
+      setFilesUploading(false);
+    }
+  }
+
+  async function retryUpload(item: UploadedTableFile) {
+    if (!threadId || !item.source || filesUploading) return;
+    setFilesUploading(true);
+    setFileError("");
+    setUploadedFiles((current) => current.map((file) => (
+      file.key === item.key ? { ...file, status: "uploading", error: undefined } : file
+    )));
+    try {
+      await uploadOneFile(threadId, item);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "文件上传失败，请稍后重试";
+      setUploadedFiles((current) => current.map((file) => (
+        file.key === item.key ? { ...file, status: "error", error: message } : file
+      )));
+      setFileError(message);
+    } finally {
+      setFilesUploading(false);
+    }
+  }
+
+  async function removeUploadedFile(item: UploadedTableFile) {
+    if (filesUploading) return;
+    if (!item.path || item.status === "error") {
+      setUploadedFiles((current) => current.filter((file) => file.key !== item.key));
+      return;
+    }
+    if (!threadId) return;
+    setFilesUploading(true);
+    setFileError("");
+    setUploadedFiles((current) => current.map((file) => (
+      file.key === item.key ? { ...file, status: "deleting" } : file
+    )));
+    try {
+      const query = new URLSearchParams({ path: item.path });
+      const response = await fetch(
+        `${apiUrl}/files/${encodeURIComponent(threadId)}?${query.toString()}`,
+        { method: "DELETE", headers: authHeaders },
+      );
+      const payload = await response.json().catch(() => ({})) as { detail?: string };
+      if (!response.ok) throw new Error(payload.detail || "删除上传文件失败");
+      setUploadedFiles((current) => current.filter((file) => file.key !== item.key));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "删除上传文件失败";
+      setUploadedFiles((current) => current.map((file) => (
+        file.key === item.key ? { ...file, status: "ready", error: message } : file
+      )));
+      setFileError(message);
+    } finally {
+      setFilesUploading(false);
+    }
+  }
+
   function submitText(text: string, mode: SubmitMode = "enqueue") {
     const value = text.trim();
-    if (!value) return;
+    if (!value || !filesReadyForAnalysis) return;
+    const uploadedPaths = uploadedFiles
+      .filter((file): file is UploadedTableFile & { path: string } => file.status === "ready" && Boolean(file.path))
+      .map((file) => `- ${file.path}`);
+    const message = uploadedPaths.length > 0
+      ? `${value}\n\n已上传文件：\n${uploadedPaths.join("\n")}`
+      : value;
     setInput("");
     const multitaskOptions = stream.isLoading
       ? { multitaskStrategy: mode }
       : {};
 
     void stream.submit(
-      { messages: [{ type: "human", content: value }] },
+      { messages: [{ type: "human", content: message }] },
       {
         ...multitaskOptions,
         ...(!threadId && stream.messages.length === 0 ? {
@@ -872,14 +1118,17 @@ export default function App() {
     stream.switchThread(null);
     setThreadId(undefined);
     setInput("");
+    setUploadedFiles([]);
+    setFileError("");
     window.history.replaceState({}, "", window.location.pathname);
   }
 
   function selectSession(nextThreadId: string) {
-    if (nextThreadId === threadId || stream.isLoading || stream.queue.size > 0) return;
+    if (nextThreadId === threadId || stream.isLoading || stream.queue.size > 0 || filesUploading) return;
     stream.switchThread(nextThreadId);
     setThreadId(nextThreadId);
     setInput("");
+    setUploadedFiles([]);
     const url = new URL(window.location.href);
     url.searchParams.set("thread", nextThreadId);
     window.history.replaceState({}, "", url);
@@ -903,6 +1152,7 @@ export default function App() {
         stream.switchThread(null);
         setThreadId(undefined);
         setInput("");
+        setUploadedFiles([]);
         window.history.replaceState({}, "", window.location.pathname);
       }
     } catch (error) {
@@ -916,6 +1166,8 @@ export default function App() {
     stream.switchThread(null);
     setThreadId(undefined);
     setInput("");
+    setUploadedFiles([]);
+    setFileError("");
     window.history.replaceState({}, "", window.location.pathname);
   }
 
@@ -994,7 +1246,7 @@ export default function App() {
           <BrandMark />
           <div>
             <strong>深研</strong>
-            <span>网页数据工作台</span>
+            <span>网页与文件数据工作台</span>
           </div>
         </div>
 
@@ -1012,7 +1264,7 @@ export default function App() {
           currentThreadId={threadId}
           loading={sessionsLoading}
           error={sessionsError}
-          switchingDisabled={stream.isLoading || stream.queue.size > 0}
+          switchingDisabled={stream.isLoading || stream.queue.size > 0 || filesUploading}
           deletingThreadId={deletingThreadId}
           deleteCurrentDisabled={identitySwitchBlocked}
           onSelect={selectSession}
@@ -1052,7 +1304,7 @@ export default function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">DeepAgents · Tavily</p>
-            <h1>从网页线索到可追溯结论</h1>
+            <h1>从网页与文件到可追溯结论</h1>
           </div>
           <div className="topbar__status">
             <div className="runtime-stats" aria-label="运行状态">
@@ -1070,7 +1322,7 @@ export default function App() {
               <p className="empty-state__index">研究入口 / 01</p>
               <h2>把一个问题，变成一条证据链。</h2>
               <p className="empty-state__lead">
-                描述目标、网址和想分析的数据。Supervisor 会规划任务，后台采集网页，并整理成带来源的 Markdown 报告。
+                描述目标、网址，或上传 CSV、TSV、XLSX。Supervisor 会规划、验证并整理成可核验的分析结果。
               </p>
               <div className="example-grid">
                 {EXAMPLES.map((example) => (
@@ -1245,15 +1497,75 @@ export default function App() {
                 ? "请先处理上方待确认事项"
                 : stream.isLoading
                   ? "补充要求或纠正方向"
-                  : "描述你的网页数据任务"}
+                  : "描述你的网页或文件分析任务"}
             </label>
+            <div className="composer__attachments">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv,.tsv,.xlsx"
+                multiple
+                onChange={(event) => void onFilesSelected(event)}
+                disabled={identitySwitchBlocked}
+                aria-label="选择本地表格文件"
+              />
+              <button
+                type="button"
+                className="attachment-button"
+                disabled={identitySwitchBlocked || uploadedFiles.filter((file) => file.status === "ready").length >= MAX_UPLOAD_FILES}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <span aria-hidden="true">＋</span>
+                添加 CSV / TSV / XLSX
+              </button>
+              {filesLoading ? <small>正在恢复附件…</small> : null}
+            </div>
+            {uploadedFiles.length > 0 ? (
+              <ul className="attachment-list" aria-label="已选择的表格文件">
+                {uploadedFiles.map((file) => (
+                  <li key={file.key} className={`attachment-list__item is-${file.status}`}>
+                    <div>
+                      <strong title={file.name}>{file.name}</strong>
+                      <span>
+                        {formatFileSize(file.size)} · {
+                          file.status === "ready"
+                            ? "已上传"
+                            : file.status === "uploading"
+                              ? "上传中"
+                              : file.status === "deleting"
+                                ? "删除中"
+                                : "上传失败"
+                        }
+                      </span>
+                      {file.error ? <small>{file.error}</small> : null}
+                    </div>
+                    <div className="attachment-list__actions">
+                      {file.status === "error" && file.source ? (
+                        <button type="button" disabled={filesUploading} onClick={() => void retryUpload(file)}>
+                          重试
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        disabled={filesUploading}
+                        onClick={() => void removeUploadedFile(file)}
+                        aria-label={`删除附件：${file.name}`}
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {fileError ? <p className="composer__file-error" role="alert">{fileError}</p> : null}
             <textarea
               id="research-input"
               rows={3}
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onComposerKeyDown}
-              placeholder="例如：抓取某个公开站点的产品页面，比较价格并列出来源……"
+              placeholder="例如：分析已上传订单表的月度趋势和异常值，并生成图表……"
               disabled={pendingInterrupt !== null}
             />
             <span>
@@ -1268,8 +1580,8 @@ export default function App() {
             <button
               className="send-button"
               type="submit"
-              disabled={!input.trim() || pendingInterrupt !== null}
-              aria-label={stream.isLoading ? "排队发送消息" : "发送研究任务"}
+              disabled={!input.trim() || pendingInterrupt !== null || !filesReadyForAnalysis}
+              aria-label={stream.isLoading ? "排队发送消息" : "发送分析任务"}
             >
               <span>{stream.isLoading ? "排队发送" : "发送任务"}</span>
               <i aria-hidden="true">↗</i>

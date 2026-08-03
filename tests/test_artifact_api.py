@@ -14,11 +14,15 @@ async def test_artifact_list_and_download_use_owned_workspace(
     workspace = tmp_path / "workspace"
     charts = workspace / "charts"
     raw = workspace / "raw"
+    input_root = workspace / "input"
     charts.mkdir(parents=True)
     raw.mkdir()
+    input_root.mkdir()
     (workspace / "final_report.md").write_text("# 报告", encoding="utf-8")
+    (workspace / "scratch.csv").write_text("temporary", encoding="utf-8")
     (charts / "price.png").write_bytes(b"png")
     (raw / "source.md").write_text("raw", encoding="utf-8")
+    (input_root / "orders.csv").write_text("id\n1", encoding="utf-8")
 
     async def owner(_thread_id: str) -> str:
         return database.DEFAULT_USER_ID

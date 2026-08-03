@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from deep_data_research_agent import database
+from deep_data_research_agent import database, sandbox_manager
 from deep_data_research_agent.user_checkpointer import (
     UserScopedSqliteCheckpointer,
     configured_user_id,
@@ -70,6 +70,7 @@ async def test_config_user_claims_thread_before_checkpoint_write(monkeypatch, tm
 @pytest.mark.asyncio
 async def test_delete_thread_removes_checkpoint_and_owner_claim(monkeypatch, tmp_path) -> None:
     deleted_claims: list[tuple[str, str]] = []
+    deleted_resources: list[tuple[str, str]] = []
 
     async def get_owner(_thread_id: str) -> str:
         return "user-a"
@@ -77,8 +78,16 @@ async def test_delete_thread_removes_checkpoint_and_owner_claim(monkeypatch, tmp
     async def delete_claim(thread_id: str, user_id: str) -> None:
         deleted_claims.append((thread_id, user_id))
 
+    async def delete_resources(thread_id: str, *, user_id: str) -> None:
+        deleted_resources.append((thread_id, user_id))
+
     monkeypatch.setattr(database, "get_thread_owner", get_owner)
     monkeypatch.setattr(database, "delete_thread_claim", delete_claim)
+    monkeypatch.setattr(
+        sandbox_manager.SANDBOX_MANAGER,
+        "delete_thread_resources",
+        delete_resources,
+    )
     checkpointer = UserScopedSqliteCheckpointer(tmp_path)
     try:
         await checkpointer.adelete_thread("thread-a")
@@ -86,3 +95,4 @@ async def test_delete_thread_removes_checkpoint_and_owner_claim(monkeypatch, tmp
         await checkpointer.aclose()
 
     assert deleted_claims == [("thread-a", "user-a")]
+    assert deleted_resources == [("thread-a", "user-a")]
