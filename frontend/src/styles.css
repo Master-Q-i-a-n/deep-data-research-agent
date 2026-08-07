@@ -446,6 +446,11 @@ code, pre {
 .markdown-body table { width: 100%; margin: 18px 0; border-collapse: collapse; font-size: 0.88rem; }
 .markdown-body th, .markdown-body td { padding: 9px 12px; text-align: left; border: 1px solid var(--line); }
 .markdown-body th { background: #eef3f6; }
+.markdown-body img { display: block; max-width: 100%; height: auto; margin: 18px auto; border-radius: 8px; }
+.markdown-image-loading,
+.markdown-image-error { display: block; margin: 14px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.7rem; }
+.markdown-image-loading { color: var(--muted); background: rgba(23, 49, 61, 0.05); }
+.markdown-image-error { color: var(--danger); border: 1px dashed rgba(180, 74, 74, 0.35); background: rgba(255, 245, 245, 0.9); }
 
 .tool-card { margin: 0 0 18px 24px; border: 1px solid var(--line); border-radius: 12px; background: rgba(251, 252, 253, 0.78); }
 .tool-card summary { min-height: 48px; padding: 0 14px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; cursor: pointer; list-style: none; }
@@ -586,6 +591,7 @@ code, pre {
 .artifact-card li > div { min-width: 0; display: grid; gap: 3px; }
 .artifact-card li strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.76rem; }
 .artifact-card li span { overflow-wrap: anywhere; color: var(--muted); font-size: 0.64rem; }
+.artifact-card__actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .artifact-card__error { margin: 12px 0 0; color: var(--danger); font-size: 0.7rem; }
 
 .composer { position: fixed; right: 318px; bottom: 0; left: 282px; z-index: 5; padding: 18px clamp(24px, 3vw, 48px) 24px; display: flex; align-items: stretch; justify-content: center; gap: 12px; border-top: 1px solid rgba(23, 49, 61, 0.1); background: linear-gradient(180deg, rgba(234, 240, 243, 0.55), rgba(234, 240, 243, 0.98) 24%); backdrop-filter: blur(14px); }

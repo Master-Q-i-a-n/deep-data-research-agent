@@ -32,7 +32,9 @@ description: 分析用户上传的 CSV、TSV 或 XLSX 表格文件。用于本�
 1. ①核对输入输出行数、筛选与去重影响、关联未匹配数、分组汇总与总计、单位币种、缺失值和异常值。
 2. ②验证失败时先修正；无法消除的限制必须写入结论，不得给出确定性排名或精确结论。
 3. ③简单问题直接回答并说明口径；复杂任务按需生成 `analysis_summary.json`、清洗后 CSV/XLSX、PNG 图表和 `/workspace/output/final_report.md`。
-4. ④最终回答先给 3–5 条结论，再列出实际产物路径；用户要求下载时调用 `request_report_download` 并传入真实输出路径。
+4. ④复杂报告完整阅读 `/skills/supervisor/md-to-pdf/SKILL.md`，默认转换为
+   `/workspace/output/final_report.pdf`；转换失败时保留 Markdown 并说明原因。
+5. ⑤最终回答先给 3–5 条结论，再列出 PDF、Markdown 和其他实际产物路径；用户要求下载时调用 `request_report_download` 并传入真实输出路径。
 
 ## 注意事项
 

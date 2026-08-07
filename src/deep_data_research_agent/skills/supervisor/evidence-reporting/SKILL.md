@@ -12,4 +12,7 @@ description: 将 crawl-worker 的网页证据整理为简要结论和带来源�
 3. 结论使用 `[1]`、`[2]` 编号引用，编号在全文保持一致。
 4. 报告末尾添加 `## 来源`，逐行列出标题和 URL。
 5. 明确列出失败页面、样本偏差、时效性和缺失字段。
-6. 最终聊天内容先给 3–5 条简要结论，再给完整 Markdown 报告。
+6. 完整报告写入 `/workspace/output/final_report.md`，图片使用相对于报告的 `charts/...` 路径。
+7. 完整阅读 `/skills/supervisor/md-to-pdf/SKILL.md`，默认生成
+   `/workspace/output/final_report.pdf`；转换失败时保留 Markdown 并说明原因。
+8. 最终聊天内容先给 3–5 条简要结论，再列出 PDF、Markdown、图表和数据产物路径。

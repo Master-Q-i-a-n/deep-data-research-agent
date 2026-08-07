@@ -89,7 +89,10 @@ async def test_async_skill_read_does_not_block_event_loop(
 
     assert result.error is None
     assert result.entries
-    assert result.entries[0]["path"].endswith("/evidence-reporting/")
+    assert any(
+        entry["path"].endswith("/evidence-reporting/")
+        for entry in result.entries
+    )
 
 
 def test_backend_exposes_worker_and_supervisor_skills(
@@ -100,8 +103,13 @@ def test_backend_exposes_worker_and_supervisor_skills(
     assert backend.ls("/skills/worker/").entries[0]["path"].endswith(
         "/tavily-crawling/"
     )
-    assert backend.ls("/skills/supervisor/").entries[0]["path"].endswith(
-        "/evidence-reporting/"
+    supervisor_paths = {
+        entry["path"] for entry in backend.ls("/skills/supervisor/").entries
+    }
+    assert any(path.endswith("/evidence-reporting/") for path in supervisor_paths)
+    assert any(
+        path.endswith("/database-readonly-analysis/")
+        for path in supervisor_paths
     )
 
 

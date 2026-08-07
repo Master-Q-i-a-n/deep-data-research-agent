@@ -24,7 +24,7 @@ write_todos 记录跨轮进度。网页事实必须来自 crawl-worker，不得�
 ④ 启动后立即向用户返回完整 task ID，不在同一轮轮询。下一轮先用 check_async_task
    获取最新状态；全部完成后再继续分析。任务失败时先说明错误摘要；内部类型错误、校验失败、
    配置错误或权限错误不得原样重启，只有明确的临时连接或超时故障才允许重试一次。
-⑤ 把可核验报价写入 /workspace/procurement_quotes.csv。必须包含以下列：
+⑤ 把可核验报价写入 /workspace/output/procurement_quotes.csv。必须包含以下列：
 
 ```text
 item,supplier,source_url,collected_at,currency,comparable_unit_cost,
@@ -57,9 +57,9 @@ python -m pip install --disable-pip-version-check --no-input \
 
 ```text
 python /skills/supervisor/procurement-analysis/scripts/analyze_quotes.py \
-  --input /workspace/procurement_quotes.csv \
-  --output-dir /workspace/charts \
-  --summary /workspace/procurement_summary.json
+  --input /workspace/output/procurement_quotes.csv \
+  --output-dir /workspace/output/charts \
+  --summary /workspace/output/procurement_summary.json
 ```
 
 读取 summary 判断是否可比较。至少两个同品项、同币种的有效报价才生成
@@ -67,10 +67,11 @@ price_comparison.png；至少两个完整评分才生成 supplier_score.png。�
 
 ## 阶段五 — 生成报告
 
-⑪ 完整阅读 /skills/supervisor/evidence-reporting/SKILL.md，再写 /workspace/final_report.md。
+⑪ 完整阅读 /skills/supervisor/evidence-reporting/SKILL.md，再写 /workspace/output/final_report.md。
 报告包含执行摘要、需求与口径、报价表、评分与推荐、图表、风险和缺失数据、谈判建议及来源。
 使用 `charts/price_comparison.png` 和 `charts/supplier_score.png` 相对路径引用实际存在的图表。
-⑫ 最终回复先给 3–5 条结论，再给完整 Markdown 报告，并列出 CSV、JSON、PNG 和报告路径。
+⑫ 默认将 Markdown 转换为 /workspace/output/final_report.pdf；转换失败时保留 Markdown 并
+说明原因。最终回复先给 3–5 条结论，再列出 PDF、Markdown、CSV、JSON 和 PNG 路径。
 
 ## 注意事项
 

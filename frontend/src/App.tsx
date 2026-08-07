@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, ImgHTMLAttributes, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -174,6 +174,88 @@ function formatFileSize(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function localImagePaths(source: string): string[] {
+  const normalized = source.trim().replace(/\\/g, "/").split(/[?#]/, 1)[0];
+  if (!normalized || /^(https?:|data:|blob:)/i.test(normalized)) return [];
+  const parts = normalized.split("/").filter((part) => part && part !== ".");
+  if (parts.includes("..")) return [];
+  if (normalized.startsWith("/workspace/")) return [normalized];
+  if (normalized.startsWith("workspace/")) return [`/${normalized}`];
+  const relative = parts.join("/");
+  if (!relative) return [];
+  if (relative.startsWith("output/")) return [`/workspace/${relative}`];
+  // 新报告把图片放在 output/charts；第二个路径兼容旧报告的 workspace/charts。
+  return [`/workspace/output/${relative}`, `/workspace/${relative}`];
+}
+
+type AuthenticatedMarkdownImageProps = ImgHTMLAttributes<HTMLImageElement> & {
+  apiUrl: string;
+  authHeaders: Record<string, string>;
+  threadId?: string;
+};
+
+function AuthenticatedMarkdownImage({
+  apiUrl,
+  authHeaders,
+  threadId,
+  src,
+  alt,
+  ...props
+}: AuthenticatedMarkdownImageProps) {
+  const source = typeof src === "string" ? src : "";
+  const directSource = /^(https?:|data:|blob:)/i.test(source) ? source : "";
+  const [resolvedSource, setResolvedSource] = useState(directSource);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (directSource) {
+      setResolvedSource(directSource);
+      setFailed(false);
+      return undefined;
+    }
+    const candidates = localImagePaths(source);
+    if (!threadId || candidates.length === 0) {
+      setResolvedSource("");
+      setFailed(true);
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    let objectUrl = "";
+    setResolvedSource("");
+    setFailed(false);
+    void (async () => {
+      for (const path of candidates) {
+        const query = new URLSearchParams({ path });
+        const response = await fetch(
+          `${apiUrl}/artifacts/${encodeURIComponent(threadId)}/download?${query.toString()}`,
+          { headers: authHeaders, signal: controller.signal },
+        );
+        if (response.ok) {
+          objectUrl = window.URL.createObjectURL(await response.blob());
+          setResolvedSource(objectUrl);
+          return;
+        }
+        if (response.status === 401) break;
+      }
+      if (!controller.signal.aborted) setFailed(true);
+    })().catch(() => {
+      if (!controller.signal.aborted) setFailed(true);
+    });
+
+    return () => {
+      controller.abort();
+      if (objectUrl) window.URL.revokeObjectURL(objectUrl);
+    };
+  }, [apiUrl, authHeaders, directSource, source, threadId]);
+
+  if (failed) {
+    return <span className="markdown-image-error" role="img" aria-label={alt ?? "图片加载失败"}>图片无法加载：{alt || source}</span>;
+  }
+  if (!resolvedSource) return <span className="markdown-image-loading">图片加载中…</span>;
+  return <img {...props} src={resolvedSource} alt={alt ?? ""} />;
+}
+
 function taskRunKey(task: AsyncTask): string {
   return `${task.task_id}:${task.run_id ?? ""}`;
 }
@@ -239,6 +321,9 @@ type MessageCardProps = {
   body: string;
   report: boolean;
   streaming: boolean;
+  apiUrl: string;
+  authHeaders: Record<string, string>;
+  threadId?: string;
 };
 
 const MessageCard = memo(function MessageCard({
@@ -246,6 +331,9 @@ const MessageCard = memo(function MessageCard({
   body,
   report,
   streaming,
+  apiUrl,
+  authHeaders,
+  threadId,
 }: MessageCardProps) {
   return (
     <article className={`message message--${role}${report ? " message--report" : ""}`}>
@@ -254,7 +342,23 @@ const MessageCard = memo(function MessageCard({
         <i aria-hidden="true" />
       </header>
       <div className={`markdown-body${streaming ? " markdown-body--streaming" : ""}`}>
-        {streaming ? body : <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>}
+        {streaming ? body : (
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              img: (props) => (
+                <AuthenticatedMarkdownImage
+                  {...props}
+                  apiUrl={apiUrl}
+                  authHeaders={authHeaders}
+                  threadId={threadId}
+                />
+              ),
+            }}
+          >
+            {body}
+          </ReactMarkdown>
+        )}
       </div>
     </article>
   );
@@ -264,6 +368,9 @@ const MessageCard = memo(function MessageCard({
   && previous.body === next.body
   && previous.report === next.report
   && previous.streaming === next.streaming
+  && previous.apiUrl === next.apiUrl
+  && previous.authHeaders === next.authHeaders
+  && previous.threadId === next.threadId
 ));
 
 function InterruptCard({
@@ -321,7 +428,7 @@ function InterruptCard({
           : "";
         const filePath = typeof action.args.file_path === "string"
           ? action.args.file_path
-          : "/workspace/final_report.md";
+          : "/workspace/output/final_report.pdf";
 
         return (
           <div className="interrupt-card__request" key={`${action.name}-${index}`}>
@@ -668,14 +775,20 @@ export default function App() {
     }
   }, [apiUrl, authHeaders, threadId]);
 
-  const downloadArtifact = useCallback(async (artifact: DownloadableArtifact) => {
+  const downloadArtifact = useCallback(async (
+    artifact: DownloadableArtifact,
+    mode: "auto" | "raw" | "bundle" = "auto",
+  ) => {
     if (!threadId) throw new Error("请先打开包含该文件的会话");
-    setDownloadingPath(artifact.path);
+    const markdown = artifact.path.toLowerCase().endsWith(".md");
+    const bundle = mode === "bundle" || (mode === "auto" && markdown);
+    const downloadKey = `${artifact.path}:${bundle ? "bundle" : "raw"}`;
+    setDownloadingPath(downloadKey);
     setArtifactError("");
     try {
       const query = new URLSearchParams({ path: artifact.path });
       const response = await fetch(
-        `${apiUrl}/artifacts/${encodeURIComponent(threadId)}/download?${query.toString()}`,
+        `${apiUrl}/artifacts/${encodeURIComponent(threadId)}/${bundle ? "bundle" : "download"}?${query.toString()}`,
         { headers: authHeaders },
       );
       if (!response.ok) {
@@ -685,7 +798,9 @@ export default function App() {
       const objectUrl = window.URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
-      anchor.download = artifact.filename;
+      anchor.download = bundle
+        ? `${artifact.filename.replace(/\.md$/i, "")}-bundle.zip`
+        : artifact.filename;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -1356,6 +1471,9 @@ export default function App() {
                 body={row.body}
                 report={row.report}
                 streaming={stream.isLoading && row.role === "ai" && row.key === lastMessageKey}
+                apiUrl={apiUrl}
+                authHeaders={authHeaders}
+                threadId={threadId}
               />
             ),
           )}
@@ -1427,13 +1545,26 @@ export default function App() {
                         <strong>{artifact.filename}</strong>
                         <span>{formatFileSize(artifact.size)} · {artifact.path}</span>
                       </div>
-                      <button
-                        type="button"
-                        disabled={downloadingPath === artifact.path}
-                        onClick={() => void downloadArtifact(artifact).catch(() => undefined)}
-                      >
-                        {downloadingPath === artifact.path ? "下载中…" : "下载"}
-                      </button>
+                      <div className="artifact-card__actions">
+                        <button
+                          type="button"
+                          disabled={downloadingPath === `${artifact.path}:raw`}
+                          onClick={() => void downloadArtifact(artifact, "raw").catch(() => undefined)}
+                        >
+                          {downloadingPath === `${artifact.path}:raw`
+                            ? "下载中…"
+                            : artifact.path.toLowerCase().endsWith(".md") ? "下载 MD" : "下载"}
+                        </button>
+                        {artifact.path.toLowerCase().endsWith(".md") ? (
+                          <button
+                            type="button"
+                            disabled={downloadingPath === `${artifact.path}:bundle`}
+                            onClick={() => void downloadArtifact(artifact, "bundle").catch(() => undefined)}
+                          >
+                            {downloadingPath === `${artifact.path}:bundle` ? "打包中…" : "下载含图片 ZIP"}
+                          </button>
+                        ) : null}
+                      </div>
                     </li>
                   ))}
                 </ul>

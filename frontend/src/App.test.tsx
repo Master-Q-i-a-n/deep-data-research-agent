@@ -638,7 +638,7 @@ describe("研究工作台", () => {
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.includes("/artifacts/thread-a/download")) {
+      if (url.includes("/artifacts/thread-a/bundle")) {
         return { ok: true, blob: async () => new Blob(["# 报告"]) };
       }
       if (url.endsWith("/artifacts/thread-a")) {
@@ -725,13 +725,49 @@ describe("研究工作台", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("final_report.md")).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "下载" }));
+    fireEvent.click(screen.getByRole("button", { name: "下载 MD" }));
 
     await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
     expect(anchorClick).toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:2024/artifacts/thread-a/download?path=%2Fworkspace%2Ffinal_report.md",
       { headers: {} },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "下载含图片 ZIP" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/artifacts/thread-a/bundle?path=%2Fworkspace%2Ffinal_report.md",
+      { headers: {} },
+    ));
+  });
+
+  it("Markdown 相对图片通过当前会话鉴权接口加载", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-a");
+    const createObjectURL = vi.fn().mockReturnValue("blob:chart-image");
+    Object.defineProperty(window.URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(window.URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/artifacts/thread-a/download?path=%2Fworkspace%2Foutput%2Fcharts%2Fprice.png")) {
+        return { ok: true, blob: async () => new Blob(["png"]) };
+      }
+      if (url.endsWith("/artifacts/thread-a")) {
+        return { ok: true, json: async () => ({ artifacts: [] }) };
+      }
+      return { ok: true, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    streamState.messages = [
+      { id: "human-chart", type: "human", content: "显示图表" },
+      { id: "ai-chart", type: "ai", content: "![价格对比](charts/price.png)" },
+    ];
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByAltText("价格对比").getAttribute("src")).toBe("blob:chart-image"));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/artifacts/thread-a/download?path=%2Fworkspace%2Foutput%2Fcharts%2Fprice.png",
+      { headers: {}, signal: expect.any(AbortSignal) },
     );
   });
 

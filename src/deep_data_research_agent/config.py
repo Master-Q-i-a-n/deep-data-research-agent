@@ -38,6 +38,20 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     tavily_project: str | None = None
 
+    # PostgreSQL credentials remain inside the standalone MCP container.  The
+    # Agent process only needs the local SSE endpoint and result-size limits.
+    postgres_mcp_enabled: bool = False
+    postgres_mcp_url: str = "http://127.0.0.1:8000/sse"
+    postgres_mcp_connect_timeout_seconds: float = Field(default=5.0, ge=1, le=30)
+    postgres_mcp_tool_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
+    postgres_mcp_preview_rows: int = Field(default=200, ge=1, le=1000)
+    postgres_mcp_export_rows: int = Field(default=50_000, ge=1, le=100_000)
+    postgres_mcp_export_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        ge=1024,
+        le=100 * 1024 * 1024,
+    )
+
     open_sandbox_domain: str = ""
     open_sandbox_api_key: str = ""
     open_sandbox_protocol: Literal["http", "https"] = "http"

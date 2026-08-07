@@ -8,6 +8,7 @@ from deep_data_research_agent.backends import (
     create_backend,
 )
 from deep_data_research_agent.config import create_chat_model
+from deep_data_research_agent.database_tools import DATABASE_TOOLS
 from deep_data_research_agent.interaction_tools import INTERACTION_TOOLS
 from deep_data_research_agent.memory import (
     AGENT_MEMORY_PATHS,
@@ -34,7 +35,7 @@ graph = create_deep_agent(
     name="supervisor",
     model=create_chat_model(),
     system_prompt=SUPERVISOR_PROMPT,
-    tools=[*ASSIGN_SKILL_TOOL, *INTERACTION_TOOLS],
+    tools=[*ASSIGN_SKILL_TOOL, *INTERACTION_TOOLS, *DATABASE_TOOLS],
     middleware=[
         SandboxLifecycleMiddleware(
             component="supervisor",

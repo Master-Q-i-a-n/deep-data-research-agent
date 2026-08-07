@@ -1,3 +1,5 @@
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -12,13 +14,18 @@ async def test_artifact_list_and_download_use_owned_workspace(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
-    charts = workspace / "charts"
+    output = workspace / "output"
+    charts = output / "charts"
     raw = workspace / "raw"
     input_root = workspace / "input"
     charts.mkdir(parents=True)
     raw.mkdir()
     input_root.mkdir()
-    (workspace / "final_report.md").write_text("# 报告", encoding="utf-8")
+    (output / "final_report.md").write_text(
+        "# 报告\n\n![价格对比](charts/price.png)",
+        encoding="utf-8",
+    )
+    (output / "final_report.pdf").write_bytes(b"pdf")
     (workspace / "scratch.csv").write_text("temporary", encoding="utf-8")
     (charts / "price.png").write_bytes(b"png")
     (raw / "source.md").write_text("raw", encoding="utf-8")
@@ -36,17 +43,27 @@ async def test_artifact_list_and_download_use_owned_workspace(
 
     listing = await webapp.list_artifacts("thread-a", None)
     assert [item["path"] for item in listing["artifacts"]] == [
-        "/workspace/final_report.md",
-        "/workspace/charts/price.png",
+        "/workspace/output/final_report.pdf",
+        "/workspace/output/final_report.md",
+        "/workspace/output/charts/price.png",
     ]
 
     response = await webapp.download_artifact(
         "thread-a",
-        "/workspace/final_report.md",
+        "/workspace/output/final_report.md",
         None,
     )
-    assert Path(response.path) == workspace / "final_report.md"
+    assert Path(response.path) == output / "final_report.md"
     assert response.filename == "final_report.md"
+
+    content, filename = webapp._markdown_bundle(
+        workspace,
+        "/workspace/output/final_report.md",
+    )
+    assert filename == "final_report-bundle.zip"
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        assert archive.namelist() == ["final_report.md", "charts/price.png"]
+        assert archive.read("charts/price.png") == b"png"
 
 
 @pytest.mark.asyncio
@@ -67,3 +84,20 @@ def test_download_path_rejects_traversal(tmp_path: Path) -> None:
         webapp._download_path(tmp_path, "/workspace/../secret.md")
 
     assert caught.value.status_code == 400
+
+
+def test_markdown_bundle_rejects_missing_or_unsafe_images(tmp_path: Path) -> None:
+    report = tmp_path / "output" / "final_report.md"
+    report.parent.mkdir()
+    report.write_text("![缺失](charts/missing.png)", encoding="utf-8")
+
+    with pytest.raises(HTTPException) as missing:
+        webapp._markdown_bundle(tmp_path, "/workspace/output/final_report.md")
+    assert missing.value.status_code == 409
+    assert "图片不存在" in str(missing.value.detail)
+
+    report.write_text("![越界](../secret.png)", encoding="utf-8")
+    with pytest.raises(HTTPException) as unsafe:
+        webapp._markdown_bundle(tmp_path, "/workspace/output/final_report.md")
+    assert unsafe.value.status_code == 409
+    assert "路径不安全" in str(unsafe.value.detail)

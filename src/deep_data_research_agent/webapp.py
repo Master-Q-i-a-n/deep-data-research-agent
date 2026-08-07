@@ -19,7 +19,7 @@ from xml.etree.ElementTree import ParseError
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from langgraph_sdk import get_client
 from langsmith import traceable
 from openpyxl import load_workbook
@@ -52,6 +52,14 @@ _WINDOWS_RESERVED_NAMES = frozenset(
     | {f"LPT{number}" for number in range(1, 10)}
 )
 _WINDOWS_INVALID_CHARACTERS = frozenset('<>:"|?*')
+_MARKDOWN_IMAGE_PATTERN = re.compile(
+    r"!\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^\s)]+))"
+    r"(?:\s+['\"][^'\"]*['\"])?\s*\)"
+)
+_HTML_IMAGE_PATTERN = re.compile(
+    r"<img\b[^>]*?\bsrc\s*=\s*(?P<quote>['\"])(?P<src>.*?)(?P=quote)[^>]*>",
+    re.IGNORECASE,
+)
 
 
 class RegisterRequest(BaseModel):
@@ -140,12 +148,15 @@ def _workspace_artifacts(root: Path) -> list[dict[str, object]]:
                 "mime_type": mime_type,
             }
         )
+    report_priority = {
+        "/workspace/output/final_report.pdf": 0,
+        "/workspace/output/final_report.md": 1,
+        "/workspace/final_report.pdf": 2,
+        "/workspace/final_report.md": 3,
+    }
     return sorted(
         artifacts,
-        key=lambda item: (
-            item["path"] != "/workspace/final_report.md",
-            str(item["path"]),
-        ),
+        key=lambda item: (report_priority.get(str(item["path"]), 4), str(item["path"])),
     )
 
 
@@ -340,6 +351,74 @@ def _download_path(root: Path, virtual_path: str) -> Path:
     if not target.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     return target
+
+
+def _markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
+    """Build a Markdown ZIP containing every referenced local image.
+
+    The report is placed at the ZIP root. Relative image paths keep their
+    original layout, so the downloaded Markdown renders without path changes.
+    """
+
+    report_path = _download_path(root, virtual_path)
+    if report_path.suffix.lower() != ".md":
+        raise HTTPException(status_code=400, detail="只有 Markdown 报告支持图片打包下载")
+
+    try:
+        markdown = report_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=409, detail="Markdown 报告不是 UTF-8 编码") from exc
+
+    sources = [
+        match.group("angle") or match.group("plain") or ""
+        for match in _MARKDOWN_IMAGE_PATTERN.finditer(markdown)
+    ]
+    sources.extend(match.group("src") for match in _HTML_IMAGE_PATTERN.finditer(markdown))
+
+    resolved_root = root.resolve()
+    report_parent = report_path.parent.resolve()
+    assets: dict[str, Path] = {}
+    rewrites: dict[str, str] = {}
+    for raw_source in sources:
+        source = raw_source.strip().replace("\\", "/")
+        if not source or source.startswith(("http://", "https://", "data:", "blob:", "#")):
+            continue
+        # Queries and fragments are not part of a local filesystem path.
+        source_path = source.split("#", 1)[0].split("?", 1)[0]
+        pure = PurePosixPath(source_path)
+        if ".." in pure.parts:
+            raise HTTPException(status_code=409, detail=f"报告图片路径不安全：{source}")
+        if source_path.startswith("/workspace/"):
+            relative = sandbox_manager.workspace_relative_path(source_path)
+            archive_path = PurePosixPath(*relative.parts).as_posix()
+            candidate = resolved_root / Path(*relative.parts)
+            # The report is extracted at the ZIP root, where /workspace does not exist.
+            rewrites[raw_source] = archive_path
+        elif pure.is_absolute():
+            raise HTTPException(status_code=409, detail=f"报告图片必须位于工作区：{source}")
+        else:
+            archive_path = pure.as_posix()
+            candidate = report_parent / Path(*pure.parts)
+
+        if candidate.is_symlink():
+            raise HTTPException(status_code=409, detail=f"报告图片不能是符号链接：{source}")
+        image_path = candidate.resolve()
+        if not image_path.is_relative_to(resolved_root):
+            raise HTTPException(status_code=409, detail=f"报告图片越过工作区：{source}")
+        if not image_path.is_file():
+            raise HTTPException(status_code=409, detail=f"报告引用的图片不存在：{source}")
+        assets[archive_path] = image_path
+
+    bundled_markdown = markdown
+    for original, replacement in rewrites.items():
+        bundled_markdown = bundled_markdown.replace(original, replacement)
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(report_path.name, bundled_markdown.encode("utf-8"))
+        for archive_path, image_path in sorted(assets.items()):
+            archive.write(image_path, archive_path)
+    return buffer.getvalue(), f"{report_path.stem}-bundle.zip"
 
 
 def _user_payload(user: database.UserRecord) -> dict[str, object]:
@@ -607,6 +686,27 @@ async def download_artifact(
     target = await asyncio.to_thread(_download_path, root, path)
     media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return FileResponse(target, media_type=media_type, filename=target.name)
+
+
+@app.get("/artifacts/{thread_id}/bundle")
+async def download_markdown_bundle(
+    thread_id: str,
+    path: str = Query(..., min_length=1),
+    authorization: str | None = Header(default=None),
+) -> StreamingResponse:
+    """Download a Markdown report together with its local images as a ZIP."""
+
+    user_id = await _authenticated_user_id(authorization)
+    if await database.get_thread_owner(thread_id) != user_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+        thread_id,
+        "supervisor",
+        user_id=user_id,
+    )
+    content, filename = await asyncio.to_thread(_markdown_bundle, root, path)
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(io.BytesIO(content), media_type="application/zip", headers=headers)
 
 
 @app.post("/async-tasks/status")

@@ -22,6 +22,13 @@ def test_supervisor_exposes_assign_skill_and_async_crawl_tools() -> None:
     assert "check_async_task" in tools
     assert "task" not in tools
     assert "crawl-worker" in tools["start_async_task"].description
+    assert {
+        "database_list_schemas",
+        "database_list_objects",
+        "database_get_object_details",
+        "database_query_preview",
+        "database_query_to_file",
+    } <= set(tools)
 
 
 def test_crawl_worker_exposes_tavily_tools() -> None:

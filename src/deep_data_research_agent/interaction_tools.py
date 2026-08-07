@@ -54,12 +54,13 @@ def ask_user(
     "request_report_download",
     description=(
         "仅当用户明确要求下载、保存到本地或导出文件时调用。默认下载"
-        "/workspace/final_report.md；调用前必须确认目标文件已经生成。"
+        "/workspace/output/final_report.pdf；PDF 不存在时显式传入 Markdown 路径。"
+        "调用前必须确认目标文件已经生成。"
     ),
 )
 async def request_report_download(
     file_path: Annotated[str, "要下载的 /workspace 下文件路径"] = (
-        "/workspace/final_report.md"
+        "/workspace/output/final_report.pdf"
     ),
     download_name: Annotated[str | None, "浏览器保存时使用的文件名，可省略"] = None,
     *,
