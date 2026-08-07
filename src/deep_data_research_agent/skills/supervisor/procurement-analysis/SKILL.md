@@ -50,13 +50,13 @@ shipping_tax_notes、notes。无法可靠换算时将 comparable_unit_cost 留�
 ```text
 python -m pip install --disable-pip-version-check --no-input \
   -i https://mirrors.aliyun.com/pypi/simple/ \
-  -r /skills/supervisor/procurement-analysis/requirements.txt
+  -r /skills/public/supervisor/active/procurement-analysis/requirements.txt
 ```
 
 ⑩ 执行：
 
 ```text
-python /skills/supervisor/procurement-analysis/scripts/analyze_quotes.py \
+python /skills/public/supervisor/active/procurement-analysis/scripts/analyze_quotes.py \
   --input /workspace/output/procurement_quotes.csv \
   --output-dir /workspace/output/charts \
   --summary /workspace/output/procurement_summary.json
@@ -67,7 +67,8 @@ price_comparison.png；至少两个完整评分才生成 supplier_score.png。�
 
 ## 阶段五 — 生成报告
 
-⑪ 完整阅读 /skills/supervisor/evidence-reporting/SKILL.md，再写 /workspace/output/final_report.md。
+⑪ 完整阅读 /skills/public/supervisor/active/evidence-reporting/SKILL.md，再写
+/workspace/output/final_report.md。
 报告包含执行摘要、需求与口径、报价表、评分与推荐、图表、风险和缺失数据、谈判建议及来源。
 使用 `charts/price_comparison.png` 和 `charts/supplier_score.png` 相对路径引用实际存在的图表。
 ⑫ 默认将 Markdown 转换为 /workspace/output/final_report.pdf；转换失败时保留 Markdown 并

@@ -1,6 +1,6 @@
 # Deep Data Research Agent 设计说明
 
-> 状态：当前 MVP 使用 Tavily、异步 crawl-worker、Supervisor 直管 Skill、OpenSandbox 与 MongoDB；更新日期：2026-07-31
+> 状态：当前 MVP 使用同步 data-analyst、异步 crawl-worker、Supervisor 直管 Skill、OpenSandbox 与 MongoDB；更新日期：2026-08-07
 > 未确认的技术选型以“暂定”标记，后续讨论后更新。
 ## 1. 项目背景
 
@@ -40,15 +40,13 @@
 flowchart LR
     U["Web 前端"] --> A["Agent Server<br/>认证与授权"]
     A --> S["Supervisor DeepAgent"]
-    S --> P["site-profiler<br/>同步子 Agent"]
+    S --> P["data-analyst<br/>同步子 Agent"]
     S --> C["crawl-worker<br/>异步子 Agent"]
     S --> K["skill-manage<br/>直接工具流程"]
-    S --> D["analysis-worker<br/>异步子 Agent"]
     S --> X["OpenSandbox<br/>每 thread/组件一个"]
     C --> X
     K --> M["MongoDB Skill Store"]
     X --> O["本地 Artifact 快照"]
-    D --> O
     O --> S
     S --> R["简要结论 + Markdown 报告"]
     S -.-> L["LangSmith"]
@@ -93,13 +91,13 @@ flowchart LR
 | 能力 | 设计 |
 |---|---|
 | Plan | `write_todos` 展示实时计划，task manifest 保存稳定计划 |
-| Skills | 内置 Skill 同步到沙箱；MongoDB active Skill 只读恢复并按需加载 |
-| Subagent | site-profiler 后续使用同步子 Agent；Skill 管理不使用子 Agent |
-| Async Subagent | crawl-worker、analysis-worker 使用 Agent Protocol |
+| Skills | 仓库公共种子启动时同步到 MongoDB；公共和用户 active Skill 只读恢复并按需加载 |
+| Subagent | data-analyst 通过 `subagents=` 同步调用；Skill 管理不使用子 Agent |
+| Async Subagent | crawl-worker 使用 Agent Protocol |
 | Context | 对话、state、workspace、artifact、memory 分层管理 |
 | Memory | MongoDB StoreBackend 保存用户动态 Skill；通用记忆后续实现 |
 | Interrupt | 审批采集范围、登录态、成本、联网和共享记忆写入 |
-| Backend | 全部 Agent 使用 OpenSandbox 默认后端，State/内置 Skills/持久化 Skills 独立路由 |
+| Backend | 全部 Agent 使用 OpenSandbox 默认后端，State、Agent 专属公共/用户 Skills 独立路由 |
 | Sandbox | Supervisor 联网（Skill 下载/安装）；crawl 禁网；Tavily 请求始终宿主进程 |
 | Streaming | 流式输出消息、todo、工具、进度和 interrupt |
 | Observability | LangSmith 自动 tracing 加业务自定义 spans |
@@ -113,7 +111,12 @@ flowchart LR
 - `data-quality-analysis`：缺失、异常、类型和统计验证。
 - `evidence-reporting`：证据引用、局限说明和 Markdown 报告。
 
-内置 Skills 随代码只读发布并同步到沙箱；Supervisor 读取统一 `skill-manage` 后在默认 OpenSandbox 的 `/skill-manage/` 创建或下载 Skill、用 `execute` 测试，再通过单个 `assign_skill` 一步分配并持久化，不创建 Skill 专用 LangGraph 或子智能体。用户 Skill 写入 MongoDB active 目录，于每轮恢复到目标沙箱。下载依赖已联网的 supervisor 沙箱，解压拒绝路径穿越与链接。
+仓库 Skill 仅作为公共版本化种子，启动时精确同步到
+`("public", "skills", agent_name)`；运行时不再读取仓库文件。Supervisor 读取统一
+`skill-manage` 后在 `/skill-manage/` 创建或下载候选 Skill、用 `execute` 测试，再通过
+`assign_skill` 写入 `(user_hash, "skills", agent_name)`。每个 Agent 每轮分别恢复自身公共与
+用户 Skill，同名时用户版本后加载并覆盖公共版本。下载依赖已联网的 supervisor 沙箱，解压
+拒绝路径穿越与链接。
 
 ## 9. 上下文与长期记忆
 

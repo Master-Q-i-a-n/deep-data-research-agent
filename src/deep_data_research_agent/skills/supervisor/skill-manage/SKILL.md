@@ -27,7 +27,7 @@ description: 管理 Skill 的下载、创建、测试和分配流程。
 
 ④ 测试通过后调用：
 
-   assign_skill(skill_name="{name}", targets=["supervisor"] 或 ["crawl-worker"])
+   assign_skill(skill_name="{name}", targets=["supervisor"]、["data-analyst"] 或 ["crawl-worker"])
 
    工具自动把 Skill 持久化到 MongoDB，并保留候选目录，便于继续检查或分配给其他
    Agent。未指定目标时先向用户确认；目标无效时按返回的“可用目标”纠正。
@@ -35,7 +35,7 @@ description: 管理 Skill 的下载、创建、测试和分配流程。
 ## 阶段四 — 完成
 
 目标 Agent 在下一轮对话中自动加载该 Skill（恢复至
-/persisted-skills/active/{name}/，沙箱物理路径相同）。
+`/skills/user/{agent_name}/active/{name}/`，沙箱物理路径相同）。
 
 ## 注意事项
 
@@ -43,8 +43,10 @@ description: 管理 Skill 的下载、创建、测试和分配流程。
   且 name 等于目录名。
 - /skill-manage/{name}/ 仅用于候选创建、下载、测试和后续分配；已激活 Skill 运行时
   不得使用该路径。
-- 最终 SKILL.md 不得引用 /skill-manage/{name}/；最终脚本路径必须写成
-  /persisted-skills/active/{name}/{script_path}。
+- 最终 SKILL.md 不得引用 /skill-manage/{name}/；自身根目录统一写为
+  `{{SKILL_ROOT}}`，例如 `{{SKILL_ROOT}}/{script_path}`。assign_skill 会按目标 Agent 改写为
+  `/skills/user/{agent_name}/active/{name}`。旧候选中使用的
+  `/persisted-skills/active/{name}` 也会在分配时自动改写。
 - 不要另建平行临时目录；文件工具与 execute 都使用 /skill-manage/{name}/。
 - 不要用 glob 匹配 /skill-manage/**（可能扫描过多文件）；用 ls 逐层或直接 read_file。
 - 不安装 curl、wget、unzip 等系统工具，不使用 apt/apk 或 `curl | sh`。下载和解压统一

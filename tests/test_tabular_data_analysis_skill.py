@@ -23,8 +23,8 @@ from openpyxl import Workbook
 
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.agent import graph as supervisor_graph
-from deep_data_research_agent.prompts import SUPERVISOR_PROMPT
-from deep_data_research_agent.skill_middleware import _load_builtin_files
+from deep_data_research_agent.mongodb_store import _public_seed_values
+from deep_data_research_agent.prompts import DATA_ANALYST_PROMPT, SUPERVISOR_PROMPT
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = (
@@ -32,7 +32,7 @@ SKILL_ROOT = (
     / "src"
     / "deep_data_research_agent"
     / "skills"
-    / "supervisor"
+    / "data-analyst"
     / "tabular-data-analysis"
 )
 SCRIPT_PATH = SKILL_ROOT / "scripts" / "profile_table.py"
@@ -48,19 +48,20 @@ def _load_profile_module():
 
 def test_tabular_skill_is_builtin_planning_guidance() -> None:
     text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")
-    files = {path for path, _content in _load_builtin_files("supervisor")}
+    files = set(_public_seed_values("data-analyst"))
 
     assert len(text.splitlines()) <= 100
     assert "name: tabular-data-analysis" in text
-    for stage in ("理解任务并规划", "确定性探查", "制定并执行分析", "验证与输出"):
+    for stage in ("理解与探查", "分析与验证", "输出"):
         assert stage in text
     assert "不在本 Skill 中假定业务指标" in text
     assert {
-        "supervisor/tabular-data-analysis/SKILL.md",
-        "supervisor/tabular-data-analysis/scripts/profile_table.py",
+        "/active/tabular-data-analysis/SKILL.md",
+        "/active/tabular-data-analysis/scripts/profile_table.py",
     } <= files
-    assert "/skills/supervisor/tabular-data-analysis/SKILL.md" in SUPERVISOR_PROMPT
-    assert "不得错误委派给 crawl-worker" in SUPERVISOR_PROMPT
+    assert "CSV" not in SUPERVISOR_PROMPT
+    assert "CSV、TSV、XLSX" in DATA_ANALYST_PROMPT
+    assert "needs_input" in DATA_ANALYST_PROMPT
 
 
 def test_profile_csv_preserves_identifier_and_detects_duplicates(

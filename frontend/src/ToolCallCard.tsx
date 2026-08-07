@@ -1,4 +1,5 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useMemo, useState } from "react";
+import SubagentTrace, { type SubagentTraceStream } from "./SubagentTrace";
 
 export type ToolCard = {
   callId: string;
@@ -10,6 +11,7 @@ export type ToolCard = {
 
 const TOOL_LABELS: Record<string, string> = {
   write_todos: "更新研究计划",
+  task: "调用同步子智能体",
   start_async_task: "启动后台任务",
   check_async_task: "检查任务进度",
   update_async_task: "补充任务要求",
@@ -38,9 +40,9 @@ function previewValue(value: string): string {
   return `${value.slice(0, TOOL_PREVIEW_LIMIT)}\n\n…内容过长，仅显示前 ${TOOL_PREVIEW_LIMIT} 个字符。`;
 }
 
-function ToolCallCard({ card }: { card: ToolCard }) {
-  const [open, setOpen] = useState(card.status === "pending");
-  const previousStatus = useRef(card.status);
+function ToolCallCard({ card, subagent }: { card: ToolCard; subagent?: SubagentTraceStream }) {
+  // 同步子智能体卡始终首次展开；状态更新不再改变用户选择的开合状态。
+  const [open, setOpen] = useState(card.name === "task" || card.status === "pending");
   // 折叠时不序列化或挂载大结果，避免每个流式 token 都处理完整网页正文。
   const argsPreview = useMemo(
     () => (open ? previewValue(formatValue(card.args)) : ""),
@@ -50,13 +52,6 @@ function ToolCallCard({ card }: { card: ToolCard }) {
     () => (open && card.result !== null ? previewValue(card.result) : null),
     [card.result, open],
   );
-
-  useEffect(() => {
-    if (previousStatus.current === "pending" && card.status === "done") {
-      setOpen(false);
-    }
-    previousStatus.current = card.status;
-  }, [card.status]);
 
   return (
     <details
@@ -77,6 +72,7 @@ function ToolCallCard({ card }: { card: ToolCard }) {
             <span className="tool-card__label">输入</span>
             <pre>{argsPreview}</pre>
           </div>
+          {subagent ? <SubagentTrace subagent={subagent} /> : null}
           {resultPreview !== null ? (
             <div>
               <span className="tool-card__label">结果</span>
@@ -95,4 +91,5 @@ export default memo(ToolCallCard, (previous, next) => (
   && previous.card.status === next.card.status
   && previous.card.args === next.card.args
   && previous.card.result === next.card.result
+  && previous.subagent === next.subagent
 ));

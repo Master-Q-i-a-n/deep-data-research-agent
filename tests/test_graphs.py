@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 
@@ -7,11 +8,12 @@ from langchain_core.messages import AIMessage
 from deep_data_research_agent.agent import graph as supervisor_graph
 from deep_data_research_agent.crawl_worker import crawl_agent
 from deep_data_research_agent.crawl_worker import graph as worker_graph
+from deep_data_research_agent.prompts import DATA_ANALYST_PROMPT, SUPERVISOR_PROMPT
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_supervisor_exposes_assign_skill_and_async_crawl_tools() -> None:
+def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
     tools = supervisor_graph.nodes["tools"].bound.tools_by_name
 
     assert supervisor_graph.name == "supervisor"
@@ -20,15 +22,16 @@ def test_supervisor_exposes_assign_skill_and_async_crawl_tools() -> None:
     assert "request_report_download" in tools
     assert "start_async_task" in tools
     assert "check_async_task" in tools
-    assert "task" not in tools
+    assert "task" in tools
+    assert "data-analyst" in tools["task"].description
     assert "crawl-worker" in tools["start_async_task"].description
-    assert {
+    assert not {
         "database_list_schemas",
         "database_list_objects",
         "database_get_object_details",
         "database_query_preview",
         "database_query_to_file",
-    } <= set(tools)
+    } & set(tools)
 
 
 def test_crawl_worker_exposes_tavily_tools() -> None:
@@ -44,6 +47,54 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
     assert {"tavily_search", "tavily_crawl", "tavily_extract"} <= set(tools)
     assert "execute" in tools
     assert "task" not in tools
+
+
+def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() -> None:
+    task_tool = supervisor_graph.nodes["tools"].bound.tools_by_name["task"]
+    child_graphs = inspect.getclosurevars(task_tool.coroutine).nonlocals[
+        "subagent_graphs"
+    ]
+    data_analyst = child_graphs["data-analyst"]
+    tools = data_analyst.nodes["tools"].bound.tools_by_name
+
+    assert {
+        "write_todos",
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "execute",
+        "database_list_schemas",
+        "database_list_objects",
+        "database_get_object_details",
+        "database_query_preview",
+        "database_query_to_file",
+    } <= set(tools)
+    assert not {
+        "task",
+        "assign_skill",
+        "ask_user",
+        "request_report_download",
+        "tavily_search",
+    } & set(tools)
+
+
+def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() -> None:
+    for business_term in ("CSV", "XLSX", "PostgreSQL", "采购算法"):
+        assert business_term not in SUPERVISOR_PROMPT
+    for contract_field in (
+        '"status"',
+        '"summary"',
+        '"findings"',
+        '"artifacts"',
+        '"warnings"',
+        '"required_inputs"',
+    ):
+        assert contract_field in DATA_ANALYST_PROMPT
+    assert "needs_input" in DATA_ANALYST_PROMPT
+    assert "不直接\n  与用户交互" in DATA_ANALYST_PROMPT
 
 
 @pytest.mark.asyncio
@@ -101,14 +152,10 @@ def test_supervisor_sandbox_lifecycle_precedes_skill_loading() -> None:
     ) in edges
     assert (
         "MemoryRefreshMiddleware.before_agent",
-        "SkillsSyncMiddleware.before_agent",
+        "MongoSkillsRestoreMiddleware.before_agent",
     ) in edges
     assert (
-        "SkillsSyncMiddleware.before_agent",
-        "UserSkillsRestoreMiddleware.before_agent",
-    ) in edges
-    assert (
-        "UserSkillsRestoreMiddleware.before_agent",
+        "MongoSkillsRestoreMiddleware.before_agent",
         "ReloadableSkillsMiddleware.before_agent",
     ) in edges
     assert ("ReloadableSkillsMiddleware.before_agent", "model") in edges
@@ -138,5 +185,6 @@ def test_manage_skill_doc_has_flexible_direct_flow() -> None:
         assert stage in text
     for number in "①②③④":
         assert number in text
-    assert "子智能体" not in text
     assert "assign_skill" in text
+    assert "data-analyst" in text
+    assert "{{SKILL_ROOT}}" in text

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministically profile CSV, TSV and XLSX inputs without business analysis."""
+"""Deterministically profile CSV, TSV and XLSX inputs for data-analyst."""
 
 from __future__ import annotations
 

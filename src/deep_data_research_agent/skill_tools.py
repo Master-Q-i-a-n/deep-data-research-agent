@@ -7,7 +7,6 @@ OpenSandbox 后端处理，所以文件工具与 execute 使用完全相同的�
 
 from __future__ import annotations
 
-import base64
 import json
 import re
 import shlex
@@ -19,11 +18,16 @@ from langchain.tools import ToolRuntime, tool
 
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.identity import user_hash
+from deep_data_research_agent.skill_storage import (
+    SKILL_AGENT_NAMES,
+    file_store_value,
+    rewrite_candidate_content,
+)
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MAX_SKILL_NAME_LENGTH = 64
 _LANGGRAPH_JSON = Path(__file__).resolve().parents[2] / "langgraph.json"
-_FALLBACK_TARGETS = frozenset({"supervisor", "crawl-worker"})
+_FALLBACK_TARGETS = SKILL_AGENT_NAMES
 _COMPONENT = "supervisor"
 
 
@@ -39,7 +43,7 @@ def _available_targets() -> frozenset[str]:
     except (OSError, ValueError, json.JSONDecodeError):
         graphs = None
     if isinstance(graphs, dict) and graphs:
-        return frozenset(graphs.keys())
+        return frozenset(graphs.keys()) | SKILL_AGENT_NAMES
     return _FALLBACK_TARGETS
 
 
@@ -65,24 +69,6 @@ def _validated_targets(values: list[str], available: frozenset[str]) -> list[str
         allowed = "、".join(sorted(available))
         raise ValueError(f"无效目标：{'、'.join(invalid)}；可用目标：{allowed}")
     return normalized
-
-
-def _file_store_value(content: bytes) -> dict[str, str]:
-    """将文件内容编码为 StoreBackend v2 格式，供 _stored_file_content 解码。"""
-
-    now = datetime.now(UTC).isoformat()
-    try:
-        text = content.decode("utf-8")
-        encoding = "utf-8"
-    except UnicodeDecodeError:
-        text = base64.b64encode(content).decode("ascii")
-        encoding = "base64"
-    return {
-        "content": text,
-        "encoding": encoding,
-        "created_at": now,
-        "modified_at": now,
-    }
 
 
 def _absolute_path(root: str, relative: str) -> str:
@@ -182,7 +168,10 @@ async def _read_skill_files(
 )
 async def assign_skill(
     skill_name: Annotated[str, "Skill 名称（小写字母、数字和单连字符）"],
-    targets: Annotated[list[str], "目标 Agent 名称列表，如 ['supervisor'] 或 ['crawl-worker']"],
+    targets: Annotated[
+        list[str],
+        "目标 Agent 名称列表，如 ['supervisor']、['data-analyst'] 或 ['crawl-worker']",
+    ],
     runtime: ToolRuntime,
 ) -> str:
     """一步完成 Skill 的分配与持久化。"""
@@ -205,17 +194,22 @@ async def assign_skill(
 
     user_ns = user_hash(runtime)
     for target in normalized_targets:
-        namespace = (user_ns, "skills", "assigned", target)
+        namespace = (user_ns, "skills", target)
         for relative, content in files:
+            rewritten = rewrite_candidate_content(
+                content,
+                skill_name=name,
+                agent_name=target,
+            )
             await store.aput(
                 namespace,
                 f"/active/{name}/{relative}",
-                _file_store_value(content),
+                file_store_value(rewritten),
             )
         await store.aput(
             namespace,
             f"/manifests/{name}.json",
-            _file_store_value(
+            file_store_value(
                 json.dumps(
                     {
                         "skill_name": name,

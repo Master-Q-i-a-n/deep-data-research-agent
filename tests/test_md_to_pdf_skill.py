@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
+from deep_data_research_agent.mongodb_store import _public_seed_values
 from deep_data_research_agent.prompts import SUPERVISOR_PROMPT
-from deep_data_research_agent.skill_middleware import _load_builtin_files
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = (
@@ -16,19 +16,19 @@ SKILL_ROOT = (
 )
 
 
-def test_md_to_pdf_is_shared_builtin_skill() -> None:
+def test_md_to_pdf_is_supervisor_public_seed() -> None:
     text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")
-    files = {path for path, _content in _load_builtin_files("supervisor")}
+    files = set(_public_seed_values("supervisor"))
 
     assert len(text.splitlines()) <= 100
     assert "name: md-to-pdf" in text
-    assert "/skills/supervisor/md-to-pdf/scripts/md_to_pdf.py" in text
+    assert "/skills/public/supervisor/active/md-to-pdf/scripts/md_to_pdf.py" in text
     assert {
-        "supervisor/md-to-pdf/SKILL.md",
-        "supervisor/md-to-pdf/scripts/md_to_pdf.py",
+        "/active/md-to-pdf/SKILL.md",
+        "/active/md-to-pdf/scripts/md_to_pdf.py",
+        "/manifests/md-to-pdf.json",
     } <= files
-    assert "/skills/supervisor/md-to-pdf/SKILL.md" in SUPERVISOR_PROMPT
-    assert "PDF 是默认交付物" in SUPERVISOR_PROMPT
+    assert "md-to-pdf" not in SUPERVISOR_PROMPT
 
 
 def test_md_to_pdf_script_uses_lightweight_weasyprint_pipeline() -> None:

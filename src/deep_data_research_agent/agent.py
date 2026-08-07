@@ -1,6 +1,6 @@
 """Supervisor DeepAgent graph exposed through the LangGraph Agent Server."""
 
-from deepagents import AsyncSubAgent, create_deep_agent
+from deepagents import AsyncSubAgent, SubAgent, create_deep_agent
 from deepagents.middleware.async_subagents import AsyncSubAgentMiddleware
 
 from deep_data_research_agent.backends import (
@@ -19,14 +19,18 @@ from deep_data_research_agent.memory import (
     UserPreferenceUpdateMiddleware,
 )
 from deep_data_research_agent.model_profile import register_mvp_profile
-from deep_data_research_agent.prompts import ASYNC_SUBAGENT_PROMPT, SUPERVISOR_PROMPT
+from deep_data_research_agent.prompts import (
+    ASYNC_SUBAGENT_PROMPT,
+    DATA_ANALYST_PROMPT,
+    SUPERVISOR_PROMPT,
+)
 from deep_data_research_agent.skill_middleware import (
+    MongoSkillsRestoreMiddleware,
     ReloadableSkillsMiddleware,
     SandboxLifecycleMiddleware,
-    SkillsSyncMiddleware,
     SkillToolErrorMiddleware,
-    UserSkillsRestoreMiddleware,
 )
+from deep_data_research_agent.skill_storage import public_skill_root, user_skill_root
 from deep_data_research_agent.skill_tools import ASSIGN_SKILL_TOOL
 
 register_mvp_profile()
@@ -35,7 +39,28 @@ graph = create_deep_agent(
     name="supervisor",
     model=create_chat_model(),
     system_prompt=SUPERVISOR_PROMPT,
-    tools=[*ASSIGN_SKILL_TOOL, *INTERACTION_TOOLS, *DATABASE_TOOLS],
+    tools=[*ASSIGN_SKILL_TOOL, *INTERACTION_TOOLS],
+    subagents=[
+        SubAgent(
+            name="data-analyst",
+            description=(
+                "分析本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据，"
+                "生成可核验的 Markdown、CSV、JSON、PNG 产物；信息不足时返回 needs_input。"
+            ),
+            system_prompt=DATA_ANALYST_PROMPT,
+            tools=DATABASE_TOOLS,
+            skills=[
+                f"{public_skill_root('data-analyst')}/",
+                f"{user_skill_root('data-analyst')}/",
+            ],
+            middleware=[
+                MongoSkillsRestoreMiddleware(
+                    component="supervisor",
+                    agent_name="data-analyst",
+                )
+            ],
+        )
+    ],
     middleware=[
         SandboxLifecycleMiddleware(
             component="supervisor",
@@ -49,11 +74,7 @@ graph = create_deep_agent(
             sources=[AGENT_MEMORY_PATHS["supervisor"], USER_PREFERENCES_PATH],
             initialize_preferences=True,
         ),
-        SkillsSyncMiddleware(
-            component="supervisor",
-            scope="supervisor",
-        ),
-        UserSkillsRestoreMiddleware(
+        MongoSkillsRestoreMiddleware(
             component="supervisor",
             agent_name="supervisor",
         ),
@@ -78,8 +99,8 @@ graph = create_deep_agent(
         ReloadableSkillsMiddleware(
             backend=create_backend,
             sources=[
-                ("/skills/supervisor/", "内置"),
-                ("/persisted-skills/active/", "用户"),
+                (f"{public_skill_root('supervisor')}/", "公共"),
+                (f"{user_skill_root('supervisor')}/", "用户"),
             ],
         ),
         AgentExperienceEnqueueMiddleware(agent_name="supervisor"),

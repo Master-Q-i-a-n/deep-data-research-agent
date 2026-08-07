@@ -506,14 +506,14 @@ async def test_replace_directory_uploads_physical_skill_copy(tmp_path) -> None:
 
     count = await manager.replace_directory_files(
         "thread-a",
-        "/persisted-skills",
-        [("active/demo/SKILL.md", b"demo")],
+        "/skills/user/supervisor/active",
+        [("demo/SKILL.md", b"demo")],
         component="supervisor",
     )
 
     assert count == 1
     assert handle.backend.files[
-        "/persisted-skills/active/demo/SKILL.md"
+        "/skills/user/supervisor/active/demo/SKILL.md"
     ] == b"demo"
 
 
@@ -535,10 +535,10 @@ def test_worker_backend_uses_sandbox_as_default(tmp_path, monkeypatch) -> None:
     assert isinstance(backend.default, OpensandboxBackend)
     assert set(backend.routes) == {
         "/state/",
-        "/skills/",
-        "/persisted-skills/",
         "/memories/agent/",
         "/memories/user/",
+        "/skills/public/crawl-worker/",
+        "/skills/user/crawl-worker/",
     }
     assert backend.artifacts_root == "/state"
 

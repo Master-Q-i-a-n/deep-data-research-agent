@@ -15,7 +15,7 @@ description: 将 Markdown 报告转换为专业排版 PDF，支持中文、表�
 4. ④执行转换脚本：
 
 ```bash
-python3 /skills/supervisor/md-to-pdf/scripts/md_to_pdf.py \
+python3 /skills/public/supervisor/active/md-to-pdf/scripts/md_to_pdf.py \
   /workspace/output/final_report.md \
   /workspace/output/final_report.pdf \
   --format A4 --header-footer
@@ -43,4 +43,3 @@ python3 /skills/supervisor/md-to-pdf/scripts/md_to_pdf.py \
 - 不执行 Markdown 内的 JavaScript、宏或外部命令。
 - 大表允许跨页，表头会重复；不要用超宽列或把完整原始数据塞入报告。
 - 不修改输入 Markdown，不静默忽略缺失图片，不把转换成功等同于视觉验收成功。
-

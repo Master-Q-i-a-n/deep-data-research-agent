@@ -1,11 +1,14 @@
-import { ChangeEvent, FormEvent, ImgHTMLAttributes, KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, ImgHTMLAttributes, KeyboardEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { HumanMessage } from "@langchain/core/messages";
 import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import SessionHistory, { type ConversationThread } from "./SessionHistory";
+import SubagentPlanPanel from "./SubagentPlanPanel";
 import TaskTrace, { type AsyncTask, type AsyncTaskStatus } from "./TaskTrace";
 import TodoPanel, { type TodoItem } from "./TodoPanel";
 import ToolCallCard, { type ToolCard } from "./ToolCallCard";
+import type { SubagentTraceStream } from "./SubagentTrace";
 
 type RawToolCall = { id?: string; name?: string; args?: unknown };
 type Message = {
@@ -115,6 +118,18 @@ const EXAMPLES = [
 function conversationTitle(value: string): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   return normalized.length > 32 ? `${normalized.slice(0, 32)}…` : normalized;
+}
+
+function viewportAtBottom(): boolean {
+  const scrollRoot = document.scrollingElement ?? document.documentElement;
+  const scrollTop = Math.max(scrollRoot.scrollTop, window.scrollY);
+  return scrollRoot.scrollHeight - (scrollTop + window.innerHeight) <= 72;
+}
+
+function scrollViewportToBottom(): void {
+  const scrollRoot = document.scrollingElement ?? document.documentElement;
+  // 滚到文档真实末端；对话区自身带有底部留白，滚动末端占位节点会提前停下。
+  window.scrollTo({ top: scrollRoot.scrollHeight, behavior: "auto" });
 }
 
 function messageText(content: unknown): string {
@@ -528,13 +543,20 @@ export default function App() {
   const [interruptSubmitting, setInterruptSubmitting] = useState(false);
   const [interruptError, setInterruptError] = useState("");
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
-  const endRef = useRef<HTMLDivElement>(null);
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  const conversationRef = useRef<HTMLElement>(null);
+  const autoFollowRef = useRef(true);
   const previousLoadingRef = useRef(false);
   const taskPollInFlightRef = useRef(false);
   const autoCollectedTaskRunsRef = useRef<Set<string>>(new Set());
   const approvedSemanticDownloadRef = useRef(false);
   const semanticDownloadBaselineRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mainSnapshotRef = useRef<{
+    threadId?: string;
+    messages: Message[];
+    values: StreamState;
+  }>();
   const authHeaders = useMemo<Record<string, string>>(
     () => {
       const headers: Record<string, string> = {};
@@ -653,23 +675,58 @@ export default function App() {
     }
   }, [apiUrl, authHeaders, threadId]);
 
-  const stream = useStream<StreamState, { InterruptType: HITLRequest }>({
+  // 当前前端只持有远程图的状态类型，无法把 Python DeepAgent 类型直接传给
+  // useStream；使用宽化后的选项仍可启用 SDK 内置的子智能体跟踪能力。
+  const streamOptions = {
     apiUrl,
     assistantId,
     threadId,
     // 合并密集 token/state 事件，避免每个事件都触发整页 React 渲染。
     throttle: 60,
     reconnectOnMount: true,
+    // 子智能体消息保留在独立流中，避免混入 Supervisor 主对话。
+    filterSubagentMessages: true,
     defaultHeaders: authHeaders,
-    onThreadId: (id) => {
+    // streamSubgraphs 也会传回内部中间件子图状态。声明一个接收 state 的
+    // onFinish 会让 SDK 在运行结束后重新读取主图 thread head，防止子图
+    // values 成为最后一个本地快照时把主对话清空。
+    onFinish: (state: unknown) => {
+      void state;
+    },
+    onThreadId: (id: string) => {
       setThreadId(id);
       const url = new URL(window.location.href);
       url.searchParams.set("thread", id);
       window.history.replaceState({}, "", url);
     },
-  });
+  };
+  const baseStream = useStream<StreamState, { InterruptType: HITLRequest }>(streamOptions);
+  const stream = baseStream as typeof baseStream & {
+    subagents: Map<string, SubagentTraceStream>;
+  };
 
-  const rows = useMemo(() => buildRows(stream.messages as Message[]), [stream.messages]);
+  const liveMessages = stream.messages as Message[];
+  const liveValues = stream.values as StreamState;
+  const cachedMainSnapshot = mainSnapshotRef.current;
+  const holdMainSnapshot = stream.isLoading
+    && liveMessages.length === 0
+    && cachedMainSnapshot !== undefined
+    && cachedMainSnapshot.threadId === threadId
+    && cachedMainSnapshot.messages.length > 0;
+  const displayedMessages = holdMainSnapshot ? cachedMainSnapshot.messages : liveMessages;
+  const displayedValues = holdMainSnapshot ? cachedMainSnapshot.values : liveValues;
+
+  useLayoutEffect(() => {
+    if (liveMessages.length === 0) return;
+    // 只缓存含主对话消息的快照。内部中间件子图没有 messages，不能覆盖它。
+    mainSnapshotRef.current = {
+      threadId,
+      messages: liveMessages,
+      values: liveValues,
+    };
+  }, [liveMessages, liveValues, threadId]);
+
+  const rows = useMemo(() => buildRows(displayedMessages), [displayedMessages]);
   const visibleRows = useMemo(
     () => rows.slice(Math.max(0, rows.length - visibleRowLimit)),
     [rows, visibleRowLimit],
@@ -682,10 +739,10 @@ export default function App() {
     }
     return undefined;
   }, [rows]);
-  const todos = Array.isArray(stream.values?.todos) ? stream.values.todos : [];
+  const todos = Array.isArray(displayedValues?.todos) ? displayedValues.todos : [];
   const trackedTasks = useMemo(
-    () => Object.values(stream.values?.async_tasks ?? {}).reverse(),
-    [stream.values?.async_tasks],
+    () => Object.values(displayedValues?.async_tasks ?? {}).reverse(),
+    [displayedValues?.async_tasks],
   );
   const tasks = useMemo(
     () => trackedTasks.map((task) => {
@@ -710,8 +767,8 @@ export default function App() {
     [stream.interrupt?.value],
   );
   const latestPreparedDownload = useMemo(() => {
-    for (let index = stream.messages.length - 1; index >= 0; index -= 1) {
-      const message = stream.messages[index] as Message;
+    for (let index = displayedMessages.length - 1; index >= 0; index -= 1) {
+      const message = displayedMessages[index] as Message;
       if (message.type !== "tool") continue;
       const artifact = fileDownloadArtifact(message.artifact);
       if (artifact) {
@@ -722,7 +779,7 @@ export default function App() {
       }
     }
     return null;
-  }, [stream.messages]);
+  }, [displayedMessages]);
   const identitySwitchBlocked = stream.isLoading
     || stream.queue.size > 0
     || runningTaskCount > 0
@@ -896,6 +953,8 @@ export default function App() {
     autoCollectedTaskRunsRef.current.clear();
     approvedSemanticDownloadRef.current = false;
     semanticDownloadBaselineRef.current = null;
+    autoFollowRef.current = true;
+    setShowJumpToBottom(false);
   }, [threadId]);
 
   useEffect(() => {
@@ -941,7 +1000,7 @@ export default function App() {
           content: `后台任务 ${taskIds} 已完成。请调用 check_async_task 读取结果并继续处理，不要重新启动任务。`,
         }],
       },
-      { streamResumable: true, onDisconnect: "continue" },
+      { streamSubgraphs: true, streamResumable: true, onDisconnect: "continue" },
     )).catch(() => {
       runKeys.forEach((key) => autoCollectedTaskRunsRef.current.delete(key));
       setTaskRefreshError("任务已完成，但自动读取结果失败，请点击“读取结果”重试");
@@ -949,12 +1008,41 @@ export default function App() {
   }, [stream.isLoading, stream.queue.size, stream.submit, tasks, trackedTasks]);
 
   useEffect(() => {
-    // jsdom 等非完整浏览器环境可能不提供 scrollIntoView。
-    endRef.current?.scrollIntoView?.({
-      behavior: stream.isLoading ? "auto" : "smooth",
-      block: "end",
+    const updateAutoFollow = () => {
+      const atBottom = viewportAtBottom();
+      autoFollowRef.current = atBottom;
+      setShowJumpToBottom(!atBottom);
+    };
+    window.addEventListener("scroll", updateAutoFollow, { passive: true });
+    window.addEventListener("resize", updateAutoFollow);
+    return () => {
+      window.removeEventListener("scroll", updateAutoFollow);
+      window.removeEventListener("resize", updateAutoFollow);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!autoFollowRef.current) {
+      setShowJumpToBottom(true);
+      return;
+    }
+    // 只有用户原本位于底部时才跟随新内容；滚轮离开底部后保持阅读位置。
+    scrollViewportToBottom();
+    setShowJumpToBottom(false);
+  }, [rows, stream.isLoading]);
+
+  useEffect(() => {
+    const conversation = conversationRef.current;
+    if (!conversation || typeof ResizeObserver === "undefined") return undefined;
+    // 子智能体过程会在 rows 不变时持续增高，监听真实布局变化才能保持贴底。
+    const observer = new ResizeObserver(() => {
+      if (!autoFollowRef.current) return;
+      scrollViewportToBottom();
+      setShowJumpToBottom(false);
     });
-  }, [rows.length, stream.isLoading]);
+    observer.observe(conversation);
+    return () => observer.disconnect();
+  }, []);
 
   async function createThreadForUpload(firstFilename: string): Promise<string> {
     const nextThreadId = window.crypto.randomUUID();
@@ -1135,6 +1223,10 @@ export default function App() {
     const message = uploadedPaths.length > 0
       ? `${value}\n\n已上传文件：\n${uploadedPaths.join("\n")}`
       : value;
+    const optimisticMessage = new HumanMessage({
+      id: `optimistic-${window.crypto.randomUUID()}`,
+      content: message,
+    });
     setInput("");
     const multitaskOptions = stream.isLoading
       ? { multitaskStrategy: mode }
@@ -1144,6 +1236,11 @@ export default function App() {
       { messages: [{ type: "human", content: message }] },
       {
         ...multitaskOptions,
+        // LangGraph 会在首个图节点完成后才返回主图 values。先本地插入用户消息，
+        // 避免新会话在模型思考或进入子图期间重新显示空首页。
+        optimisticValues: (current) => ({
+          messages: [...(current.messages ?? []), optimisticMessage],
+        }),
         ...(!threadId && stream.messages.length === 0 ? {
           metadata: {
             kind: "conversation",
@@ -1151,6 +1248,7 @@ export default function App() {
           },
         } : {}),
         streamResumable: true,
+        streamSubgraphs: true,
         onDisconnect: "continue",
       },
     );
@@ -1169,6 +1267,7 @@ export default function App() {
       await stream.submit(null, {
         command: { resume: { decisions } },
         streamResumable: true,
+        streamSubgraphs: true,
         onDisconnect: "continue",
       });
     } catch (error) {
@@ -1215,6 +1314,12 @@ export default function App() {
 
   function refreshTasks() {
     void refreshTaskStatuses(undefined, true);
+  }
+
+  function jumpToBottom() {
+    autoFollowRef.current = true;
+    setShowJumpToBottom(false);
+    scrollViewportToBottom();
   }
 
   function startNewThread() {
@@ -1431,7 +1536,7 @@ export default function App() {
           </div>
         </header>
 
-        <section className="conversation" aria-label="研究对话">
+        <section ref={conversationRef} className="conversation" aria-label="研究对话">
           {rows.length === 0 ? (
             <div className="empty-state">
               <p className="empty-state__index">研究入口 / 01</p>
@@ -1462,7 +1567,11 @@ export default function App() {
 
           {visibleRows.map((row) =>
             row.kind === "tool" ? (
-              <ToolCallCard key={row.key} card={row.card} />
+              <ToolCallCard
+                key={row.key}
+                card={row.card}
+                subagent={row.card.name === "task" ? stream.subagents.get(row.card.callId) : undefined}
+              />
             ) : (
               <MessageCard
                 key={row.key}
@@ -1618,8 +1727,19 @@ export default function App() {
               <span>{String(stream.error)}</span>
             </div>
           ) : null}
-          <div ref={endRef} />
         </section>
+
+        {showJumpToBottom && rows.length > 0 ? (
+          <button
+            type="button"
+            className="jump-to-bottom"
+            onClick={jumpToBottom}
+            aria-label="回到对话底部"
+          >
+            <span aria-hidden="true">↓</span>
+            回到底部
+          </button>
+        ) : null}
 
         <form className="composer" onSubmit={onSubmit}>
           <div className="composer__field">
@@ -1742,6 +1862,7 @@ export default function App() {
           refreshError={taskRefreshError}
         />
         <TodoPanel todos={todos} />
+        <SubagentPlanPanel subagents={stream.subagents} />
       </aside>
 
       {authMode ? (

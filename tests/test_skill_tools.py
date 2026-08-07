@@ -63,7 +63,11 @@ class FakeBackend:
         return _execute(self.find_output, self.find_exit_code)
 
 
-SKILL_MD = "---\nname: demo\ndescription: 演示 Skill\n---\n".encode()
+SKILL_MD = (
+    "---\nname: demo-skill\ndescription: 演示 Skill\n---\n"
+    "python {{SKILL_ROOT}}/scripts/run.py\n"
+    "legacy=/persisted-skills/active/demo-skill/old.py\n"
+).encode()
 
 
 def _filled_backend(glob_matches, contents):
@@ -174,7 +178,7 @@ async def test_assign_skill_reads_and_keeps_candidate_dir(monkeypatch) -> None:
 
     result = await skill_tools.assign_skill.coroutine(
         skill_name="demo-skill",
-        targets=["crawl-worker"],
+        targets=["data-analyst", "crawl-worker"],
         runtime=runtime,
     )
 
@@ -186,11 +190,16 @@ async def test_assign_skill_reads_and_keeps_candidate_dir(monkeypatch) -> None:
     ]]
     assert backend.execute_calls == []
 
-    namespace = (identity.user_hash(runtime), "skills", "assigned", "crawl-worker")
-    items = store.search(namespace)
-    keys = {item.key for item in items}
-    assert "/active/demo-skill/SKILL.md" in keys
-    assert "/manifests/demo-skill.json" in keys
+    for target in ("data-analyst", "crawl-worker"):
+        namespace = (identity.user_hash(runtime), "skills", target)
+        items = store.search(namespace)
+        values = {item.key: item.value for item in items}
+        assert "/active/demo-skill/SKILL.md" in values
+        assert "/manifests/demo-skill.json" in values
+        content = values["/active/demo-skill/SKILL.md"]["content"]
+        expected_root = f"/skills/user/{target}/active/demo-skill"
+        assert f"python {expected_root}/scripts/run.py" in content
+        assert f"legacy={expected_root}/old.py" in content
 
 
 @pytest.mark.asyncio

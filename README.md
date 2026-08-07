@@ -1,22 +1,25 @@
 # Deep Data Research Agent
 
-基于 DeepAgents 的网页数据分析 Agent MVP。用户提交自然语言任务后，Supervisor 通过 ASGI
-异步子代理启动 `crawl-worker`；Worker 使用 Tavily 搜索、爬取或提取公开网页，整理证据并返回
-初步分析，Supervisor 最终生成简要结论和 Markdown 报告。
+基于 DeepAgents 的数据研究 Agent MVP。Supervisor 通过同步 `data-analyst` 分析本地表格和
+PostgreSQL 只读数据，通过 ASGI 异步 `crawl-worker` 采集公开网页，再核验和整合结果。
 
 Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Skill，经测试后用单个
-`assign_skill` 工具一步分配给 Supervisor、crawl-worker 或两者，并持久化到 MongoDB。
+`assign_skill` 工具分配给 Supervisor、data-analyst、crawl-worker 中的一个或多个目标，并
+持久化到 MongoDB。
 
 ## 当前能力
 
 - DeepAgents Supervisor，使用内置 `write_todos` 管理计划。
+- 通过官方 `subagents=` 注册的同步 `data-analyst`，负责 CSV、TSV、XLSX 与 PostgreSQL
+  只读分析，并返回稳定 JSON 文本契约。
 - ASGI co-deployed `crawl-worker`，拥有独立 thread 和上下文。
 - Tavily Search、Crawl、Extract 三种采集入口。
-- Worker 使用 `OpenSandbox + StateBackend + FilesystemBackend` 混合后端。
+- Agent 使用 `OpenSandbox + StateBackend + StoreBackend` 混合后端。
 - 每个 Worker thread 独占一个沙箱，成功后导出本地产物快照。
 - 沙箱内可执行仅限数据处理和分析用途的 Python 脚本。
-- Supervisor 与 Worker 分别加载只读 Skill。
-- 用户动态 Skill 使用 MongoDB `StoreBackend` 按用户和 Agent 隔离，并在每次 run 重新加载。
+- 所有运行时 Skill 从 MongoDB 加载；仓库中的公共 Skill 只作为启动时的版本化种子。
+- 公共 Skill 使用 `("public", "skills", agent_name)`，用户 Skill 使用
+  `(user_hash, "skills", agent_name)`，按 Agent 隔离并在每次 run 重新加载；同名时用户版本优先。
 - Supervisor 读取 `skill-manage` 后通过 `assign_skill` 一步分配 Skill，不创建 Skill 子智能体。
 - LangSmith 记录 Agent、模型、工具及沙箱生命周期。
 - React 三栏研究工作台，左侧显示用户会话，中间流式展示对话，右侧集中显示计划和异步任务轨迹。
@@ -75,7 +78,8 @@ OPEN_SANDBOX_USE_SERVER_PROXY=true
 OPEN_SANDBOX_TIMEOUT_SECONDS=1800
 ```
 
-每个 thread 按 `supervisor`、`crawl-worker` 组件创建或复用 Agent 沙箱。
+每个 thread 按 `supervisor`、`crawl-worker` 组件创建或复用 Agent 沙箱；同步 data-analyst
+继承并共享 supervisor 沙箱与工作区。
 沙箱失效时会创建新实例，并从 `data/users/<user-id>/jobs/<thread-id>/<component>/workspace/` 恢复上一次
 成功快照。`supervisor` 沙箱已联网（Skill 下载和依赖安装可直接用 `execute`），
 `crawl-worker` 保持断网隔离，Tavily 请求始终由宿主进程完成。
@@ -84,6 +88,9 @@ Skill 在 `/skill-manage/{name}/` 下创建或下载：下载支持公开 GitHub
 压缩包或单个 `SKILL.md`；依赖用根级 `requirements.txt` 声明，测试时在沙箱中
 `pip install`。压缩包按内容识别格式，并限制路径穿越和链接文件。首次运行前还应确认
 相关镜像均已拉取到 Docker。
+
+应用连接 MongoDB Store 时会先幂等迁移旧的 `(user_hash, "skills", "assigned", agent_name)`
+namespace，再把仓库公共种子精确同步到各 Agent 的公共 namespace；同步失败会阻止启动。
 
 ## 启动后端
 
@@ -100,8 +107,8 @@ Windows 下显式启用 UTF-8，可规避 `langgraph-api` 读取 OpenAPI 文件�
 - `supervisor`：用户入口。
 - `crawl-worker`：Supervisor 通过异步子代理工具启动的后台图。
 
-Skill 管理不注册独立图，也不使用同步 `task`；它作为 Supervisor 主图中的 Skill 流程
-执行。`crawl-worker` 仍是唯一的异步子智能体。
+`data-analyst` 只通过 Supervisor 的同步 `task` 工具调用，不注册公开图，也不产生异步任务
+ID。Skill 管理仍是 Supervisor 主图中的直接流程；`crawl-worker` 是异步子智能体。
 
 ## 启动前端
 
@@ -140,12 +147,14 @@ Supervisor 支持 DeepAgents 自动提供的 `check_async_task`、`update_async_
 
 Skill 流程已简化为一步分配：
 
-1. 提交要下载的 URL，或描述要创建的 Skill，并指定分配目标（supervisor / crawl-worker）。
+1. 提交要下载的 URL，或描述要创建的 Skill，并指定分配目标（supervisor / data-analyst /
+   crawl-worker）。
 2. Supervisor 完整读取 `skill-manage`，在 /skill-manage/{name}/ 创建或下载 Skill，
    再用 execute 测试，可按实际结果反复修改和重测。
 3. 测试通过后调用 `assign_skill(name, targets)`：文件持久化到 MongoDB active 目录，
    候选目录继续保留，便于检查或分配给其他 Agent。
-4. 目标 Agent 在下一轮对话中自动加载该 Skill（恢复至 /persisted-skills/）。
+4. 目标 Agent 在下一轮对话中自动加载该 Skill；公共与用户 Skill 分别恢复到
+   `/skills/public/{agent}/active/` 和 `/skills/user/{agent}/active/`。
 
 ## 本地产物
 

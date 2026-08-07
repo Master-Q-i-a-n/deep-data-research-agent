@@ -24,6 +24,7 @@ from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import NetworkPolicy
 
 from deep_data_research_agent.config import Settings, get_settings
+from deep_data_research_agent.skill_storage import SKILL_AGENT_NAMES
 
 _SAFE_THREAD_ID = re.compile(r"[^A-Za-z0-9_.-]")
 _WORKSPACE_ROOT = PurePosixPath("/workspace")
@@ -748,13 +749,20 @@ class SandboxManager:
         shell execution still needs real copies inside the container.
         """
 
-        if root not in {"/skills", "/persisted-skills"}:
+        root_path = PurePosixPath(root)
+        root_parts = root_path.parts
+        if (
+            len(root_parts) != 5
+            or root_parts[1] != "skills"
+            or root_parts[2] not in {"public", "user"}
+            or root_parts[3] not in SKILL_AGENT_NAMES
+            or root_parts[4] != "active"
+        ):
             raise ValueError(f"不允许同步沙箱目录：{root}")
 
         handle = self._get_handle(thread_id, component)
         normalized: list[tuple[str, bytes]] = []
         directories = {root}
-        root_path = PurePosixPath(root)
         for relative_value, content in files:
             relative = PurePosixPath(relative_value)
             if (

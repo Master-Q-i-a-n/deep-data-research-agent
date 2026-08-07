@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from deep_data_research_agent.mongodb_store import _public_seed_values
 from deep_data_research_agent.prompts import SUPERVISOR_PROMPT
-from deep_data_research_agent.skill_middleware import _load_builtin_files
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = (
@@ -89,16 +89,16 @@ def _run_analysis(tmp_path: Path, rows: list[dict[str, str]]) -> dict:
 
 def test_procurement_skill_is_builtin_and_step_based() -> None:
     text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")
-    files = {path for path, _content in _load_builtin_files("supervisor")}
+    files = set(_public_seed_values("supervisor"))
 
     assert "name: procurement-analysis" in text
     assert "采购分析、供应商比价、询价比较、采购推荐或市场价格调研" in text
     for stage in ("理解需求", "收集数据", "执行分析", "生成图表", "生成报告"):
         assert stage in text
     assert {
-        "supervisor/procurement-analysis/SKILL.md",
-        "supervisor/procurement-analysis/requirements.txt",
-        "supervisor/procurement-analysis/scripts/analyze_quotes.py",
+        "/active/procurement-analysis/SKILL.md",
+        "/active/procurement-analysis/requirements.txt",
+        "/active/procurement-analysis/scripts/analyze_quotes.py",
     } <= files
 
 
@@ -106,8 +106,7 @@ def test_procurement_dependencies_and_prompt_are_restricted() -> None:
     requirements = (SKILL_ROOT / "requirements.txt").read_text("utf-8").splitlines()
 
     assert requirements == ["pandas>=3,<4", "matplotlib>=3.11,<4"]
-    assert "采购数据分析、制图所需的 Python 依赖" in SUPERVISOR_PROMPT
-    assert "apt/apk" in SUPERVISOR_PROMPT
+    assert "采购" not in SUPERVISOR_PROMPT
 
 
 def test_analysis_generates_price_and_score_charts(tmp_path: Path) -> None:

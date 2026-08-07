@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import base64
 import json
-from pathlib import Path
 from typing import Any
 
 from deepagents.middleware.skills import SkillsMiddleware, SkillsState
@@ -14,21 +12,12 @@ from langgraph.store.base import BaseStore
 
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.identity import assigned_skill_namespace, user_identity
-
-_SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
-
-
-def _load_builtin_files(scope: str) -> list[tuple[str, bytes]]:
-    """Load immutable built-in Skill files before ASGI request handling."""
-
-    root = _SKILLS_ROOT / scope
-    if not root.is_dir():
-        raise RuntimeError(f"内置 Skill 目录不存在：{root}")
-    return [
-        ((Path(scope) / path.relative_to(root)).as_posix(), path.read_bytes())
-        for path in sorted(root.rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    ]
+from deep_data_research_agent.skill_storage import (
+    public_skill_namespace,
+    public_skill_root,
+    stored_file_content,
+    user_skill_root,
+)
 
 
 async def _search_all(
@@ -46,20 +35,6 @@ async def _search_all(
             break
         offset += 100
     return items
-
-
-def _stored_file_content(value: dict[str, Any]) -> bytes:
-    """Decode the v2 StoreBackend value written by Skill activation."""
-
-    content = value.get("content")
-    encoding = value.get("encoding")
-    if not isinstance(content, str):
-        raise TypeError("MongoDB Skill 文件缺少字符串内容")
-    if encoding == "base64":
-        return base64.b64decode(content, validate=True)
-    if encoding in {None, "utf-8"}:
-        return content.encode("utf-8")
-    raise ValueError(f"MongoDB Skill 文件编码不受支持：{encoding}")
 
 
 class SandboxLifecycleMiddleware(AgentMiddleware):
@@ -111,25 +86,8 @@ class SkillToolErrorMiddleware(AgentMiddleware):
             )
 
 
-class SkillsSyncMiddleware(AgentMiddleware):
-    """Copy built-in Skill files into the component's physical sandbox."""
-
-    def __init__(self, *, component: str, scope: str) -> None:
-        self._component = component
-        self._files = _load_builtin_files(scope)
-
-    async def abefore_agent(self, state, runtime):
-        thread_id = sandbox_manager.thread_id_from_runtime(runtime)
-        await sandbox_manager.SANDBOX_MANAGER.replace_directory_files(
-            thread_id,
-            "/skills",
-            self._files,
-            component=self._component,
-        )
-
-
-class UserSkillsRestoreMiddleware(AgentMiddleware):
-    """Restore active MongoDB Skill files into an Agent's physical sandbox."""
+class MongoSkillsRestoreMiddleware(AgentMiddleware):
+    """Restore one Agent's public and private MongoDB Skills into its sandbox."""
 
     def __init__(self, *, component: str, agent_name: str) -> None:
         self._component = component
@@ -140,22 +98,27 @@ class UserSkillsRestoreMiddleware(AgentMiddleware):
         if store is None:
             raise RuntimeError("LangGraph Store 不可用，无法恢复已激活 Skill")
 
-        namespace = assigned_skill_namespace(runtime, self._agent_name)
-        items = await _search_all(store, namespace)
-        files: list[tuple[str, bytes]] = []
-        for item in items:
-            if not item.key.startswith("/active/"):
-                continue
-            relative = item.key.removeprefix("/")
-            files.append((relative, _stored_file_content(item.value)))
-
         thread_id = sandbox_manager.thread_id_from_runtime(runtime)
-        await sandbox_manager.SANDBOX_MANAGER.replace_directory_files(
-            thread_id,
-            "/persisted-skills",
-            files,
-            component=self._component,
+        sources = (
+            (public_skill_namespace(self._agent_name), public_skill_root(self._agent_name)),
+            (assigned_skill_namespace(runtime, self._agent_name), user_skill_root(self._agent_name)),
         )
+        for namespace, root in sources:
+            items = await _search_all(store, namespace)
+            files = [
+                (
+                    item.key.removeprefix("/active/"),
+                    stored_file_content(item.value),
+                )
+                for item in items
+                if item.key.startswith("/active/")
+            ]
+            await sandbox_manager.SANDBOX_MANAGER.replace_directory_files(
+                thread_id,
+                root,
+                files,
+                component=self._component,
+            )
 
 
 class ReloadableSkillsMiddleware(SkillsMiddleware):

@@ -8,14 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from deepagents.backends import StateBackend
-from langchain_core.messages import AIMessage
 from langgraph.runtime import ExecutionInfo, Runtime
 
 from deep_data_research_agent import database_tools
-from deep_data_research_agent.agent import graph as supervisor_graph
-from deep_data_research_agent.prompts import SUPERVISOR_PROMPT
-from deep_data_research_agent.skill_middleware import _load_builtin_files
+from deep_data_research_agent.mongodb_store import _public_seed_values
+from deep_data_research_agent.prompts import DATA_ANALYST_PROMPT, SUPERVISOR_PROMPT
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = (
@@ -23,7 +20,7 @@ SKILL_ROOT = (
     / "src"
     / "deep_data_research_agent"
     / "skills"
-    / "supervisor"
+    / "data-analyst"
     / "database-readonly-analysis"
 )
 
@@ -41,21 +38,20 @@ def _runtime(thread_id: str = "thread-database") -> Runtime:
 
 def test_database_skill_is_builtin_planning_guidance() -> None:
     text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")
-    files = {path for path, _content in _load_builtin_files("supervisor")}
+    files = set(_public_seed_values("data-analyst"))
 
     assert len(text.splitlines()) <= 100
     assert "name: database-readonly-analysis" in text
     for stage in (
-        "理解任务并规划",
-        "确认数据库结构",
-        "查询与深度分析",
-        "验证与报告",
+        "理解任务",
+        "确认结构与查询",
+        "验证与输出",
     ):
         assert stage in text
-    assert "不假定 Olist" in text
-    assert "supervisor/database-readonly-analysis/SKILL.md" in files
-    assert "/skills/supervisor/database-readonly-analysis/SKILL.md" in SUPERVISOR_PROMPT
-    assert "不得委派给" in SUPERVISOR_PROMPT
+    assert "不假定固定业务指标" in text
+    assert "/active/database-readonly-analysis/SKILL.md" in files
+    assert "PostgreSQL" not in SUPERVISOR_PROMPT
+    assert "PostgreSQL 只读分析" in DATA_ANALYST_PROMPT
 
 
 @pytest.mark.parametrize(
@@ -173,7 +169,7 @@ async def test_transient_mcp_error_retries_once(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_compiled_tool_node_exports_query_to_supervisor_sandbox(
+async def test_database_tool_exports_query_to_shared_sandbox(
     monkeypatch,
 ) -> None:
     uploads: list[dict] = []
@@ -201,30 +197,13 @@ async def test_compiled_tool_node_exports_query_to_supervisor_sandbox(
         "upload_workspace_files",
         fake_upload,
     )
-    monkeypatch.setattr(
-        database_tools.sandbox_manager.SANDBOX_MANAGER,
-        "get_backend",
-        lambda *_args, **_kwargs: StateBackend(),
+    result = json.loads(
+        await database_tools.database_query_to_file.coroutine(
+            sql="SELECT 1",
+            output_name="orders",
+            runtime=_runtime(),
+        )
     )
-    message = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "database_query_to_file",
-                "args": {"sql": "SELECT 1", "output_name": "orders"},
-                "id": "call-database-export",
-                "type": "tool_call",
-            }
-        ],
-    )
-
-    update = await supervisor_graph.nodes["tools"].ainvoke(
-        {"messages": [message]},
-        {"configurable": {"thread_id": "thread-database"}},
-        runtime=_runtime(),
-    )
-
-    result = json.loads(update["messages"][0].content)
     assert result["status"] == "success"
     assert result["path"] == "/workspace/database/orders.csv"
     assert uploads[0]["thread_id"] == "thread-database"
@@ -275,39 +254,16 @@ async def test_export_refuses_truncated_result_without_upload(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_compiled_tool_node_keeps_mcp_failure_in_conversation(monkeypatch) -> None:
+async def test_database_tool_returns_mcp_failure_as_json(monkeypatch) -> None:
     async def fake_invoke(*_args, **_kwargs):
         raise ConnectionError("SSE service unavailable")
 
     monkeypatch.setattr(database_tools, "_invoke_remote_tool", fake_invoke)
-    monkeypatch.setattr(
-        database_tools.sandbox_manager.SANDBOX_MANAGER,
-        "get_backend",
-        lambda *_args, **_kwargs: StateBackend(),
+    result = json.loads(
+        await database_tools.database_list_schemas.coroutine(runtime=_runtime())
     )
-    message = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "database_list_schemas",
-                "args": {},
-                "id": "call-database-failure",
-                "type": "tool_call",
-            }
-        ],
-    )
-
-    update = await supervisor_graph.nodes["tools"].ainvoke(
-        {"messages": [message]},
-        {"configurable": {"thread_id": "thread-database"}},
-        runtime=_runtime(),
-    )
-
-    result = json.loads(update["messages"][0].content)
     assert result["status"] == "error"
     assert "SSE service unavailable" in result["error"]
-    # The tool call itself completed, so LangGraph can return control to the model.
-    assert update["messages"][0].status == "success"
 
 
 @pytest.mark.integration
@@ -316,31 +272,11 @@ async def test_compiled_tool_node_keeps_mcp_failure_in_conversation(monkeypatch)
     reason="需要显式启用本地 PostgreSQL MCP 集成测试",
 )
 @pytest.mark.asyncio
-async def test_real_postgres_mcp_lists_schemas_through_compiled_node(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        database_tools.sandbox_manager.SANDBOX_MANAGER,
-        "get_backend",
-        lambda *_args, **_kwargs: StateBackend(),
+async def test_real_postgres_mcp_lists_schemas() -> None:
+    result = json.loads(
+        await database_tools.database_list_schemas.coroutine(
+            runtime=_runtime("thread-real-database")
+        )
     )
-    message = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "database_list_schemas",
-                "args": {},
-                "id": "call-real-database",
-                "type": "tool_call",
-            }
-        ],
-    )
-    update = await supervisor_graph.nodes["tools"].ainvoke(
-        {"messages": [message]},
-        {"configurable": {"thread_id": "thread-real-database"}},
-        runtime=_runtime("thread-real-database"),
-    )
-
-    result = json.loads(update["messages"][0].content)
     assert result["status"] == "success", result.get("error", result)
     assert "olist" in result["result"] or "public" in result["result"]

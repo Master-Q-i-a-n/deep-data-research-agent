@@ -41,6 +41,7 @@ function createStreamState() {
     ],
     isLoading: false,
     error: null,
+    subagents: new Map<string, Record<string, unknown>>(),
     interrupt: undefined as {
       id?: string;
       value?: {
@@ -81,6 +82,7 @@ beforeEach(() => {
   window.localStorage.clear();
   window.sessionStorage.clear();
   vi.spyOn(window, "confirm").mockReturnValue(true);
+  vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
   vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => ({
     ok: true,
     json: async () => (String(input).endsWith("/async-tasks/status") ? { tasks: [] } : []),
@@ -95,6 +97,7 @@ afterEach(() => {
   cancelQueuedRun.mockReset();
   clearQueue.mockReset();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   capturedOptions = null;
   window.history.replaceState({}, "", "http://localhost:5174/");
   window.localStorage.clear();
@@ -107,6 +110,9 @@ describe("研究工作台", () => {
 
     expect(screen.getByText("默认账户")).toBeTruthy();
     expect(capturedOptions?.defaultHeaders).toEqual({});
+    expect(capturedOptions?.filterSubagentMessages).toBe(true);
+    expect(capturedOptions?.onFinish).toEqual(expect.any(Function));
+    expect((capturedOptions?.onFinish as ((state: unknown) => void)).length).toBe(1);
   });
 
   it("注册后保存令牌、切换身份并清空旧 thread", async () => {
@@ -256,6 +262,110 @@ describe("研究工作台", () => {
     expect(screen.getByText("分配 Skill")).toBeTruthy();
   });
 
+  it("将 task 工具显示为同步子智能体调用", () => {
+    streamState.messages = [
+      {
+        id: "ai-subagent",
+        type: "ai",
+        content: "",
+        tool_calls: [
+          {
+            id: "call-subagent",
+            name: "task",
+            args: { subagent_type: "data-analyst" },
+          },
+        ],
+      },
+    ];
+    const subagentTrace = {
+      id: "call-subagent",
+      status: "running",
+      result: null,
+      error: null,
+      startedAt: new Date("2026-08-07T08:00:00Z"),
+      completedAt: null,
+      namespace: ["tools:call-subagent"],
+      parentId: null,
+      depth: 0,
+      toolCall: {
+        id: "call-subagent",
+        name: "task",
+        args: { subagent_type: "data-analyst", description: "分析上传的表格" },
+      },
+      values: {
+        todos: [
+          { content: "读取并检查数据", status: "completed" },
+          { content: "计算统计指标", status: "in_progress" },
+        ],
+      },
+      messages: [
+        { type: "ai", content: "已确认数据结构，正在计算描述性统计。" },
+      ],
+      toolCalls: [{
+        id: "child-call-1",
+        call: { id: "child-call-1", name: "profile_table", args: { input: "/workspace/input/data.csv" } },
+        result: null,
+        state: "completed" as "pending" | "completed" | "error",
+      }],
+    };
+    streamState.subagents.set("call-subagent", subagentTrace);
+    streamState.subagents.set("call-subagent-2", {
+      ...subagentTrace,
+      id: "call-subagent-2",
+      status: "running",
+      toolCall: {
+        id: "call-subagent-2",
+        name: "task",
+        args: { subagent_type: "data-analyst", description: "复核数据库分析结果" },
+      },
+      values: {
+        todos: [
+          { content: "核对关键查询", status: "in_progress" },
+          { content: "复核结论", status: "pending" },
+        ],
+      },
+      messages: [],
+      toolCalls: [],
+    });
+
+    const view = render(<App />);
+
+    expect(screen.getByText("调用同步子智能体")).toBeTruthy();
+    expect(screen.getByLabelText("data-analyst 子智能体执行过程")).toBeTruthy();
+    const planPanel = screen.getByLabelText("子智能体计划");
+    const operationsRail = screen.getByLabelText("研究执行状态");
+    const supervisorPlan = screen.getByRole("heading", { name: "研究步骤" }).closest("section");
+    expect(operationsRail.contains(planPanel)).toBe(true);
+    expect(Array.from(operationsRail.children).indexOf(supervisorPlan as Element))
+      .toBeLessThan(Array.from(operationsRail.children).indexOf(planPanel));
+    expect(planPanel.textContent).toContain("计算统计指标");
+    expect(planPanel.textContent).toContain("复核数据库分析结果");
+    const planCards = screen.getAllByLabelText(/data-analyst 子智能体计划 · 调用/);
+    expect(planCards).toHaveLength(2);
+    expect((planCards[0] as HTMLDetailsElement).open).toBe(true);
+    fireEvent.click(planCards[0].querySelector("summary") as HTMLElement);
+    expect((planCards[0] as HTMLDetailsElement).open).toBe(false);
+    expect(screen.getByText("已确认数据结构，正在计算描述性统计。")).toBeTruthy();
+    expect(screen.getByText("profile_table")).toBeTruthy();
+
+    const taskDetails = screen.getByText("调用同步子智能体").closest("details") as HTMLDetailsElement;
+    const childDetails = screen.getByText("profile_table").closest("details") as HTMLDetailsElement;
+    expect(taskDetails.open).toBe(true);
+    expect(childDetails.open).toBe(true);
+
+    subagentTrace.status = "complete";
+    subagentTrace.toolCalls[0].state = "completed";
+    streamState.messages = [
+      ...streamState.messages,
+      { id: "tool-subagent", type: "tool", tool_call_id: "call-subagent", content: "analysis complete" },
+    ];
+    view.rerender(<App />);
+
+    expect((screen.getAllByLabelText(/data-analyst 子智能体计划 · 调用/)[0] as HTMLDetailsElement).open).toBe(false);
+    expect((screen.getByText("调用同步子智能体").closest("details") as HTMLDetailsElement).open).toBe(true);
+    expect((screen.getByText("profile_table").closest("details") as HTMLDetailsElement).open).toBe(true);
+  });
+
   it("提交自然语言任务到 supervisor", () => {
     streamState.messages = [];
     render(<App />);
@@ -271,9 +381,83 @@ describe("研究工作台", () => {
         kind: "conversation",
         title: "抓取官网并生成报告",
       },
+      optimisticValues: expect.any(Function),
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     });
+
+    const optimisticValues = submit.mock.calls[0]?.[1]?.optimisticValues as
+      | ((current: { messages: Array<{ type: string; content: string }> }) => {
+          messages: Array<{ type: string; content: string }>;
+        })
+      | undefined;
+    const optimisticState = optimisticValues?.({ messages: [] });
+    expect(optimisticState?.messages).toEqual([expect.objectContaining({
+      id: expect.stringMatching(/^optimistic-/),
+      type: "human",
+      content: "抓取官网并生成报告",
+    })]);
+  });
+
+  it("运行中的内部子图空状态不会清空主对话", () => {
+    streamState.messages = [
+      { id: "human-stable", type: "human", content: "保留这条主对话" },
+    ];
+    const view = render(<App />);
+
+    expect(screen.getByText("保留这条主对话")).toBeTruthy();
+
+    streamState.messages = [];
+    streamState.values = {
+      todos: [],
+      async_tasks: {} as typeof streamState.values.async_tasks,
+    };
+    streamState.isLoading = true;
+    view.rerender(<App />);
+
+    expect(screen.getByText("保留这条主对话")).toBeTruthy();
+    expect(screen.queryByText("把一个问题，变成一条证据链。")).toBeNull();
+  });
+
+  it("离开底部后停止自动跟随并提供回底部按钮", () => {
+    let scrollTop = 0;
+    let resizeCallback: ResizeObserverCallback | undefined;
+    const scrollTo = vi.mocked(window.scrollTo);
+    vi.spyOn(window, "scrollY", "get").mockImplementation(() => scrollTop);
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(800);
+    vi.spyOn(document.documentElement, "scrollHeight", "get").mockReturnValue(2_000);
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    streamState.messages = [{ id: "human-scroll", type: "human", content: "滚动位置测试" }];
+    const view = render(<App />);
+
+    act(() => window.dispatchEvent(new Event("scroll")));
+    expect(screen.getByRole("button", { name: "回到对话底部" })).toBeTruthy();
+
+    scrollTo.mockClear();
+    streamState.messages = [
+      ...streamState.messages,
+      { id: "ai-scroll", type: "ai", content: "新增的流式内容" },
+    ];
+    view.rerender(<App />);
+    act(() => resizeCallback?.([], {} as ResizeObserver));
+    expect(scrollTo).not.toHaveBeenCalled();
+
+    scrollTop = 1_200;
+    fireEvent.click(screen.getByRole("button", { name: "回到对话底部" }));
+    expect(scrollTo).toHaveBeenCalledWith({ top: 2_000, behavior: "auto" });
+
+    scrollTo.mockClear();
+    act(() => resizeCallback?.([], {} as ResizeObserver));
+    expect(scrollTo).toHaveBeenCalledWith({ top: 2_000, behavior: "auto" });
   });
 
   it("空白会话选择文件后建 thread、顺序上传并把真实路径发给 Agent", async () => {
@@ -331,6 +515,8 @@ describe("研究工作台", () => {
         content: "分析月度趋势\n\n已上传文件：\n- /workspace/input/orders.csv",
       }],
     }, {
+      optimisticValues: expect.any(Function),
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     });
@@ -425,6 +611,7 @@ describe("研究工作台", () => {
         content: "后台任务 task-123456789 已完成。请调用 check_async_task 读取结果并继续处理，不要重新启动任务。",
       }],
     }, {
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     }));
@@ -480,6 +667,8 @@ describe("研究工作台", () => {
       messages: [{ type: "human", content: "报告增加国内市场数据" }],
     }, {
       multitaskStrategy: "enqueue",
+      optimisticValues: expect.any(Function),
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     });
@@ -498,6 +687,8 @@ describe("研究工作台", () => {
       messages: [{ type: "human", content: "停止国外数据，只分析国内数据" }],
     }, {
       multitaskStrategy: "interrupt",
+      optimisticValues: expect.any(Function),
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     });
@@ -514,6 +705,8 @@ describe("研究工作台", () => {
         content: "请调用 check_async_task 检查任务 task-123456789。如果远程运行已经结束，请读取结果第一行的业务 status 并继续处理。",
       }],
     }, {
+      optimisticValues: expect.any(Function),
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     });
@@ -536,6 +729,8 @@ describe("研究工作台", () => {
       }],
     }, {
       multitaskStrategy: "interrupt",
+      optimisticValues: expect.any(Function),
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     });
@@ -555,6 +750,8 @@ describe("研究工作台", () => {
       }],
     }, {
       multitaskStrategy: "interrupt",
+      optimisticValues: expect.any(Function),
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     });
@@ -622,6 +819,7 @@ describe("研究工作台", () => {
           decisions: [{ type: "respond", message: "采购 500 件，交付到上海" }],
         },
       },
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     }));
@@ -666,6 +864,7 @@ describe("研究工作台", () => {
 
     await waitFor(() => expect(submit).toHaveBeenCalledWith(null, {
       command: { resume: { decisions: [{ type: "approve" }] } },
+      streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
     }));

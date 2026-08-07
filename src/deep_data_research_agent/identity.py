@@ -73,4 +73,4 @@ def user_hash(runtime: Any) -> str:
 def assigned_skill_namespace(runtime: Any, agent_name: str) -> tuple[str, ...]:
     """Build the MongoDB namespace containing one Agent's active Skills."""
 
-    return (user_hash(runtime), "skills", "assigned", agent_name)
+    return (user_hash(runtime), "skills", agent_name)

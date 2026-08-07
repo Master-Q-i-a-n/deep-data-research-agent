@@ -29,10 +29,10 @@ from deep_data_research_agent.memory import (
 from deep_data_research_agent.model_profile import register_mvp_profile
 from deep_data_research_agent.prompts import CRAWL_WORKER_PROMPT
 from deep_data_research_agent.skill_middleware import (
+    MongoSkillsRestoreMiddleware,
     ReloadableSkillsMiddleware,
-    SkillsSyncMiddleware,
-    UserSkillsRestoreMiddleware,
 )
+from deep_data_research_agent.skill_storage import public_skill_root, user_skill_root
 from deep_data_research_agent.tavily_tools import CRAWL_TOOLS
 
 register_mvp_profile()
@@ -102,19 +102,15 @@ crawl_agent = create_deep_agent(
             backend_factory=create_worker_backend,
             sources=[AGENT_MEMORY_PATHS["crawl-worker"]],
         ),
-        SkillsSyncMiddleware(
-            component="crawl-worker",
-            scope="worker",
-        ),
-        UserSkillsRestoreMiddleware(
+        MongoSkillsRestoreMiddleware(
             component="crawl-worker",
             agent_name="crawl-worker",
         ),
         ReloadableSkillsMiddleware(
             backend=create_worker_backend,
             sources=[
-                ("/skills/worker/", "内置"),
-                ("/persisted-skills/active/", "用户"),
+                (f"{public_skill_root('crawl-worker')}/", "公共"),
+                (f"{user_skill_root('crawl-worker')}/", "用户"),
             ],
         ),
         AgentExperienceEnqueueMiddleware(agent_name="crawl-worker"),

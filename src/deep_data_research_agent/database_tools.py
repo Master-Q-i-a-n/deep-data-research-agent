@@ -379,7 +379,7 @@ async def database_query_to_file(
     output_name: str,
     runtime: ToolRuntime,
 ) -> str:
-    """把只读查询结果保存到 Supervisor 沙箱，供 Python 深度分析和制图。"""
+    """把只读查询结果保存到共享沙箱，供 data-analyst 深度分析和制图。"""
 
     try:
         settings = get_settings()

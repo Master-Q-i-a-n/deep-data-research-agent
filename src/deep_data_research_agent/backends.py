@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from deepagents import FilesystemPermission
@@ -19,14 +18,8 @@ from deep_data_research_agent.memory import (
     AGENT_MEMORY_ROOT,
     user_preferences_namespace,
 )
+from deep_data_research_agent.skill_storage import public_skill_namespace
 
-SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
-# FilesystemBackend 构造时会同步解析本地路径，必须在模块导入阶段完成，不能在
-# ReloadableSkillsMiddleware.before_agent 的异步请求路径中重复初始化。
-_BUILTIN_SKILLS_BACKEND = FilesystemBackend(
-    root_dir=SKILLS_ROOT,
-    virtual_mode=True,
-)
 # Shared Agent experience is managed only by system middleware.  The virtual
 # route keeps it outside sandboxes while still letting DeepAgents memory load it.
 _AGENT_MEMORY_BACKEND = FilesystemBackend(
@@ -45,6 +38,7 @@ def _sandbox_backend(
     runtime: Any,
     *,
     component: str,
+    skill_agents: tuple[str, ...],
 ) -> CompositeBackend:
     """Build one request-local sandbox backend with stable routed storage."""
 
@@ -54,17 +48,23 @@ def _sandbox_backend(
     )
     routes: dict[str, Any] = {
         "/state/": StateBackend(),
-        "/skills/": _BUILTIN_SKILLS_BACKEND,
-        "/persisted-skills/": StoreBackend(
-            namespace=lambda rt: assigned_skill_namespace(rt, component),
-            file_format="v2",
-        ),
         "/memories/agent/": _AGENT_MEMORY_BACKEND,
         "/memories/user/": StoreBackend(
             namespace=user_preferences_namespace,
             file_format="v2",
         ),
     }
+    for agent_name in skill_agents:
+        # Route at the Agent directory so the remaining StoreBackend key keeps
+        # the required /active/... prefix used in MongoDB.
+        routes[f"/skills/public/{agent_name}/"] = StoreBackend(
+            namespace=lambda _rt, name=agent_name: public_skill_namespace(name),
+            file_format="v2",
+        )
+        routes[f"/skills/user/{agent_name}/"] = StoreBackend(
+            namespace=lambda rt, name=agent_name: assigned_skill_namespace(rt, name),
+            file_format="v2",
+        )
 
     return CompositeBackend(
         default=sandbox,
@@ -79,6 +79,7 @@ def create_backend(runtime: Any) -> CompositeBackend:
     return _sandbox_backend(
         runtime,
         component="supervisor",
+        skill_agents=("supervisor", "data-analyst"),
     )
 
 
@@ -88,6 +89,7 @@ def create_worker_backend(runtime: Any) -> CompositeBackend:
     return _sandbox_backend(
         runtime,
         component="crawl-worker",
+        skill_agents=("crawl-worker",),
     )
 
 
@@ -123,16 +125,6 @@ FILESYSTEM_PERMISSIONS = [
     ),
     FilesystemPermission(
         operations=["write"],
-        paths=["/persisted-skills/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/persisted-skills/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
-        operations=["write"],
         paths=["/memories/**"],
         mode="deny",
     ),
@@ -158,16 +150,6 @@ WORKER_FILESYSTEM_PERMISSIONS = [
     FilesystemPermission(
         operations=["read", "write"],
         paths=["/state/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
-        operations=["write"],
-        paths=["/persisted-skills/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/persisted-skills/**"],
         mode="allow",
     ),
     FilesystemPermission(

@@ -1,14 +1,16 @@
 from types import SimpleNamespace
 
 import pytest
+from deepagents.backends.protocol import FileDownloadResponse, LsResult
 from langgraph.store.memory import InMemoryStore
 
 from deep_data_research_agent import identity, sandbox_manager
 from deep_data_research_agent.skill_middleware import (
+    MongoSkillsRestoreMiddleware,
+    ReloadableSkillsMiddleware,
     SandboxLifecycleMiddleware,
-    SkillsSyncMiddleware,
-    UserSkillsRestoreMiddleware,
 )
+from deep_data_research_agent.skill_storage import file_store_value
 
 
 class FakeManager:
@@ -71,65 +73,111 @@ async def test_supervisor_lifecycle_ensures_and_exports(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_builtin_skills_are_copied_to_physical_sandbox(
+async def test_public_and_user_skills_are_restored_to_isolated_roots(
     monkeypatch,
 ) -> None:
     manager = FakeManager()
     monkeypatch.setattr(sandbox_manager, "SANDBOX_MANAGER", manager)
-    middleware = SkillsSyncMiddleware(
-        component="supervisor",
-        scope="supervisor",
-    )
-
-    await middleware.abefore_agent({}, _runtime())
-
-    _, _, root, files, component = manager.calls[0]
-    assert root == "/skills"
-    assert component == "supervisor"
-    assert any(
-        path == "supervisor/evidence-reporting/SKILL.md"
-        for path, _content in files
-    )
-
-
-@pytest.mark.asyncio
-async def test_active_user_skills_are_restored_from_store(monkeypatch) -> None:
-    manager = FakeManager()
-    monkeypatch.setattr(sandbox_manager, "SANDBOX_MANAGER", manager)
     store = InMemoryStore()
     runtime = _runtime(store)
-    namespace = (
-        identity.user_hash(runtime),
-        "skills",
-        "assigned",
-        "supervisor",
-    )
+    public_namespace = ("public", "skills", "supervisor")
+    user_namespace = (identity.user_hash(runtime), "skills", "supervisor")
     await store.aput(
-        namespace,
+        public_namespace,
         "/active/demo-skill/SKILL.md",
-        {
-            "content": "---\nname: demo-skill\ndescription: demo\n---\n",
-            "encoding": "utf-8",
-        },
+        file_store_value(b"public"),
     )
     await store.aput(
-        namespace,
-        "/manifests/demo-skill.json",
-        {"content": "{}", "encoding": "utf-8"},
+        user_namespace,
+        "/active/demo-skill/SKILL.md",
+        file_store_value(b"user"),
     )
-    middleware = UserSkillsRestoreMiddleware(
+    await store.aput(
+        user_namespace,
+        "/manifests/demo-skill.json",
+        file_store_value(b"{}"),
+    )
+    middleware = MongoSkillsRestoreMiddleware(
         component="supervisor",
         agent_name="supervisor",
     )
 
     await middleware.abefore_agent({}, runtime)
 
-    _, _, root, files, component = manager.calls[0]
-    assert root == "/persisted-skills"
-    assert component == "supervisor"
-    assert files == [
+    assert manager.calls == [
         (
-            "active/demo-skill/SKILL.md",
-            b"---\nname: demo-skill\ndescription: demo\n---\n",
-        )
+            "replace",
+            "thread-a",
+            "/skills/public/supervisor/active",
+            [("demo-skill/SKILL.md", b"public")],
+            "supervisor",
+        ),
+        (
+            "replace",
+            "thread-a",
+            "/skills/user/supervisor/active",
+            [("demo-skill/SKILL.md", b"user")],
+            "supervisor",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deleted_mongodb_skills_clear_sandbox_residue(monkeypatch) -> None:
+    manager = FakeManager()
+    monkeypatch.setattr(sandbox_manager, "SANDBOX_MANAGER", manager)
+    middleware = MongoSkillsRestoreMiddleware(
+        component="crawl-worker",
+        agent_name="crawl-worker",
+    )
+
+    await middleware.abefore_agent({}, _runtime(InMemoryStore()))
+
+    assert [call[3] for call in manager.calls] == [[], []]
+    assert [call[2] for call in manager.calls] == [
+        "/skills/public/crawl-worker/active",
+        "/skills/user/crawl-worker/active",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_skill_metadata_overrides_same_named_public_skill() -> None:
+    public_root = "/skills/public/supervisor/active/"
+    user_root = "/skills/user/supervisor/active/"
+
+    class MetadataBackend:
+        async def als(self, path):
+            return LsResult(
+                entries=[{"path": f"{path}demo", "is_dir": True}]
+            )
+
+        async def adownload_files(self, paths):
+            responses = []
+            for path in paths:
+                description = "用户版本" if path.startswith(user_root) else "公共版本"
+                content = (
+                    "---\nname: demo\ndescription: "
+                    f"{description}\n---\n"
+                ).encode()
+                responses.append(FileDownloadResponse(path=path, content=content))
+            return responses
+
+    middleware = ReloadableSkillsMiddleware(
+        backend=MetadataBackend(),
+        sources=[(public_root, "公共"), (user_root, "用户")],
+    )
+
+    update = await middleware.abefore_agent({}, None, {})
+
+    assert update is not None
+    assert update["skills_metadata"] == [
+        {
+            "path": "/skills/user/supervisor/active/demo/SKILL.md",
+            "name": "demo",
+            "description": "用户版本",
+            "metadata": {},
+            "license": None,
+            "compatibility": None,
+            "allowed_tools": [],
+        }
     ]

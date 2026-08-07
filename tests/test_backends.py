@@ -47,19 +47,20 @@ def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
     assert crawl.default is initialized_backends["crawl-worker"]
     assert set(supervisor.routes) == {
         "/state/",
-        "/skills/",
-        "/persisted-skills/",
         "/memories/agent/",
         "/memories/user/",
+        "/skills/public/supervisor/",
+        "/skills/user/supervisor/",
+        "/skills/public/data-analyst/",
+        "/skills/user/data-analyst/",
     }
     assert set(crawl.routes) == {
         "/state/",
-        "/skills/",
-        "/persisted-skills/",
         "/memories/agent/",
         "/memories/user/",
+        "/skills/public/crawl-worker/",
+        "/skills/user/crawl-worker/",
     }
-    assert supervisor.routes["/skills/"] is crawl.routes["/skills/"]
     # /skill-manage/ 不配置路由，直接由默认 OpenSandbox 处理。
     assert "/skill-manage/" not in supervisor.routes
     assert "/skill-manage/" not in crawl.routes
@@ -69,48 +70,38 @@ def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
     )
 
 
-def test_persisted_skill_route_uses_store_backend(initialized_backends) -> None:
+def test_agent_skill_routes_use_isolated_store_backends(initialized_backends) -> None:
     backend = backends.create_backend(_runtime("thread-a"))
 
-    assert isinstance(backend.routes["/persisted-skills/"], StoreBackend)
-    assert "/user-skills/" not in backend.routes
+    for root in (
+        "/skills/public/supervisor/",
+        "/skills/user/supervisor/",
+        "/skills/public/data-analyst/",
+        "/skills/user/data-analyst/",
+    ):
+        assert isinstance(backend.routes[root], StoreBackend)
+        assert callable(backend.routes[root]._namespace)
+    public_route = backend.routes["/skills/public/supervisor/"]
+    assert public_route._namespace(_runtime("thread-a")) == (
+        "public",
+        "skills",
+        "supervisor",
+    )
+    user_route = backend.routes["/skills/user/data-analyst/"]
+    assert user_route._namespace(_runtime("thread-a"))[1:] == (
+        "skills",
+        "data-analyst",
+    )
     assert "/memories/agent/" in backend.routes
     assert isinstance(backend.routes["/memories/user/"], StoreBackend)
 
 
-@pytest.mark.asyncio
-async def test_async_skill_read_does_not_block_event_loop(
+def test_backend_construction_does_not_read_seed_files(
     initialized_backends,
 ) -> None:
     with blockbuster_ctx(scanned_modules=["deep_data_research_agent"]):
-        # 回归：backend factory 在 before_agent 中执行，不能重新解析本地路径。
-        backend = backends.create_backend(_runtime("thread-async"))
-        result = await backend.als("/skills/supervisor/")
-
-    assert result.error is None
-    assert result.entries
-    assert any(
-        entry["path"].endswith("/evidence-reporting/")
-        for entry in result.entries
-    )
-
-
-def test_backend_exposes_worker_and_supervisor_skills(
-    initialized_backends,
-) -> None:
-    backend = backends.create_backend(_runtime("thread-1"))
-
-    assert backend.ls("/skills/worker/").entries[0]["path"].endswith(
-        "/tavily-crawling/"
-    )
-    supervisor_paths = {
-        entry["path"] for entry in backend.ls("/skills/supervisor/").entries
-    }
-    assert any(path.endswith("/evidence-reporting/") for path in supervisor_paths)
-    assert any(
-        path.endswith("/database-readonly-analysis/")
-        for path in supervisor_paths
-    )
+        backends.create_backend(_runtime("thread-1"))
+        backends.create_worker_backend(_runtime("thread-2"))
 
 
 def test_supervisor_file_tools_cannot_overwrite_uploaded_inputs() -> None:
