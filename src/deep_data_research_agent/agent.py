@@ -44,8 +44,10 @@ graph = create_deep_agent(
         SubAgent(
             name="data-analyst",
             description=(
-                "分析本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据，"
-                "生成可核验的 Markdown、CSV、JSON、PNG 产物；信息不足时返回 needs_input。"
+                "对本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据执行端到端分析；"
+                "一次委派内完成结构探查、指标计算、验证、制图和 Markdown 主报告，"
+                "主报告以相对路径嵌入全部生成图表，并生成可核验的 Markdown、CSV、JSON、"
+                "PNG 产物；信息不足时返回 needs_input。"
             ),
             system_prompt=DATA_ANALYST_PROMPT,
             tools=DATABASE_TOOLS,

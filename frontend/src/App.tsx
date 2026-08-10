@@ -1655,24 +1655,23 @@ export default function App() {
                         <span>{formatFileSize(artifact.size)} · {artifact.path}</span>
                       </div>
                       <div className="artifact-card__actions">
-                        <button
-                          type="button"
-                          disabled={downloadingPath === `${artifact.path}:raw`}
-                          onClick={() => void downloadArtifact(artifact, "raw").catch(() => undefined)}
-                        >
-                          {downloadingPath === `${artifact.path}:raw`
-                            ? "下载中…"
-                            : artifact.path.toLowerCase().endsWith(".md") ? "下载 MD" : "下载"}
-                        </button>
                         {artifact.path.toLowerCase().endsWith(".md") ? (
                           <button
                             type="button"
                             disabled={downloadingPath === `${artifact.path}:bundle`}
                             onClick={() => void downloadArtifact(artifact, "bundle").catch(() => undefined)}
                           >
-                            {downloadingPath === `${artifact.path}:bundle` ? "打包中…" : "下载含图片 ZIP"}
+                            {downloadingPath === `${artifact.path}:bundle` ? "打包中…" : "下载 ZIP"}
                           </button>
-                        ) : null}
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={downloadingPath === `${artifact.path}:raw`}
+                            onClick={() => void downloadArtifact(artifact, "raw").catch(() => undefined)}
+                          >
+                            {downloadingPath === `${artifact.path}:raw` ? "下载中…" : "下载"}
+                          </button>
+                        )}
                       </div>
                     </li>
                   ))}

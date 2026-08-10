@@ -36,6 +36,8 @@ _PASSWORD_HASHER = PasswordHasher()
 logger = logging.getLogger(__name__)
 _FAILED_TASK_STATUSES = frozenset({"error", "timeout", "interrupted"})
 _UPLOAD_SUFFIXES = frozenset({".csv", ".tsv", ".xlsx"})
+_ARTIFACT_CARD_SUFFIXES = frozenset({".md", ".pdf", ".zip"})
+_BUNDLE_COMPANION_SUFFIXES = frozenset({".csv", ".json", ".png", ".tsv", ".xlsx"})
 _UPLOAD_MEDIA_TYPES = {
     ".csv": "text/csv",
     ".tsv": "text/tab-separated-values",
@@ -137,7 +139,8 @@ def _workspace_artifacts(root: Path) -> list[dict[str, object]]:
         is_report = "report" in resolved.stem.lower()
         if not is_output and not is_report:
             continue
-        if resolved.suffix.lower() not in DOWNLOADABLE_SUFFIXES:
+        # 图片与表格作为报告附件进入 ZIP，不在产物卡中逐项占据位置。
+        if resolved.suffix.lower() not in _ARTIFACT_CARD_SUFFIXES:
             continue
         mime_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
         artifacts.append(
@@ -354,10 +357,11 @@ def _download_path(root: Path, virtual_path: str) -> Path:
 
 
 def _markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
-    """Build a Markdown ZIP containing every referenced local image.
+    """Build a Markdown ZIP containing its images and companion data files.
 
     The report is placed at the ZIP root. Relative image paths keep their
-    original layout, so the downloaded Markdown renders without path changes.
+    original layout. CSV, TSV, XLSX, JSON and PNG files beside the report are
+    bundled recursively even when they are only listed as supporting outputs.
     """
 
     report_path = _download_path(root, virtual_path)
@@ -378,6 +382,7 @@ def _markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
     resolved_root = root.resolve()
     report_parent = report_path.parent.resolve()
     assets: dict[str, Path] = {}
+    included_files: set[Path] = set()
     rewrites: dict[str, str] = {}
     for raw_source in sources:
         source = raw_source.strip().replace("\\", "/")
@@ -408,6 +413,23 @@ def _markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
         if not image_path.is_file():
             raise HTTPException(status_code=409, detail=f"报告引用的图片不存在：{source}")
         assets[archive_path] = image_path
+        included_files.add(image_path)
+
+    # data-analyst 会把图表和指标表放在主报告目录树内；统一随报告打包，
+    # 这样前端无需把每个辅助文件展示成独立下载项。
+    for candidate in report_parent.rglob("*"):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        if candidate.suffix.lower() not in _BUNDLE_COMPANION_SUFFIXES:
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(resolved_root) or resolved in included_files:
+            continue
+        archive_path = PurePosixPath(
+            *resolved.relative_to(report_parent).parts
+        ).as_posix()
+        assets[archive_path] = resolved
+        included_files.add(resolved)
 
     bundled_markdown = markdown
     for original, replacement in rewrites.items():

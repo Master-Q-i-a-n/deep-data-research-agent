@@ -318,14 +318,23 @@ describe("研究工作台", () => {
         name: "task",
         args: { subagent_type: "data-analyst", description: "复核数据库分析结果" },
       },
-      values: {
-        todos: [
-          { content: "核对关键查询", status: "in_progress" },
-          { content: "复核结论", status: "pending" },
-        ],
-      },
+      values: {},
       messages: [],
-      toolCalls: [],
+      toolCalls: [{
+        id: "child-plan-2",
+        call: {
+          id: "child-plan-2",
+          name: "write_todos",
+          args: {
+            todos: [
+              { content: "核对关键查询", status: "in_progress" },
+              { content: "复核结论", status: "pending" },
+            ],
+          },
+        },
+        result: null,
+        state: "completed" as "pending" | "completed" | "error",
+      }],
     });
 
     const view = render(<App />);
@@ -339,6 +348,7 @@ describe("研究工作台", () => {
     expect(Array.from(operationsRail.children).indexOf(supervisorPlan as Element))
       .toBeLessThan(Array.from(operationsRail.children).indexOf(planPanel));
     expect(planPanel.textContent).toContain("计算统计指标");
+    expect(planPanel.textContent).toContain("核对关键查询");
     expect(planPanel.textContent).toContain("复核数据库分析结果");
     const planCards = screen.getAllByLabelText(/data-analyst 子智能体计划 · 调用/);
     expect(planCards).toHaveLength(2);
@@ -355,6 +365,8 @@ describe("研究工作台", () => {
 
     subagentTrace.status = "complete";
     subagentTrace.toolCalls[0].state = "completed";
+    // SDK 的完成快照可能清空子图 values，计划仍应使用流式期间的缓存。
+    (subagentTrace as unknown as { values: Record<string, unknown> }).values = {};
     streamState.messages = [
       ...streamState.messages,
       { id: "tool-subagent", type: "tool", tool_call_id: "call-subagent", content: "analysis complete" },
@@ -362,6 +374,7 @@ describe("研究工作台", () => {
     view.rerender(<App />);
 
     expect((screen.getAllByLabelText(/data-analyst 子智能体计划 · 调用/)[0] as HTMLDetailsElement).open).toBe(false);
+    expect(screen.getByLabelText("子智能体计划").textContent).toContain("计算统计指标");
     expect((screen.getByText("调用同步子智能体").closest("details") as HTMLDetailsElement).open).toBe(true);
     expect((screen.getByText("profile_table").closest("details") as HTMLDetailsElement).open).toBe(true);
   });
@@ -902,7 +915,7 @@ describe("研究工作台", () => {
     const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
     const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.includes("/artifacts/thread-a/download")) {
+      if (url.includes("/artifacts/thread-a/bundle")) {
         return { ok: true, blob: async () => new Blob(["# 报告"]) };
       }
       if (url.endsWith("/artifacts/thread-a")) {
@@ -924,20 +937,14 @@ describe("研究工作台", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("final_report.md")).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "下载 MD" }));
-
-    await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
-    expect(anchorClick).toHaveBeenCalled();
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:2024/artifacts/thread-a/download?path=%2Fworkspace%2Ffinal_report.md",
-      { headers: {} },
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "下载含图片 ZIP" }));
+    expect(screen.queryByRole("button", { name: "下载 MD" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "下载 ZIP" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:2024/artifacts/thread-a/bundle?path=%2Fworkspace%2Ffinal_report.md",
       { headers: {} },
     ));
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+    expect(anchorClick).toHaveBeenCalled();
   });
 
   it("Markdown 相对图片通过当前会话鉴权接口加载", async () => {

@@ -24,6 +24,7 @@ def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
     assert "check_async_task" in tools
     assert "task" in tools
     assert "data-analyst" in tools["task"].description
+    assert "一次委派内完成" in tools["task"].description
     assert "crawl-worker" in tools["start_async_task"].description
     assert not {
         "database_list_schemas",
@@ -95,6 +96,12 @@ def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() ->
         assert contract_field in DATA_ANALYST_PROMPT
     assert "needs_input" in DATA_ANALYST_PROMPT
     assert "不直接\n  与用户交互" in DATA_ANALYST_PROMPT
+    assert "同一目标" in SUPERVISOR_PROMPT
+    assert "默认只调用一次 task" in SUPERVISOR_PROMPT
+    assert "默认调用动态注入的报告转换 Skill" in SUPERVISOR_PROMPT
+    assert "在报告同目录\n   生成同名 PDF" in SUPERVISOR_PROMPT
+    assert "不得仅\n  完成探查、部分指标或某个报告章节" in DATA_ANALYST_PROMPT
+    assert "相对于报告文件的路径嵌入" in DATA_ANALYST_PROMPT
 
 
 @pytest.mark.asyncio

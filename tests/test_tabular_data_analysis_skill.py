@@ -52,9 +52,21 @@ def test_tabular_skill_is_builtin_planning_guidance() -> None:
 
     assert len(text.splitlines()) <= 100
     assert "name: tabular-data-analysis" in text
-    for stage in ("理解与探查", "分析与验证", "输出"):
+    for stage in (
+        "理解任务并规划",
+        "确定性探查",
+        "制定并执行分析",
+        "验证与输出",
+    ):
         assert stage in text
     assert "不在本 Skill 中假定业务指标" in text
+    assert "write_todos" in text
+    assert "/workspace/output/final_report.md" in text
+    assert "不得只完成探查" in text
+    assert "needs_input" in text
+    assert "相对于主报告的路径嵌入" in text
+    assert "ask_user" not in text
+    assert "request_report_download" not in text
     assert {
         "/active/tabular-data-analysis/SKILL.md",
         "/active/tabular-data-analysis/scripts/profile_table.py",

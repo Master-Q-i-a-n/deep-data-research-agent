@@ -16,9 +16,11 @@ async def test_artifact_list_and_download_use_owned_workspace(
     workspace = tmp_path / "workspace"
     output = workspace / "output"
     charts = output / "charts"
+    metrics = output / "metrics"
     raw = workspace / "raw"
     input_root = workspace / "input"
     charts.mkdir(parents=True)
+    metrics.mkdir()
     raw.mkdir()
     input_root.mkdir()
     (output / "final_report.md").write_text(
@@ -28,6 +30,10 @@ async def test_artifact_list_and_download_use_owned_workspace(
     (output / "final_report.pdf").write_bytes(b"pdf")
     (workspace / "scratch.csv").write_text("temporary", encoding="utf-8")
     (charts / "price.png").write_bytes(b"png")
+    (charts / "unreferenced.png").write_bytes(b"other-png")
+    (metrics / "orders.csv").write_bytes(b"id\n1")
+    (metrics / "summary.json").write_text('{"rows": 1}', encoding="utf-8")
+    (metrics / "workbook.xlsx").write_bytes(b"xlsx")
     (raw / "source.md").write_text("raw", encoding="utf-8")
     (input_root / "orders.csv").write_text("id\n1", encoding="utf-8")
 
@@ -45,7 +51,6 @@ async def test_artifact_list_and_download_use_owned_workspace(
     assert [item["path"] for item in listing["artifacts"]] == [
         "/workspace/output/final_report.pdf",
         "/workspace/output/final_report.md",
-        "/workspace/output/charts/price.png",
     ]
 
     response = await webapp.download_artifact(
@@ -62,8 +67,16 @@ async def test_artifact_list_and_download_use_owned_workspace(
     )
     assert filename == "final_report-bundle.zip"
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
-        assert archive.namelist() == ["final_report.md", "charts/price.png"]
+        assert archive.namelist() == [
+            "final_report.md",
+            "charts/price.png",
+            "charts/unreferenced.png",
+            "metrics/orders.csv",
+            "metrics/summary.json",
+            "metrics/workbook.xlsx",
+        ]
         assert archive.read("charts/price.png") == b"png"
+        assert archive.read("metrics/orders.csv") == b"id\n1"
 
 
 @pytest.mark.asyncio

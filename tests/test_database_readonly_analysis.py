@@ -43,12 +43,20 @@ def test_database_skill_is_builtin_planning_guidance() -> None:
     assert len(text.splitlines()) <= 100
     assert "name: database-readonly-analysis" in text
     for stage in (
-        "理解任务",
-        "确认结构与查询",
-        "验证与输出",
+        "理解任务并规划",
+        "确认数据库结构",
+        "查询与深度分析",
+        "验证与报告",
     ):
         assert stage in text
     assert "不假定固定业务指标" in text
+    assert "write_todos" in text
+    assert "/workspace/output/final_report.md" in text
+    assert "不得只完成结构" in text
+    assert "needs_input" in text
+    assert "相对于主报告的路径嵌入" in text
+    assert "ask_user" not in text
+    assert "request_report_download" not in text
     assert "/active/database-readonly-analysis/SKILL.md" in files
     assert "PostgreSQL" not in SUPERVISOR_PROMPT
     assert "PostgreSQL 只读分析" in DATA_ANALYST_PROMPT
