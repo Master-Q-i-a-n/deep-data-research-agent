@@ -31,6 +31,13 @@ type Row =
   | { kind: "message"; key: string; role: "human" | "ai"; body: string; report: boolean }
   | { kind: "tool"; key: string; card: ToolCard };
 
+type CurrentTurn = {
+  userKey: string;
+  userBody: string;
+  assistantBody: string;
+  assistantReport: boolean;
+};
+
 type SubmitMode = "enqueue" | "interrupt";
 type AuthMode = "login" | "register";
 type AsyncTaskStatusResponse = { tasks?: AsyncTask[] };
@@ -80,6 +87,7 @@ type AuthUser = {
 const AUTH_TOKEN_KEY = "deep-data-auth-token";
 const TASK_POLL_INTERVAL_MS = 4_000;
 const INITIAL_VISIBLE_ROW_LIMIT = 60;
+const EMPTY_ROWS: Row[] = [];
 const MAX_UPLOAD_FILES = 5;
 const MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
@@ -320,6 +328,38 @@ export function buildRows(messages: Message[]): Row[] {
   return rows;
 }
 
+function currentTurn(messages: Message[]): CurrentTurn | null {
+  let userIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.type === "human" && message.name !== "async-task-monitor") {
+      userIndex = index;
+      break;
+    }
+  }
+  if (userIndex < 0) return null;
+
+  const userMessage = messages[userIndex];
+  const userBody = messageText(userMessage.content).trim();
+  if (!userBody) return null;
+
+  // 一个可见用户请求可能被内部监控消息续跑；把该请求之后的 Supervisor
+  // 文本合并到同一个输出框，但不把工具和子智能体消息带入轻量视图。
+  const assistantBody = messages
+    .slice(userIndex + 1)
+    .filter((message) => message.type === "ai")
+    .map((message) => messageText(message.content).trim())
+    .filter(Boolean)
+    .join("\n\n");
+
+  return {
+    userKey: userMessage.id ?? `human-${userIndex}`,
+    userBody,
+    assistantBody,
+    assistantReport: isReport(assistantBody),
+  };
+}
+
 function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
@@ -387,6 +427,78 @@ const MessageCard = memo(function MessageCard({
   && previous.authHeaders === next.authHeaders
   && previous.threadId === next.threadId
 ));
+
+type CompactTurnViewProps = CurrentTurn & {
+  streaming: boolean;
+  apiUrl: string;
+  authHeaders: Record<string, string>;
+  threadId?: string;
+  onStop: () => void;
+};
+
+const CompactTurnView = memo(function CompactTurnView({
+  userKey,
+  userBody,
+  assistantBody,
+  assistantReport,
+  streaming,
+  apiUrl,
+  authHeaders,
+  threadId,
+  onStop,
+}: CompactTurnViewProps) {
+  const placeholder = streaming ? "正在规划或调用工具…" : "本轮尚未产生模型输出。";
+  return (
+    <div className="compact-turn">
+      <MessageCard
+        messageKey={userKey}
+        role="human"
+        body={userBody}
+        report={false}
+        streaming={false}
+        apiUrl={apiUrl}
+        authHeaders={authHeaders}
+        threadId={threadId}
+      />
+      <article className={`message message--ai compact-turn__output${assistantReport ? " message--report" : ""}`}>
+        <header>
+          <span>Supervisor</span>
+          <i aria-hidden="true" />
+          <span className={`compact-turn__status${streaming ? " is-running" : ""}`}>
+            {streaming ? "生成中" : "已完成"}
+          </span>
+          {streaming ? (
+            <button type="button" onClick={onStop}>停止回答</button>
+          ) : null}
+        </header>
+        <div
+          className={`markdown-body${streaming ? " markdown-body--streaming" : ""}${assistantBody ? "" : " compact-turn__placeholder"}`}
+          aria-live="polite"
+        >
+          {assistantBody ? (
+            streaming ? assistantBody : (
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  img: (props) => (
+                    <AuthenticatedMarkdownImage
+                      {...props}
+                      apiUrl={apiUrl}
+                      authHeaders={authHeaders}
+                      threadId={threadId}
+                    />
+                  ),
+                }}
+              >
+                {assistantBody}
+              </ReactMarkdown>
+            )
+          ) : placeholder}
+        </div>
+      </article>
+    </div>
+  );
+});
 
 function InterruptCard({
   request,
@@ -542,6 +654,7 @@ export default function App() {
   const [fileError, setFileError] = useState("");
   const [interruptSubmitting, setInterruptSubmitting] = useState(false);
   const [interruptError, setInterruptError] = useState("");
+  const [showDetails, setShowDetails] = useState(false);
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const conversationRef = useRef<HTMLElement>(null);
@@ -726,7 +839,15 @@ export default function App() {
     };
   }, [liveMessages, liveValues, threadId]);
 
-  const rows = useMemo(() => buildRows(displayedMessages), [displayedMessages]);
+  // 轻量模式不构造工具卡和完整历史，避免每次流事件都扫描并挂载重型轨迹组件。
+  const rows = useMemo(
+    () => showDetails ? buildRows(displayedMessages) : EMPTY_ROWS,
+    [displayedMessages, showDetails],
+  );
+  const compactTurn = useMemo(
+    () => showDetails ? null : currentTurn(displayedMessages),
+    [displayedMessages, showDetails],
+  );
   const visibleRows = useMemo(
     () => rows.slice(Math.max(0, rows.length - visibleRowLimit)),
     [rows, visibleRowLimit],
@@ -759,6 +880,9 @@ export default function App() {
     ),
     [dismissedTaskFailures, tasks],
   );
+  const stopStream = useCallback(() => {
+    void stream.stop();
+  }, [stream.stop]);
   const runningTaskCount = tasks.filter(
     (task) => task.status === "running" || task.status === "pending",
   ).length;
@@ -1029,9 +1153,10 @@ export default function App() {
     // 只有用户原本位于底部时才跟随新内容；滚轮离开底部后保持阅读位置。
     scrollViewportToBottom();
     setShowJumpToBottom(false);
-  }, [rows, stream.isLoading]);
+  }, [compactTurn?.assistantBody, compactTurn?.userKey, rows, showDetails, stream.isLoading]);
 
   useEffect(() => {
+    if (!showDetails) return undefined;
     const conversation = conversationRef.current;
     if (!conversation || typeof ResizeObserver === "undefined") return undefined;
     // 子智能体过程会在 rows 不变时持续增高，监听真实布局变化才能保持贴底。
@@ -1042,7 +1167,7 @@ export default function App() {
     });
     observer.observe(conversation);
     return () => observer.disconnect();
-  }, []);
+  }, [showDetails]);
 
   async function createThreadForUpload(firstFilename: string): Promise<string> {
     const nextThreadId = window.crypto.randomUUID();
@@ -1460,7 +1585,7 @@ export default function App() {
   }
 
   return (
-    <div className="workspace-shell">
+    <div className={`workspace-shell${showDetails ? "" : " workspace-shell--compact"}`}>
       <aside className="sidebar">
         <div className="brand">
           <BrandMark />
@@ -1500,16 +1625,29 @@ export default function App() {
               <strong>{authUser.username}</strong>
             </div>
           </div>
-          {authUser.is_default ? (
-            <div className="account-card__actions">
-              <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("login")}>登录</button>
-              <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("register")}>注册</button>
-            </div>
-          ) : (
-            <button className="account-card__logout" type="button" disabled={identitySwitchBlocked} onClick={() => void logout()}>
-              注销并切回默认账户
+          <div className="account-card__actions">
+            {authUser.is_default ? (
+              <>
+                <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("login")}>登录</button>
+                <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("register")}>注册</button>
+              </>
+            ) : null}
+            <button
+              className={`account-card__mode-toggle${authUser.is_default ? " account-card__mode-toggle--wide" : ""}`}
+              type="button"
+              role="switch"
+              aria-checked={showDetails}
+              onClick={() => setShowDetails((current) => !current)}
+            >
+              <span>详细模式</span>
+              <i aria-hidden="true"><b /></i>
             </button>
-          )}
+            {!authUser.is_default ? (
+              <button className="account-card__logout" type="button" disabled={identitySwitchBlocked} onClick={() => void logout()}>
+                注销
+              </button>
+            ) : null}
+          </div>
           {identitySwitchBlocked ? <p>结束当前运行和后台任务后可切换账户。</p> : null}
           {!authMode && authError ? <p className="account-card__error">{authError}</p> : null}
         </section>
@@ -1537,7 +1675,7 @@ export default function App() {
         </header>
 
         <section ref={conversationRef} className="conversation" aria-label="研究对话">
-          {rows.length === 0 ? (
+          {(showDetails ? rows.length === 0 : compactTurn === null) ? (
             <div className="empty-state">
               <p className="empty-state__index">研究入口 / 01</p>
               <h2>把一个问题，变成一条证据链。</h2>
@@ -1555,7 +1693,7 @@ export default function App() {
             </div>
           ) : null}
 
-          {hiddenRowCount > 0 ? (
+          {showDetails && hiddenRowCount > 0 ? (
             <button
               type="button"
               className="load-earlier"
@@ -1565,7 +1703,7 @@ export default function App() {
             </button>
           ) : null}
 
-          {visibleRows.map((row) =>
+          {showDetails ? visibleRows.map((row) =>
             row.kind === "tool" ? (
               <ToolCallCard
                 key={row.key}
@@ -1585,7 +1723,16 @@ export default function App() {
                 threadId={threadId}
               />
             ),
-          )}
+          ) : compactTurn ? (
+            <CompactTurnView
+              {...compactTurn}
+              streaming={stream.isLoading}
+              apiUrl={apiUrl}
+              authHeaders={authHeaders}
+              threadId={threadId}
+              onStop={stopStream}
+            />
+          ) : null}
 
           {failedTasks.length > 0 ? (
             <section className="task-failure-alert" role="alert" aria-live="assertive">
@@ -1709,14 +1856,14 @@ export default function App() {
             </section>
           ) : null}
 
-          {stream.isLoading ? (
+          {showDetails && stream.isLoading ? (
             <div className="working-card" role="status" aria-live="polite">
               <div className="working-card__signal" aria-hidden="true"><i /><i /><i /></div>
               <div>
                 <strong>正在推进研究任务</strong>
                 <span>规划、工具调用和结果会实时出现在这里。</span>
               </div>
-              <button type="button" onClick={() => void stream.stop()}>停止回答</button>
+              <button type="button" onClick={stopStream}>停止回答</button>
             </div>
           ) : null}
 
@@ -1728,7 +1875,7 @@ export default function App() {
           ) : null}
         </section>
 
-        {showJumpToBottom && rows.length > 0 ? (
+        {showJumpToBottom && (showDetails ? rows.length > 0 : compactTurn !== null) ? (
           <button
             type="button"
             className="jump-to-bottom"
@@ -1740,7 +1887,7 @@ export default function App() {
           </button>
         ) : null}
 
-        <form className="composer" onSubmit={onSubmit}>
+        <form className={`composer${showDetails ? "" : " composer--compact"}`} onSubmit={onSubmit}>
           <div className="composer__field">
             <label htmlFor="research-input">
               {pendingInterrupt
@@ -1850,19 +1997,21 @@ export default function App() {
         </form>
       </main>
 
-      <aside className="operations-rail" aria-label="研究执行状态">
-        <TaskTrace
-          tasks={tasks}
-          onCheck={checkTask}
-          onUpdate={updateTask}
-          onCancel={cancelTask}
-          onRefresh={refreshTasks}
-          refreshing={tasksRefreshing}
-          refreshError={taskRefreshError}
-        />
-        <TodoPanel todos={todos} />
-        <SubagentPlanPanel subagents={stream.subagents} />
-      </aside>
+      {showDetails ? (
+        <aside className="operations-rail" aria-label="研究执行状态">
+          <TaskTrace
+            tasks={tasks}
+            onCheck={checkTask}
+            onUpdate={updateTask}
+            onCancel={cancelTask}
+            onRefresh={refreshTasks}
+            refreshing={tasksRefreshing}
+            refreshError={taskRefreshError}
+          />
+          <TodoPanel todos={todos} />
+          <SubagentPlanPanel subagents={stream.subagents} />
+        </aside>
+      ) : null}
 
       {authMode ? (
         <div className="auth-overlay" role="presentation" onMouseDown={(event) => {

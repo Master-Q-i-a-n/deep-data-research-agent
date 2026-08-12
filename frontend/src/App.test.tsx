@@ -9,6 +9,16 @@ const cancelQueuedRun = vi.fn();
 const clearQueue = vi.fn();
 let capturedOptions: Record<string, unknown> | null = null;
 
+type TestMessage = {
+  id: string;
+  type: string;
+  content: string;
+  name?: string;
+  tool_calls?: Array<{ id: string; name: string; args: Record<string, unknown> }>;
+  tool_call_id?: string;
+  artifact?: unknown;
+};
+
 function createStreamState() {
   return {
     values: {
@@ -38,7 +48,7 @@ function createStreamState() {
         ],
       },
       { id: "tool-1", type: "tool", tool_call_id: "call-1", content: "task_id: task-123456789" },
-    ],
+    ] as TestMessage[],
     isLoading: false,
     error: null,
     subagents: new Map<string, Record<string, unknown>>(),
@@ -69,6 +79,10 @@ function createStreamState() {
 }
 
 let streamState = createStreamState();
+
+function enableDetailedMode() {
+  fireEvent.click(screen.getByRole("switch", { name: "详细模式" }));
+}
 
 vi.mock("@langchain/react", () => ({
   useStream: (options: Record<string, unknown>) => {
@@ -109,10 +123,72 @@ describe("研究工作台", () => {
     render(<App />);
 
     expect(screen.getByText("默认账户")).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByLabelText("研究执行状态")).toBeNull();
     expect(capturedOptions?.defaultHeaders).toEqual({});
     expect(capturedOptions?.filterSubagentMessages).toBe(true);
     expect(capturedOptions?.onFinish).toEqual(expect.any(Function));
     expect((capturedOptions?.onFinish as ((state: unknown) => void)).length).toBe(1);
+  });
+
+  it("简洁模式只显示当前轮问答，并可切换完整历史", () => {
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    streamState.isLoading = true;
+    streamState.messages = [
+      { id: "human-old", type: "human", content: "旧问题" },
+      { id: "ai-old", type: "ai", content: "旧回答" },
+      { id: "human-current", type: "human", content: "当前问题" },
+      { id: "ai-current-1", type: "ai", content: "先检查数据。" },
+      {
+        id: "ai-tool",
+        type: "ai",
+        content: "",
+        tool_calls: [{ id: "call-skill", name: "assign_skill", args: { skill_name: "demo" } }],
+      },
+      { id: "tool-skill", type: "tool", tool_call_id: "call-skill", content: "assigned" },
+      { id: "monitor", name: "async-task-monitor", type: "human", content: "内部续跑消息" },
+      { id: "ai-current-2", type: "ai", content: "最终回答。" },
+    ];
+
+    const view = render(<App />);
+
+    expect(screen.getByText("当前问题")).toBeTruthy();
+    expect(screen.getByText(/先检查数据。[\s\S]*最终回答。/)).toBeTruthy();
+    expect(screen.queryByText("旧问题")).toBeNull();
+    expect(screen.queryByText("内部续跑消息")).toBeNull();
+    expect(screen.queryByText("分配 Skill")).toBeNull();
+    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(1);
+
+    streamState.messages = [
+      ...streamState.messages.slice(0, -1),
+      { id: "ai-current-2", type: "ai", content: "最终回答继续流式增长。" },
+    ];
+    view.rerender(<App />);
+    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(1);
+    expect(screen.getByText(/最终回答继续流式增长。/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "停止回答" }));
+    expect(stop).toHaveBeenCalled();
+
+    enableDetailedMode();
+    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByText("旧问题")).toBeTruthy();
+    expect(screen.getByText("分配 Skill")).toBeTruthy();
+    expect(screen.getByLabelText("研究执行状态")).toBeTruthy();
+
+    enableDetailedMode();
+    expect(screen.queryByText("旧问题")).toBeNull();
+    expect(screen.queryByLabelText("研究执行状态")).toBeNull();
+  });
+
+  it("详细模式选择不跨页面挂载持久化", () => {
+    const view = render(<App />);
+    enableDetailedMode();
+    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");
+
+    view.unmount();
+    render(<App />);
+    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("false");
   });
 
   it("注册后保存令牌、切换身份并清空旧 thread", async () => {
@@ -225,6 +301,7 @@ describe("研究工作台", () => {
 
   it("展示 DeepAgents 计划、异步任务和工具调用", () => {
     render(<App />);
+    enableDetailedMode();
 
     expect(screen.getByText("研究步骤")).toBeTruthy();
     expect(screen.getByText("Supervisor 入口就绪")).toBeTruthy();
@@ -258,6 +335,7 @@ describe("研究工作台", () => {
     ];
 
     render(<App />);
+    enableDetailedMode();
 
     expect(screen.getByText("分配 Skill")).toBeTruthy();
   });
@@ -338,6 +416,7 @@ describe("研究工作台", () => {
     });
 
     const view = render(<App />);
+    enableDetailedMode();
 
     expect(screen.getByText("调用同步子智能体")).toBeTruthy();
     expect(screen.getByLabelText("data-analyst 子智能体执行过程")).toBeTruthy();
@@ -451,6 +530,7 @@ describe("研究工作台", () => {
     });
     streamState.messages = [{ id: "human-scroll", type: "human", content: "滚动位置测试" }];
     const view = render(<App />);
+    enableDetailedMode();
 
     act(() => window.dispatchEvent(new Event("scroll")));
     expect(screen.getByRole("button", { name: "回到对话底部" })).toBeTruthy();
@@ -658,7 +738,8 @@ describe("研究工作台", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("有 1 个任务未正常完成")).toBeTruthy());
-    expect(screen.getAllByText(errorSummary).length).toBeGreaterThanOrEqual(2);
+    // 简洁模式不挂载右侧任务卡，错误摘要由主区提醒保留一份即可。
+    expect(screen.getAllByText(errorSummary).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(`crawl-worker · ${statusLabel}`)).toBeTruthy();
     expect(submit).not.toHaveBeenCalled();
 
@@ -709,6 +790,7 @@ describe("研究工作台", () => {
 
   it("任务卡通过 Supervisor 检查完整 task id", () => {
     render(<App />);
+    enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "检查进度" }));
 
@@ -728,6 +810,7 @@ describe("研究工作台", () => {
   it("任务卡可以立即补充 crawl-worker 要求", () => {
     streamState.isLoading = true;
     render(<App />);
+    enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "补充要求" }));
     fireEvent.change(screen.getByLabelText("补充任务要求"), {
@@ -752,6 +835,7 @@ describe("研究工作台", () => {
   it("任务卡可以取消 crawl-worker", () => {
     streamState.isLoading = true;
     render(<App />);
+    enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
 
