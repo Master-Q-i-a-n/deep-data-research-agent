@@ -36,6 +36,10 @@ _SANDBOX_CREATE_RETRY_DELAYS = (1.0, 3.0)
 logger = logging.getLogger(__name__)
 
 
+class SandboxNotInitializedError(RuntimeError):
+    """Raised when this process has not created a sandbox handle yet."""
+
+
 def sanitize_thread_id(value: Any) -> str:
     """Return a filesystem-safe representation of a LangGraph thread ID."""
 
@@ -270,7 +274,7 @@ class SandboxManager:
         self._thread_users: dict[str, str] = {}
 
     def _user_for_thread(self, thread_id: str, user_id: str | None = None) -> str:
-        """Bind a globally unique Agent Protocol thread to one local user path."""
+        """Bind once from an explicit identity, then reuse the trusted mapping."""
 
         thread_id = sanitize_thread_id(thread_id)
         normalized_user = str(user_id or "").strip()
@@ -282,11 +286,9 @@ class SandboxManager:
             return normalized_user
         if existing:
             return existing
-        fallback = self._settings.local_dev_user_id.strip()
-        if not fallback:
-            raise RuntimeError(f"任务 {thread_id} 尚未绑定用户")
-        self._thread_users[thread_id] = fallback
-        return fallback
+        # Identity fallback belongs at the authenticated runtime boundary. This
+        # storage layer must never guess an owner or cache a default identity.
+        raise RuntimeError(f"任务 {thread_id} 尚未通过显式 user_id 绑定用户")
 
     def local_workspace_path(
         self,
@@ -550,13 +552,14 @@ class SandboxManager:
         thread_id: str,
         *,
         component: str = "crawl-worker",
+        user_id: str | None = None,
     ) -> OpensandboxBackend:
         """Return the already initialized backend for a worker request."""
 
         thread_id = sanitize_thread_id(thread_id)
-        handle = self._handles.get(self._key(thread_id, component))
+        handle = self._handles.get(self._key(thread_id, component, user_id))
         if handle is None:
-            raise RuntimeError(
+            raise SandboxNotInitializedError(
                 f"任务 {thread_id} 的沙箱尚未初始化，请先执行 ensure_sandbox"
             )
         return handle.backend

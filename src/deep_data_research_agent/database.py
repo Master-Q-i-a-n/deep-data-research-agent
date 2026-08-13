@@ -1,4 +1,4 @@
-"""MySQL persistence for accounts, login sessions, and thread ownership."""
+"""PostgreSQL persistence for accounts, sessions, ownership, and deliveries."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, delete, select
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -26,7 +27,7 @@ DEFAULT_USERNAME = "default"
 
 
 def _utcnow() -> datetime:
-    """Return naive UTC for predictable MySQL DATETIME comparisons."""
+    """Return naive UTC for portable PostgreSQL/SQLite test comparisons."""
 
     return datetime.now(UTC).replace(tzinfo=None)
 
@@ -153,12 +154,49 @@ def get_engine() -> AsyncEngine:
 
     global _engine, _session_factory
     if _engine is None:
-        uri = get_settings().mysql_uri.strip()
+        settings = get_settings()
+        uri = settings.postgres_uri.strip()
         if not uri:
-            raise RuntimeError("MYSQL_URI 未配置，无法使用账户与用户检查点")
-        _engine = create_async_engine(uri, pool_pre_ping=True, pool_recycle=1800)
+            raise RuntimeError("POSTGRES_URI 未配置，无法使用账户与用户检查点")
+        _engine = create_async_engine(
+            sqlalchemy_postgres_uri(uri),
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            pool_size=settings.postgres_app_pool_size,
+            max_overflow=settings.postgres_app_max_overflow,
+            pool_timeout=settings.postgres_pool_timeout_seconds,
+        )
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
     return _engine
+
+
+def _postgres_url(uri: str) -> URL:
+    """Validate one PostgreSQL URL before selecting a concrete driver."""
+
+    try:
+        url = make_url(uri)
+    except Exception as exc:  # SQLAlchemy raises several URL parse subclasses.
+        raise ValueError("POSTGRES_URI 格式无效") from exc
+    base_driver = url.drivername.split("+", maxsplit=1)[0]
+    if base_driver not in {"postgresql", "postgres"}:
+        raise ValueError("POSTGRES_URI 必须使用 PostgreSQL 协议")
+    return url
+
+
+def sqlalchemy_postgres_uri(uri: str) -> str:
+    """Return an async SQLAlchemy URL backed by psycopg 3."""
+
+    return _postgres_url(uri).set(drivername="postgresql+psycopg").render_as_string(
+        hide_password=False
+    )
+
+
+def psycopg_postgres_uri(uri: str) -> str:
+    """Return a plain libpq-compatible URL for psycopg and its pool."""
+
+    return _postgres_url(uri).set(drivername="postgresql").render_as_string(
+        hide_password=False
+    )
 
 
 def session_factory() -> async_sessionmaker[AsyncSession]:
@@ -196,7 +234,7 @@ async def ensure_schema() -> None:
 
 
 async def close_database() -> None:
-    """Dispose the process-scoped MySQL engine."""
+    """Dispose the process-scoped PostgreSQL application engine."""
 
     global _engine, _session_factory, _initialized
     if _engine is not None:

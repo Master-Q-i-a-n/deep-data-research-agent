@@ -7,7 +7,7 @@ from deep_data_research_agent import database
 
 @pytest_asyncio.fixture
 async def isolated_database(monkeypatch):
-    """Use SQLite to verify delivery idempotency without an external MySQL service."""
+    """Use SQLite to verify delivery idempotency without external PostgreSQL."""
 
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     factory = async_sessionmaker(engine, expire_on_commit=False)

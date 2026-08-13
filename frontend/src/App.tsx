@@ -842,6 +842,7 @@ export default function App() {
     messages: Message[];
     values: StreamState;
   }>();
+  const activeRunReconnectRef = useRef<string>();
   const authHeaders = useMemo<Record<string, string>>(
     () => {
       const headers: Record<string, string> = {};
@@ -984,12 +985,23 @@ export default function App() {
       const url = new URL(window.location.href);
       url.searchParams.set("thread", id);
       window.history.replaceState({}, "", url);
+      // useStream 已经在服务端创建了 thread；立即刷新左栏，避免长任务必须
+      // 等到整个 run 结束后才出现在会话记录中。
+      void loadSessions();
     },
   };
   const baseStream = useStream<StreamState, { InterruptType: HITLRequest }>(streamOptions);
   const stream = baseStream as typeof baseStream & {
     subagents: Map<string, SubagentTraceStream>;
   };
+  const joinStreamRef = useRef(stream.joinStream);
+  const streamLoadingRef = useRef(stream.isLoading);
+  joinStreamRef.current = stream.joinStream;
+  streamLoadingRef.current = stream.isLoading;
+  const currentSession = useMemo(
+    () => sessions.find((session) => session.thread_id === threadId),
+    [sessions, threadId],
+  );
 
   const liveMessages = stream.messages as Message[];
   const liveValues = stream.values as StreamState;
@@ -1227,6 +1239,68 @@ export default function App() {
     }
     previousLoadingRef.current = stream.isLoading;
   }, [loadArtifacts, loadSessions, stream.isLoading]);
+
+  useEffect(() => {
+    if (!threadId || stream.isLoading || currentSession?.status !== "busy") return undefined;
+
+    const controller = new AbortController();
+    // 先给 SDK 使用 sessionStorage 中的 run ID 自动重连；如果它没有启动
+    // 流，再以服务端 busy 状态为准查询活动 run。延迟和 isLoading 双重检查
+    // 防止两个 joinStream 同时订阅同一个运行。
+    const timerId = window.setTimeout(() => {
+      if (streamLoadingRef.current) return;
+      void stream.client.runs.list(threadId, {
+        limit: 10,
+        signal: controller.signal,
+      }).then(async (runs) => {
+        if (controller.signal.aborted || streamLoadingRef.current) return;
+        const activeRun = runs.find(
+          (run) => run.status === "running" || run.status === "pending",
+        );
+        if (!activeRun) return;
+
+        const reconnectKey = `${threadId}:${activeRun.run_id}`;
+        if (activeRunReconnectRef.current === reconnectKey) return;
+        activeRunReconnectRef.current = reconnectKey;
+        try {
+          await joinStreamRef.current(activeRun.run_id);
+        } catch (error) {
+          if (activeRunReconnectRef.current === reconnectKey) {
+            activeRunReconnectRef.current = undefined;
+          }
+          if (!controller.signal.aborted) {
+            setSessionsError(
+              error instanceof Error
+                ? `运行仍在服务端继续，但实时流重连失败：${error.message}`
+                : "运行仍在服务端继续，但实时流重连失败",
+            );
+          }
+        }
+      }).catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        setSessionsError(
+          error instanceof Error
+            ? `无法查询当前运行：${error.message}`
+            : "无法查询当前运行",
+        );
+      });
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timerId);
+      controller.abort();
+    };
+  }, [currentSession?.status, stream.client, stream.isLoading, threadId]);
+
+  useEffect(() => {
+    if (!threadId || (!stream.isLoading && currentSession?.status !== "busy")) {
+      return undefined;
+    }
+    // 长任务期间保持左栏的服务端状态新鲜；最终完成刷新仍由 isLoading
+    // 的下降沿负责，这里的低频轮询只用于跨刷新/断线场景。
+    const intervalId = window.setInterval(() => void loadSessions(), 5_000);
+    return () => window.clearInterval(intervalId);
+  }, [currentSession?.status, loadSessions, stream.isLoading, threadId]);
 
   useEffect(() => {
     if (!authToken) {

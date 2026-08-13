@@ -5,6 +5,8 @@ import App from "./App";
 const submit = vi.fn();
 const stop = vi.fn();
 const switchThread = vi.fn();
+const joinStream = vi.fn();
+const listRuns = vi.fn();
 const cancelQueuedRun = vi.fn();
 const clearQueue = vi.fn();
 let capturedOptions: Record<string, unknown> | null = null;
@@ -65,6 +67,12 @@ function createStreamState() {
     submit,
     stop,
     switchThread,
+    joinStream,
+    client: {
+      runs: {
+        list: listRuns,
+      },
+    },
     queue: {
       entries: [] as Array<{
         id: string;
@@ -93,6 +101,7 @@ vi.mock("@langchain/react", () => ({
 
 beforeEach(() => {
   streamState = createStreamState();
+  listRuns.mockResolvedValue([]);
   window.localStorage.clear();
   window.sessionStorage.clear();
   vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -108,6 +117,8 @@ afterEach(() => {
   submit.mockReset();
   stop.mockReset();
   switchThread.mockReset();
+  joinStream.mockReset();
+  listRuns.mockReset();
   cancelQueuedRun.mockReset();
   clearQueue.mockReset();
   vi.restoreAllMocks();
@@ -119,6 +130,69 @@ afterEach(() => {
 });
 
 describe("研究工作台", () => {
+  it("新任务取得 thread ID 后立即刷新左侧会话记录", async () => {
+    let searchCount = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/threads/search")) {
+        searchCount += 1;
+        return {
+          ok: true,
+          json: async () => searchCount === 1 ? [] : [{
+            thread_id: "thread-new",
+            status: "busy",
+            metadata: { title: "刚创建的研究任务" },
+          }],
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    }));
+
+    render(<App />);
+    await waitFor(() => expect(searchCount).toBe(1));
+
+    await act(async () => {
+      (capturedOptions?.onThreadId as (id: string) => void)("thread-new");
+    });
+
+    await waitFor(() => expect(screen.getByText("刚创建的研究任务")).toBeTruthy());
+  });
+
+  it("刷新后根据 busy thread 兜底重新加入服务端活动 run", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-busy");
+    listRuns.mockResolvedValue([{
+      run_id: "run-active",
+      thread_id: "thread-busy",
+      assistant_id: "supervisor",
+      status: "running",
+      created_at: "2026-08-13T15:24:24Z",
+      updated_at: "2026-08-13T15:25:24Z",
+      metadata: {},
+      multitask_strategy: null,
+    }]);
+    joinStream.mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/threads/search")) {
+        return {
+          ok: true,
+          json: async () => [{
+            thread_id: "thread-busy",
+            status: "busy",
+            metadata: { title: "执行中的任务" },
+          }],
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    }));
+
+    render(<App />);
+
+    await waitFor(() => expect(listRuns).toHaveBeenCalledWith(
+      "thread-busy",
+      expect.objectContaining({ limit: 10 }),
+    ));
+    await waitFor(() => expect(joinStream).toHaveBeenCalledWith("run-active"));
+  });
+
   it("未登录时使用默认账户且不发送认证头", () => {
     render(<App />);
 

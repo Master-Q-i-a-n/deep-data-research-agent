@@ -61,7 +61,12 @@ class Settings(BaseSettings):
 
     app_env: Literal["development", "production"] = "development"
     local_dev_user_id: str = "local-user"
-    mysql_uri: str = ""
+    postgres_uri: str = ""
+    postgres_app_pool_size: int = Field(default=5, ge=1, le=50)
+    postgres_app_max_overflow: int = Field(default=10, ge=0, le=100)
+    postgres_checkpoint_pool_min_size: int = Field(default=1, ge=1, le=20)
+    postgres_checkpoint_pool_max_size: int = Field(default=5, ge=1, le=50)
+    postgres_pool_timeout_seconds: float = Field(default=30.0, ge=1, le=120)
     auth_session_days: int = Field(default=7, ge=1, le=90)
     mongodb_uri: str = ""
     mongodb_database: str = "deep_data_research_agent"

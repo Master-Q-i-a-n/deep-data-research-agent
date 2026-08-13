@@ -100,6 +100,35 @@ def _handle(sandbox_id: str, *, healthy: bool = True):
     )
 
 
+def test_first_thread_binding_requires_explicit_user_id(tmp_path) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+
+    with pytest.raises(RuntimeError, match="显式 user_id"):
+        manager.local_workspace_path("thread-a", "supervisor")
+
+    assert "thread-a" not in manager._thread_users
+
+
+def test_explicit_thread_binding_is_reused_but_cannot_be_reassigned(tmp_path) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+
+    explicit = manager.local_workspace_path(
+        "thread-a",
+        "supervisor",
+        user_id="user-a",
+    )
+    reused = manager.local_workspace_path("thread-a", "supervisor")
+
+    assert explicit == reused
+    assert manager._thread_users == {"thread-a": "user-a"}
+    with pytest.raises(RuntimeError, match="不能绑定到不同用户"):
+        manager.local_workspace_path(
+            "thread-a",
+            "supervisor",
+            user_id="user-b",
+        )
+
+
 def test_opensandbox_backend_preserves_multiline_json_output() -> None:
     """DeepAgents glob must receive one parseable JSON object per line."""
 
@@ -162,7 +191,7 @@ async def test_missing_opensandbox_configuration_fails_explicitly(
     )
 
     with pytest.raises(RuntimeError, match="OPEN_SANDBOX_DOMAIN"):
-        await manager.ensure("thread-a")
+        await manager.ensure("thread-a", user_id="user-a")
 
 
 @pytest.mark.asyncio
@@ -186,6 +215,7 @@ async def test_same_thread_reuses_one_sandbox_under_concurrency(
         return handle
 
     monkeypatch.setattr(manager, "_create_handle", fake_create)
+    manager.local_workspace_path("thread-a", "crawl-worker", user_id="user-a")
 
     first, second = await asyncio.gather(
         manager.ensure("thread-a"),
@@ -218,8 +248,8 @@ async def test_different_threads_and_unhealthy_replacement_are_isolated(
 
     monkeypatch.setattr(manager, "_create_handle", fake_create)
 
-    first = await manager.ensure("thread-a")
-    second = await manager.ensure("thread-b")
+    first = await manager.ensure("thread-a", user_id="user-a")
+    second = await manager.ensure("thread-b", user_id="user-a")
     stale = manager._get_handle("thread-a")
     stale.sandbox.healthy = False
     replacement = await manager.ensure("thread-a")
@@ -439,7 +469,9 @@ async def test_export_and_restore_workspace(tmp_path) -> None:
         "/workspace/report.md": "中文报告".encode(),
         "/workspace/raw/page.md": b"raw page",
     }
-    manager._handles[manager._key("thread-a", "crawl-worker")] = handle
+    manager._handles[
+        manager._key("thread-a", "crawl-worker", "user-a")
+    ] = handle
 
     exported = await manager.export_workspace("thread-a")
 
@@ -450,7 +482,7 @@ async def test_export_and_restore_workspace(tmp_path) -> None:
     }
     assert (
         tmp_path
-        / "local-user"
+        / "user-a"
         / "jobs"
         / "thread-a"
         / "crawl-worker"
@@ -472,7 +504,9 @@ async def test_component_workspaces_do_not_collide(tmp_path) -> None:
     crawl_handle.backend.files = {"/workspace/report.md": b"crawl"}
     supervisor_handle = _handle("supervisor-box")
     supervisor_handle.backend.files = {"/workspace/report.md": b"supervisor"}
-    manager._handles[manager._key("shared", "crawl-worker")] = crawl_handle
+    manager._handles[
+        manager._key("shared", "crawl-worker", "user-a")
+    ] = crawl_handle
     manager._handles[manager._key("shared", "supervisor")] = supervisor_handle
 
     await manager.export_workspace("shared", component="crawl-worker")
@@ -480,7 +514,7 @@ async def test_component_workspaces_do_not_collide(tmp_path) -> None:
 
     assert (
         tmp_path
-        / "local-user"
+        / "user-a"
         / "jobs"
         / "shared"
         / "crawl-worker"
@@ -489,7 +523,7 @@ async def test_component_workspaces_do_not_collide(tmp_path) -> None:
     ).read_bytes() == b"crawl"
     assert (
         tmp_path
-        / "local-user"
+        / "user-a"
         / "jobs"
         / "shared"
         / "supervisor"
@@ -502,7 +536,9 @@ async def test_component_workspaces_do_not_collide(tmp_path) -> None:
 async def test_replace_directory_uploads_physical_skill_copy(tmp_path) -> None:
     manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
     handle = _handle("sandbox-1")
-    manager._handles[manager._key("thread-a", "supervisor")] = handle
+    manager._handles[
+        manager._key("thread-a", "supervisor", "user-a")
+    ] = handle
 
     count = await manager.replace_directory_files(
         "thread-a",
@@ -520,7 +556,9 @@ async def test_replace_directory_uploads_physical_skill_copy(tmp_path) -> None:
 def test_worker_backend_uses_sandbox_as_default(tmp_path, monkeypatch) -> None:
     manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
     sandbox = FakeSandbox("sandbox-1")
-    manager._handles[manager._key("thread-a", "crawl-worker")] = sandbox_manager._SandboxHandle(
+    manager._handles[
+        manager._key("thread-a", "crawl-worker", "user-a")
+    ] = sandbox_manager._SandboxHandle(
         sandbox=sandbox,
         backend=OpensandboxBackend(sandbox=sandbox),
     )
@@ -528,11 +566,17 @@ def test_worker_backend_uses_sandbox_as_default(tmp_path, monkeypatch) -> None:
 
     backend = backends.create_worker_backend(
         SimpleNamespace(
-            config={"configurable": {"thread_id": "thread-a"}},
+            config={
+                "configurable": {
+                    "thread_id": "thread-a",
+                    "langgraph_auth_user_id": "user-a",
+                }
+            },
         )
     )
 
-    assert isinstance(backend.default, OpensandboxBackend)
+    assert isinstance(backend.default, backends.RestartSafeSandboxBackend)
+    assert backend.default._backend().id == "sandbox-1"
     assert set(backend.routes) == {
         "/state/",
         "/memories/agent/crawl-worker/",
@@ -552,7 +596,7 @@ async def test_real_opensandbox_write_execute_and_export(tmp_path) -> None:
     manager = sandbox_manager.SandboxManager(artifact_root=tmp_path)
     thread_id = "integration-thread"
     try:
-        backend = await manager.ensure(thread_id)
+        backend = await manager.ensure(thread_id, user_id="local-user")
         await manager.upload_workspace_files(
             thread_id,
             [("/workspace/hello.py", b"print('sandbox-ok')")],
@@ -667,7 +711,7 @@ async def test_worker_and_supervisor_components_use_separate_network_profiles(
 
     monkeypatch.setattr(manager, "_create_handle", fake_create)
 
-    crawl = await manager.ensure("shared-thread")
+    crawl = await manager.ensure("shared-thread", user_id="user-a")
     supervisor = await manager.ensure(
         "shared-thread",
         component="supervisor",

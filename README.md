@@ -24,6 +24,8 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
 - LangSmith 记录 Agent、模型、工具及沙箱生命周期。
 - React 三栏研究工作台，左侧显示用户会话，中间流式展示对话，右侧集中显示计划和异步任务轨迹。
 - 可选注册登录；账户、会话、Skill 和检查点按用户隔离，匿名请求使用共享默认账户。
+- 账户、thread 归属、邮件投递与 LangGraph checkpoint 统一持久化到 PostgreSQL；Skill 与
+  长期记忆继续使用 MongoDB。
 - MongoDB 长期记忆只保留当前用户偏好/行为反馈和每个 Agent 独立的公共失败经验；三个
   Agent 均按用户及 Agent namespace 直接加载，写入由显式工具和后台 worker 控制。
 
@@ -55,7 +57,13 @@ MONGODB_MEMORY_COLLECTION=memories
 MONGODB_MEMORY_JOB_COLLECTION=memory_update_jobs
 MEMORY_MODEL=
 MEMORY_CONSOLIDATION_TIMEOUT_SECONDS=30
-MYSQL_URI=mysql+asyncmy://root:your-password@127.0.0.1:3306/deep_data_research_agent?charset=utf8mb4
+POSTGRES_URI=postgresql://deep_data_research_agent_app:your-password@127.0.0.1:5432/deep_data_research_agent
+POSTGRES_APP_POOL_SIZE=5
+POSTGRES_APP_MAX_OVERFLOW=10
+POSTGRES_CHECKPOINT_POOL_MIN_SIZE=1
+POSTGRES_CHECKPOINT_POOL_MAX_SIZE=5
+POSTGRES_POOL_TIMEOUT_SECONDS=30
+LANGGRAPH_STRICT_MSGPACK=true
 AUTH_SESSION_DAYS=7
 ```
 
@@ -76,17 +84,28 @@ SMTP_TIMEOUT_SECONDS=30
 SMTP_MAX_ATTACHMENT_BYTES=20971520
 ```
 
-首次启动前创建 MySQL 数据库，应用会幂等创建账户、登录令牌和 thread 归属表：
+账户、登录令牌、thread 归属、邮件投递与 LangGraph checkpoint 统一使用 PostgreSQL。
+先在被 Git 忽略的 `.env.postgres-admin` 中写入管理员连接；应用角色密码可省略，命令会生成并
+只保存到本地文件：
 
-```sql
-CREATE DATABASE deep_data_research_agent
-CHARACTER SET utf8mb4
-COLLATE utf8mb4_0900_ai_ci;
+```dotenv
+POSTGRES_ADMIN_URI=postgresql://postgres:admin-password@127.0.0.1:5432/postgres
+# POSTGRES_APP_PASSWORD=optional-fixed-password
 ```
+
+停止后端后初始化专用角色、数据库、应用表与官方 PostgreSQL checkpoint 表：
+
+```powershell
+uv run setup-agent-postgres
+```
+
+该命令不会在终端输出管理员或应用凭证，并会把 `POSTGRES_URI` 与
+`LANGGRAPH_STRICT_MSGPACK=true` 写入本地 `.env`。应用启动后，账户、登录令牌、thread
+归属、邮件投递和 LangGraph checkpoint 均直接使用该 PostgreSQL 数据库。
 
 动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。无 Bearer Token 时
 LangGraph Auth 注入共享身份 `local-user`；注册用户使用独立 UUID。MongoDB 不配置 TTL 和
-向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要写入 MySQL。
+向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要写入 PostgreSQL。
 
 如需清空所有用户记忆和失败经验并重新开始，应先停止应用，再执行：
 
@@ -126,11 +145,13 @@ namespace，再把仓库公共种子精确同步到各 Agent 的公共 namespace
 
 ```powershell
 $env:PYTHONUTF8='1'
-uv run langgraph dev --n-jobs-per-worker 4 --no-browser --no-reload
+uv run langgraph dev --n-jobs-per-worker 4 --no-browser
 ```
 
 Windows 下显式启用 UTF-8，可规避 `langgraph-api` 读取 OpenAPI 文件时使用 GBK 导致的启动错误。
-`--no-reload` 避免 SQLite 的 WAL 文件变化触发开发服务器热重载；修改后端代码后手动重启即可。
+Windows 下不要添加 `--no-reload`：Uvicorn 0.51 在无 reload 子进程时会创建
+`ProactorEventLoop`，而 psycopg 异步连接池要求 `SelectorEventLoop`。保留开发服务器默认的
+reload 模式即可使用兼容的 Selector loop；Linux 部署不受该限制。
 
 同一 `langgraph.json` 只注册两个对外图：
 
@@ -193,7 +214,6 @@ Agent 执行期间文件位于沙箱 `/workspace`；任务成功后按组件合�
 
 ```text
 data/users/<user-id>/
-├── checkpoints.sqlite
 └── jobs/<thread-id>/
     ├── supervisor/workspace/final_report.md
     └── crawl-worker/workspace/
@@ -202,6 +222,9 @@ data/users/<user-id>/
         ├── *_pages.jsonl
         └── crawl_report.md
 ```
+
+checkpoint 已存入 PostgreSQL；切换前已有的 `checkpoints.sqlite*` 仅作为本地回退备份保留，
+新版本不会读取或迁移这些文件。
 
 Worker 采集产物位于异步任务 ID 对应的组件目录。`data/` 仅用于本地 MVP，已经加入
 `.gitignore`。

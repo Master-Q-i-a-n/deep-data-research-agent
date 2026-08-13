@@ -11,6 +11,9 @@ from deep_data_research_agent import backends, sandbox_manager
 def _runtime(thread_id: str) -> SimpleNamespace:
     return SimpleNamespace(
         execution_info=SimpleNamespace(thread_id=thread_id),
+        server_info=SimpleNamespace(
+            user=SimpleNamespace(identity="test-user"),
+        ),
         state={},
     )
 
@@ -26,7 +29,13 @@ def initialized_backends(monkeypatch):
         "crawl-worker": _sandbox_backend("crawl-box"),
     }
 
-    def get_backend(_thread_id: str, *, component: str = "crawl-worker"):
+    def get_backend(
+        _thread_id: str,
+        *,
+        component: str = "crawl-worker",
+        user_id: str | None = None,
+    ):
+        assert user_id == "test-user"
         return values[component]
 
     monkeypatch.setattr(
@@ -43,8 +52,10 @@ def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
     supervisor = backends.create_backend(runtime)
     crawl = backends.create_worker_backend(runtime)
 
-    assert supervisor.default is initialized_backends["supervisor"]
-    assert crawl.default is initialized_backends["crawl-worker"]
+    assert isinstance(supervisor.default, backends.RestartSafeSandboxBackend)
+    assert isinstance(crawl.default, backends.RestartSafeSandboxBackend)
+    assert supervisor.default._backend() is initialized_backends["supervisor"]
+    assert crawl.default._backend() is initialized_backends["crawl-worker"]
     assert set(supervisor.routes) == {
         "/state/",
         "/memories/user/",
@@ -111,6 +122,36 @@ def test_backend_construction_does_not_read_seed_files(
     with blockbuster_ctx(scanned_modules=["deep_data_research_agent"]):
         backends.create_backend(_runtime("thread-1"))
         backends.create_worker_backend(_runtime("thread-2"))
+
+
+@pytest.mark.asyncio
+async def test_backend_recreates_sandbox_after_process_restart(monkeypatch) -> None:
+    restored = _sandbox_backend("restored-box")
+    calls: list[dict[str, object]] = []
+
+    def missing_backend(*_args, **_kwargs):
+        raise sandbox_manager.SandboxNotInitializedError("not initialized")
+
+    async def ensure(*_args, **kwargs):
+        calls.append(kwargs)
+        return restored
+
+    monkeypatch.setattr(
+        sandbox_manager.SANDBOX_MANAGER,
+        "get_backend",
+        missing_backend,
+    )
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "ensure", ensure)
+
+    backend = backends.create_backend(_runtime("resumed-thread"))
+    assert await backend.default._abackend() is restored
+    assert calls == [
+        {
+            "component": "supervisor",
+            "network_enabled": True,
+            "user_id": "test-user",
+        }
+    ]
 
 
 def test_supervisor_file_tools_cannot_overwrite_uploaded_inputs() -> None:

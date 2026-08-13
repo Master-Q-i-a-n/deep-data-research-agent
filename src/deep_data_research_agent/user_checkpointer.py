@@ -1,16 +1,11 @@
-"""Agent Server checkpointer that routes each user to a separate SQLite file."""
+"""PostgreSQL checkpointer with application-level thread ownership checks."""
 
 from __future__ import annotations
 
-import asyncio
-import re
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from hashlib import sha256
-from pathlib import Path
 from typing import Any
 
-import aiosqlite
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
@@ -19,24 +14,17 @@ from langgraph.checkpoint.base import (
     CheckpointMetadata,
     CheckpointTuple,
 )
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from deep_data_research_agent import database, sandbox_manager
 from deep_data_research_agent.config import get_settings
 
-_SAFE_DIRECTORY = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
-
-
-def storage_user_id(user_id: str) -> str:
-    """Keep trusted IDs readable and hash any future provider-specific identity."""
-
-    value = user_id.strip()
-    if _SAFE_DIRECTORY.fullmatch(value):
-        return value
-    return sha256(value.encode("utf-8")).hexdigest()
-
 
 def configured_user_id(config: RunnableConfig | None) -> str | None:
+    """Extract the authenticated identity injected by LangGraph Server."""
+
     configurable = (config or {}).get("configurable", {})
     value = configurable.get("langgraph_auth_user_id")
     if value:
@@ -50,38 +38,13 @@ def configured_user_id(config: RunnableConfig | None) -> str | None:
     return str(value) if value else None
 
 
-class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
-    """Lazily route LangGraph checkpoint calls by authenticated thread owner."""
+class UserOwnedPostgresCheckpointer(BaseCheckpointSaver):
+    """Delegate checkpoints to PostgreSQL after enforcing thread ownership."""
 
-    def __init__(self, root: Path) -> None:
-        super().__init__()
-        self._root = root.expanduser().resolve()
-        self._savers: dict[str, AsyncSqliteSaver] = {}
-        self._connections: dict[str, aiosqlite.Connection] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._locks_guard = asyncio.Lock()
-
-    async def _lock_for(self, user_id: str) -> asyncio.Lock:
-        async with self._locks_guard:
-            return self._locks.setdefault(user_id, asyncio.Lock())
-
-    async def _saver(self, user_id: str) -> AsyncSqliteSaver:
-        if saver := self._savers.get(user_id):
-            return saver
-        lock = await self._lock_for(user_id)
-        async with lock:
-            if saver := self._savers.get(user_id):
-                return saver
-            user_root = self._root / storage_user_id(user_id)
-            await asyncio.to_thread(user_root.mkdir, parents=True, exist_ok=True)
-            connection = await aiosqlite.connect(user_root / "checkpoints.sqlite")
-            await connection.execute("PRAGMA busy_timeout=5000")
-            await connection.execute("PRAGMA foreign_keys=ON")
-            saver = AsyncSqliteSaver(connection, serde=self.serde)
-            await saver.setup()  # setup also enables WAL.
-            self._connections[user_id] = connection
-            self._savers[user_id] = saver
-            return saver
+    def __init__(self, saver: AsyncPostgresSaver) -> None:
+        # Keep this wrapper's serializer aligned with the official saver.
+        super().__init__(serde=saver.serde)
+        self._saver = saver
 
     @staticmethod
     def _thread_id(config: RunnableConfig | None) -> str:
@@ -113,8 +76,8 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         return owner
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
-        user_id = await self._user_for_config(config)
-        return await (await self._saver(user_id)).aget_tuple(config)
+        await self._user_for_config(config)
+        return await self._saver.aget_tuple(config)
 
     async def alist(
         self,
@@ -124,9 +87,8 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         before: RunnableConfig | None = None,
         limit: int | None = None,
     ) -> AsyncIterator[CheckpointTuple]:
-        user_id = await self._user_for_config(config)
-        saver = await self._saver(user_id)
-        async for item in saver.alist(
+        await self._user_for_config(config)
+        async for item in self._saver.alist(
             config,
             filter=filter,
             before=before,
@@ -141,8 +103,8 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
-        user_id = await self._user_for_config(config, claim=True)
-        return await (await self._saver(user_id)).aput(
+        await self._user_for_config(config, claim=True)
+        return await self._saver.aput(
             config,
             checkpoint,
             metadata,
@@ -156,21 +118,15 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        user_id = await self._user_for_config(config, claim=True)
-        await (await self._saver(user_id)).aput_writes(
-            config,
-            writes,
-            task_id,
-            task_path,
-        )
+        await self._user_for_config(config, claim=True)
+        await self._saver.aput_writes(config, writes, task_id, task_path)
 
     async def adelete_thread(self, thread_id: str) -> None:
         owner = await database.get_thread_owner(thread_id)
         if owner is None:
             return
-        await (await self._saver(owner)).adelete_thread(thread_id)
-        # Thread deletion is explicit user intent, so remove its uploaded files,
-        # generated artifacts and any still-live sandbox before dropping ownership.
+        await self._saver.adelete_thread(thread_id)
+        # Explicit thread deletion also removes its artifacts and live sandbox.
         await sandbox_manager.SANDBOX_MANAGER.delete_thread_resources(
             thread_id,
             user_id=owner,
@@ -178,18 +134,23 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         await database.delete_thread_claim(thread_id, owner)
 
     async def adelete_for_runs(self, run_ids: Sequence[str]) -> None:
-        # AsyncSqliteSaver 3.x does not expose run-to-thread routing.
-        raise NotImplementedError("SQLite 检查点暂不支持按 run_id 删除")
+        # Run IDs alone do not carry a trusted owner, so do not bypass isolation.
+        raise NotImplementedError("按 run_id 删除缺少可信的 thread 归属信息")
 
     async def acopy_thread(self, source_thread_id: str, target_thread_id: str) -> None:
         owner = await database.get_thread_owner(source_thread_id)
         if owner is None:
             raise RuntimeError("源会话不存在")
+        target_owner = await database.get_thread_owner(target_thread_id)
         await database.claim_thread(target_thread_id, owner)
-        await (await self._saver(owner)).acopy_thread(
-            source_thread_id,
-            target_thread_id,
-        )
+        try:
+            await self._saver.acopy_thread(source_thread_id, target_thread_id)
+        except Exception:
+            # Only roll back a claim created by this copy attempt. An existing
+            # target claim must survive a delegate failure.
+            if target_owner is None:
+                await database.delete_thread_claim(target_thread_id, owner)
+            raise
 
     async def aprune(
         self,
@@ -197,32 +158,46 @@ class UserScopedSqliteCheckpointer(BaseCheckpointSaver):
         *,
         strategy: str = "keep_latest",
     ) -> None:
-        owners: dict[str, list[str]] = {}
-        for thread_id in thread_ids:
-            owner = await database.get_thread_owner(thread_id)
-            if owner is not None:
-                owners.setdefault(owner, []).append(thread_id)
-        for owner, owned_threads in owners.items():
-            await (await self._saver(owner)).aprune(
-                owned_threads,
-                strategy=strategy,
-            )
-
-    async def aclose(self) -> None:
-        connections = list(self._connections.values())
-        self._savers.clear()
-        self._connections.clear()
-        self._locks.clear()
-        for connection in connections:
-            await connection.close()
+        # Only forward threads already registered in the ownership table.
+        owned_threads = [
+            thread_id
+            for thread_id in thread_ids
+            if await database.get_thread_owner(thread_id) is not None
+        ]
+        if owned_threads:
+            await self._saver.aprune(owned_threads, strategy=strategy)
 
 
 @asynccontextmanager
-async def create_user_checkpointer() -> AsyncIterator[UserScopedSqliteCheckpointer]:
-    """Create the Agent Server-level checkpointer; graphs must not embed one."""
+async def create_user_checkpointer() -> AsyncIterator[UserOwnedPostgresCheckpointer]:
+    """Create one production PostgreSQL saver for the Agent Server lifespan."""
 
-    checkpointer = UserScopedSqliteCheckpointer(get_settings().artifact_root)
+    settings = get_settings()
+    uri = settings.postgres_uri.strip()
+    if not uri:
+        raise RuntimeError("POSTGRES_URI 未配置，无法初始化 PostgreSQL 检查点")
+    if settings.postgres_checkpoint_pool_max_size < (
+        settings.postgres_checkpoint_pool_min_size
+    ):
+        raise RuntimeError("PostgreSQL 检查点连接池最大值不能小于最小值")
+
+    pool = AsyncConnectionPool(
+        conninfo=database.psycopg_postgres_uri(uri),
+        min_size=settings.postgres_checkpoint_pool_min_size,
+        max_size=settings.postgres_checkpoint_pool_max_size,
+        timeout=settings.postgres_pool_timeout_seconds,
+        open=False,
+        kwargs={
+            # AsyncPostgresSaver setup and migrations require autocommit.
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+        },
+    )
+    await pool.open(wait=True)
+    saver = AsyncPostgresSaver(pool)
+    await saver.setup()
     try:
-        yield checkpointer
+        yield UserOwnedPostgresCheckpointer(saver)
     finally:
-        await checkpointer.aclose()
+        await pool.close()
