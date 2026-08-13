@@ -79,6 +79,31 @@ class AgentThread(Base):
     )
 
 
+class EmailDelivery(Base):
+    """Durable idempotency and audit state for an external SMTP side effect."""
+
+    __tablename__ = "email_deliveries"
+
+    idempotency_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    thread_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    recipient: Mapped[str] = mapped_column(String(320), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    pdf_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    zip_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class UserRecord:
     """User information safe to return to authentication callers."""
@@ -87,6 +112,22 @@ class UserRecord:
     username: str
     is_system: bool
     password_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EmailDeliveryRecord:
+    """Immutable delivery state returned to the report-email tool."""
+
+    idempotency_key: str
+    thread_id: str
+    user_id: str
+    recipient: str
+    subject: str
+    pdf_filename: str
+    zip_filename: str
+    message_id: str
+    status: str
+    error_summary: str | None
 
 
 class UsernameExistsError(ValueError):
@@ -171,6 +212,21 @@ def _record(user: User) -> UserRecord:
         username=user.username,
         is_system=user.is_system,
         password_hash=user.password_hash,
+    )
+
+
+def _email_delivery_record(delivery: EmailDelivery) -> EmailDeliveryRecord:
+    return EmailDeliveryRecord(
+        idempotency_key=delivery.idempotency_key,
+        thread_id=delivery.thread_id,
+        user_id=delivery.user_id,
+        recipient=delivery.recipient,
+        subject=delivery.subject,
+        pdf_filename=delivery.pdf_filename,
+        zip_filename=delivery.zip_filename,
+        message_id=delivery.message_id,
+        status=delivery.status,
+        error_summary=delivery.error_summary,
     )
 
 
@@ -292,3 +348,68 @@ async def delete_thread_claim(thread_id: str, user_id: str) -> None:
             )
         )
         await session.commit()
+
+
+async def begin_email_delivery(
+    *,
+    idempotency_key: str,
+    thread_id: str,
+    user_id: str,
+    recipient: str,
+    subject: str,
+    pdf_filename: str,
+    zip_filename: str,
+    message_id: str,
+) -> tuple[EmailDeliveryRecord, bool]:
+    """Create a sending record or return the existing replay-safe record."""
+
+    await ensure_schema()
+    async with session_factory()() as session:
+        existing = await session.get(EmailDelivery, idempotency_key)
+        if existing is not None:
+            return _email_delivery_record(existing), False
+
+        delivery = EmailDelivery(
+            idempotency_key=idempotency_key,
+            thread_id=thread_id,
+            user_id=user_id,
+            recipient=recipient,
+            subject=subject,
+            pdf_filename=pdf_filename,
+            zip_filename=zip_filename,
+            message_id=message_id,
+            status="sending",
+        )
+        session.add(delivery)
+        try:
+            await session.commit()
+        except IntegrityError:
+            # A concurrent resume of the same tool call may win the unique insert.
+            await session.rollback()
+            existing = await session.get(EmailDelivery, idempotency_key)
+            if existing is None:
+                raise
+            return _email_delivery_record(existing), False
+        return _email_delivery_record(delivery), True
+
+
+async def finish_email_delivery(
+    idempotency_key: str,
+    *,
+    status: str,
+    error_summary: str | None = None,
+) -> EmailDeliveryRecord:
+    """Persist one terminal delivery state without allowing arbitrary statuses."""
+
+    if status not in {"sent", "failed", "uncertain"}:
+        raise ValueError("邮件投递状态无效")
+    await ensure_schema()
+    async with session_factory()() as session:
+        delivery = await session.get(EmailDelivery, idempotency_key)
+        if delivery is None:
+            raise RuntimeError("邮件投递记录不存在")
+        delivery.status = status
+        delivery.error_summary = error_summary[:255] if error_summary else None
+        delivery.updated_at = _utcnow()
+        await session.commit()
+        return _email_delivery_record(delivery)

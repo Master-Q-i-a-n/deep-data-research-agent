@@ -20,6 +20,7 @@ const TOOL_LABELS: Record<string, string> = {
   assign_skill: "分配 Skill",
   ask_user: "请求补充信息",
   request_report_download: "准备报告下载",
+  send_report_email: "发送报告邮件",
   write_file: "写入研究产物",
   read_file: "读取研究产物",
   edit_file: "编辑研究产物",

@@ -61,6 +61,21 @@ AUTH_SESSION_DAYS=7
 
 不要提交 `.env`，也不要把 API Key 作为命令行参数传递。
 
+如需使用 QQ 邮箱发送报告，在本地 `.env` 中启用固定发件邮箱。`SMTP_PASSWORD` 必须填写
+QQ 邮箱生成的授权码，而不是登录密码：
+
+```dotenv
+SMTP_ENABLED=true
+SMTP_HOST=smtp.qq.com
+SMTP_PORT=465
+SMTP_USERNAME=your-account@qq.com
+SMTP_PASSWORD=your-qq-mail-authorization-code
+SMTP_USE_SSL=true
+SMTP_SENDER_NAME=深研
+SMTP_TIMEOUT_SECONDS=30
+SMTP_MAX_ATTACHMENT_BYTES=20971520
+```
+
 首次启动前创建 MySQL 数据库，应用会幂等创建账户、登录令牌和 thread 归属表：
 
 ```sql
@@ -145,6 +160,7 @@ npm run dev
 - 停止生成、新建任务及 thread URL 恢复；
 - 当前用户的 Supervisor 会话历史、首条任务标题和历史 thread 切换；
 - 注册、登录、注销和刷新后的登录恢复。
+- 用户明确要求时，经确认将 PDF 主报告和完整材料 ZIP 发送到本次提供的单个邮箱。
 
 登录、注册或注销后，前端会清除当前 thread 并进入对应身份的新空间。默认账户由所有未登录
 浏览器共享，不会在登录时把其会话或 Skill 复制到个人账户。

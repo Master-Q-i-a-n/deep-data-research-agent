@@ -116,5 +116,8 @@ graph = create_deep_agent(
         "request_report_download": {
             "allowed_decisions": ["approve", "reject"],
         },
+        "send_report_email": {
+            "allowed_decisions": ["approve", "reject"],
+        },
     },
 )

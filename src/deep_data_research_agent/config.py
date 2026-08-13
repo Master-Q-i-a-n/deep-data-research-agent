@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from langchain_openai import ChatOpenAI
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,6 +68,21 @@ class Settings(BaseSettings):
     mongodb_skill_collection: str = "skill_files"
     mongodb_memory_collection: str = "memories"
     mongodb_memory_job_collection: str = "memory_update_jobs"
+
+    # Fixed platform mailbox used by the Supervisor's approval-gated report tool.
+    smtp_enabled: bool = False
+    smtp_host: str = "smtp.qq.com"
+    smtp_port: int = Field(default=465, ge=1, le=65535)
+    smtp_username: str = ""
+    smtp_password: SecretStr = SecretStr("")
+    smtp_use_ssl: bool = True
+    smtp_sender_name: str = "深研"
+    smtp_timeout_seconds: float = Field(default=30.0, ge=1, le=120)
+    smtp_max_attachment_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        ge=1024,
+        le=100 * 1024 * 1024,
+    )
 
     # Explicit memory tools enqueue work; the background worker uses this
     # non-streaming model for validated consolidation.

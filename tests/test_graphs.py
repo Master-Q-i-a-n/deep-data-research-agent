@@ -20,6 +20,7 @@ def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
     assert "assign_skill" in tools
     assert "ask_user" in tools
     assert "request_report_download" in tools
+    assert "send_report_email" in tools
     assert "capture_user_memory" in tools
     assert "record_failure_lesson" in tools
     assert "start_async_task" in tools
@@ -86,6 +87,7 @@ def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() ->
         "assign_skill",
         "ask_user",
         "request_report_download",
+        "send_report_email",
         "tavily_search",
     } & set(tools)
 
@@ -112,6 +114,9 @@ def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() ->
     assert "相对于报告文件的路径嵌入" in DATA_ANALYST_PROMPT
     assert "capture_user_memory" in SUPERVISOR_PROMPT
     assert "record_failure_lesson" in SUPERVISOR_PROMPT
+    assert "明确要求通过邮件发送报告" in SUPERVISOR_PROMPT
+    assert "不从记忆或历史收件人中推测" in SUPERVISOR_PROMPT
+    assert "不得自行创建新的邮件工具调用" in SUPERVISOR_PROMPT
     assert "record_failure_lesson" in DATA_ANALYST_PROMPT
 
 

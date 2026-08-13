@@ -27,8 +27,13 @@ from openpyxl.utils.exceptions import InvalidFileException
 from pydantic import BaseModel, Field
 
 from deep_data_research_agent import database, sandbox_manager
+from deep_data_research_agent.artifacts import (
+    ArtifactError,
+    build_markdown_bundle,
+    resolve_download_path,
+    workspace_artifacts,
+)
 from deep_data_research_agent.auth import bearer_token
-from deep_data_research_agent.interaction_tools import DOWNLOADABLE_SUFFIXES
 from deep_data_research_agent.memory import start_memory_worker
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
@@ -36,8 +41,6 @@ _PASSWORD_HASHER = PasswordHasher()
 logger = logging.getLogger(__name__)
 _FAILED_TASK_STATUSES = frozenset({"error", "timeout", "interrupted"})
 _UPLOAD_SUFFIXES = frozenset({".csv", ".tsv", ".xlsx"})
-_ARTIFACT_CARD_SUFFIXES = frozenset({".md", ".pdf", ".zip"})
-_BUNDLE_COMPANION_SUFFIXES = frozenset({".csv", ".json", ".png", ".tsv", ".xlsx"})
 _UPLOAD_MEDIA_TYPES = {
     ".csv": "text/csv",
     ".tsv": "text/tab-separated-values",
@@ -54,14 +57,6 @@ _WINDOWS_RESERVED_NAMES = frozenset(
     | {f"LPT{number}" for number in range(1, 10)}
 )
 _WINDOWS_INVALID_CHARACTERS = frozenset('<>:"|?*')
-_MARKDOWN_IMAGE_PATTERN = re.compile(
-    r"!\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^\s)]+))"
-    r"(?:\s+['\"][^'\"]*['\"])?\s*\)"
-)
-_HTML_IMAGE_PATTERN = re.compile(
-    r"<img\b[^>]*?\bsrc\s*=\s*(?P<quote>['\"])(?P<src>.*?)(?P=quote)[^>]*>",
-    re.IGNORECASE,
-)
 
 
 class RegisterRequest(BaseModel):
@@ -120,47 +115,9 @@ async def _authenticated_user_id(authorization: str | None) -> str:
 
 
 def _workspace_artifacts(root: Path) -> list[dict[str, object]]:
-    """List user-facing artifacts without following links outside the snapshot."""
+    """Keep the existing webapp helper name while sharing artifact policy."""
 
-    if not root.is_dir():
-        return []
-    resolved_root = root.resolve()
-    artifacts: list[dict[str, object]] = []
-    for candidate in resolved_root.rglob("*"):
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
-        resolved = candidate.resolve()
-        if not resolved.is_relative_to(resolved_root):
-            continue
-        relative = resolved.relative_to(resolved_root)
-        if relative.parts[0] in {"input", "profile", "raw", "scripts"}:
-            continue
-        is_output = relative.parts[0] in {"charts", "output"}
-        is_report = "report" in resolved.stem.lower()
-        if not is_output and not is_report:
-            continue
-        # 图片与表格作为报告附件进入 ZIP，不在产物卡中逐项占据位置。
-        if resolved.suffix.lower() not in _ARTIFACT_CARD_SUFFIXES:
-            continue
-        mime_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
-        artifacts.append(
-            {
-                "path": f"/workspace/{relative.as_posix()}",
-                "filename": resolved.name,
-                "size": resolved.stat().st_size,
-                "mime_type": mime_type,
-            }
-        )
-    report_priority = {
-        "/workspace/output/final_report.pdf": 0,
-        "/workspace/output/final_report.md": 1,
-        "/workspace/final_report.pdf": 2,
-        "/workspace/final_report.md": 3,
-    }
-    return sorted(
-        artifacts,
-        key=lambda item: (report_priority.get(str(item["path"]), 4), str(item["path"])),
-    )
+    return workspace_artifacts(root)
 
 
 def _uploaded_files(root: Path) -> list[dict[str, object]]:
@@ -335,112 +292,21 @@ async def _upload_to_supervisor_workspace(
 
 
 def _download_path(root: Path, virtual_path: str) -> Path:
-    """Resolve one virtual workspace path while rejecting traversal and links."""
+    """Translate artifact validation failures into API responses."""
 
     try:
-        relative = sandbox_manager.workspace_relative_path(virtual_path)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if relative.suffix.lower() not in DOWNLOADABLE_SUFFIXES:
-        raise HTTPException(status_code=400, detail="下载文件类型不受支持")
-
-    resolved_root = root.resolve()
-    candidate = resolved_root / Path(*relative.parts)
-    if candidate.is_symlink():
-        raise HTTPException(status_code=404, detail="文件不存在")
-    target = candidate.resolve()
-    if not target.is_relative_to(resolved_root):
-        raise HTTPException(status_code=400, detail="下载路径越过工作区")
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="文件不存在")
-    return target
+        return resolve_download_path(root, virtual_path)
+    except ArtifactError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 def _markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
-    """Build a Markdown ZIP containing its images and companion data files.
-
-    The report is placed at the ZIP root. Relative image paths keep their
-    original layout. CSV, TSV, XLSX, JSON and PNG files beside the report are
-    bundled recursively even when they are only listed as supporting outputs.
-    """
-
-    report_path = _download_path(root, virtual_path)
-    if report_path.suffix.lower() != ".md":
-        raise HTTPException(status_code=400, detail="只有 Markdown 报告支持图片打包下载")
+    """Translate shared bundle validation failures into API responses."""
 
     try:
-        markdown = report_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=409, detail="Markdown 报告不是 UTF-8 编码") from exc
-
-    sources = [
-        match.group("angle") or match.group("plain") or ""
-        for match in _MARKDOWN_IMAGE_PATTERN.finditer(markdown)
-    ]
-    sources.extend(match.group("src") for match in _HTML_IMAGE_PATTERN.finditer(markdown))
-
-    resolved_root = root.resolve()
-    report_parent = report_path.parent.resolve()
-    assets: dict[str, Path] = {}
-    included_files: set[Path] = set()
-    rewrites: dict[str, str] = {}
-    for raw_source in sources:
-        source = raw_source.strip().replace("\\", "/")
-        if not source or source.startswith(("http://", "https://", "data:", "blob:", "#")):
-            continue
-        # Queries and fragments are not part of a local filesystem path.
-        source_path = source.split("#", 1)[0].split("?", 1)[0]
-        pure = PurePosixPath(source_path)
-        if ".." in pure.parts:
-            raise HTTPException(status_code=409, detail=f"报告图片路径不安全：{source}")
-        if source_path.startswith("/workspace/"):
-            relative = sandbox_manager.workspace_relative_path(source_path)
-            archive_path = PurePosixPath(*relative.parts).as_posix()
-            candidate = resolved_root / Path(*relative.parts)
-            # The report is extracted at the ZIP root, where /workspace does not exist.
-            rewrites[raw_source] = archive_path
-        elif pure.is_absolute():
-            raise HTTPException(status_code=409, detail=f"报告图片必须位于工作区：{source}")
-        else:
-            archive_path = pure.as_posix()
-            candidate = report_parent / Path(*pure.parts)
-
-        if candidate.is_symlink():
-            raise HTTPException(status_code=409, detail=f"报告图片不能是符号链接：{source}")
-        image_path = candidate.resolve()
-        if not image_path.is_relative_to(resolved_root):
-            raise HTTPException(status_code=409, detail=f"报告图片越过工作区：{source}")
-        if not image_path.is_file():
-            raise HTTPException(status_code=409, detail=f"报告引用的图片不存在：{source}")
-        assets[archive_path] = image_path
-        included_files.add(image_path)
-
-    # data-analyst 会把图表和指标表放在主报告目录树内；统一随报告打包，
-    # 这样前端无需把每个辅助文件展示成独立下载项。
-    for candidate in report_parent.rglob("*"):
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
-        if candidate.suffix.lower() not in _BUNDLE_COMPANION_SUFFIXES:
-            continue
-        resolved = candidate.resolve()
-        if not resolved.is_relative_to(resolved_root) or resolved in included_files:
-            continue
-        archive_path = PurePosixPath(
-            *resolved.relative_to(report_parent).parts
-        ).as_posix()
-        assets[archive_path] = resolved
-        included_files.add(resolved)
-
-    bundled_markdown = markdown
-    for original, replacement in rewrites.items():
-        bundled_markdown = bundled_markdown.replace(original, replacement)
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(report_path.name, bundled_markdown.encode("utf-8"))
-        for archive_path, image_path in sorted(assets.items()):
-            archive.write(image_path, archive_path)
-    return buffer.getvalue(), f"{report_path.stem}-bundle.zip"
+        return build_markdown_bundle(root, virtual_path)
+    except ArtifactError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 def _user_payload(user: database.UserRecord) -> dict[str, object]:

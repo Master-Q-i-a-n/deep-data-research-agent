@@ -449,6 +449,7 @@ function compactToolActivity(toolCall: CompactToolCall): string {
     tavily_crawl: "正在采集网页…",
     tavily_extract: "正在提取网页内容…",
     request_report_download: "正在准备报告下载…",
+    send_report_email: "正在发送报告邮件…",
   };
   return labels[toolCall.name] ?? `正在执行 ${toolCall.name}…`;
 }
@@ -690,6 +691,7 @@ function InterruptCard({
       {request.action_requests.map((action, index) => {
         const allowed = request.review_configs[index]?.allowed_decisions ?? [];
         const isQuestion = action.name === "ask_user" && allowed.includes("respond");
+        const isEmail = action.name === "send_report_email";
         const question = typeof action.args.question === "string"
           ? action.args.question
           : action.description ?? "请补充完成任务所需的信息";
@@ -702,10 +704,27 @@ function InterruptCard({
         const filePath = typeof action.args.file_path === "string"
           ? action.args.file_path
           : "/workspace/output/final_report.pdf";
+        const recipient = typeof action.args.recipient === "string"
+          ? action.args.recipient
+          : "未提供";
+        const pdfPath = typeof action.args.pdf_path === "string"
+          ? action.args.pdf_path
+          : "/workspace/output/final_report.pdf";
+        const markdownPath = typeof action.args.markdown_path === "string"
+          ? action.args.markdown_path
+          : "/workspace/output/final_report.md";
+        const pdfFilename = pdfPath.split("/").pop() || "final_report.pdf";
+        const markdownFilename = markdownPath.split("/").pop() || "final_report.md";
+        const zipFilename = `${markdownFilename.replace(/\.md$/i, "")}-bundle.zip`;
+        const emailSubject = typeof action.args.subject === "string" && action.args.subject.trim()
+          ? action.args.subject.trim()
+          : `研究报告：${pdfFilename.replace(/\.pdf$/i, "")}`;
 
         return (
           <div className="interrupt-card__request" key={`${action.name}-${index}`}>
-            <strong>{isQuestion ? question : "是否允许下载此文件？"}</strong>
+            <strong>
+              {isQuestion ? question : isEmail ? "是否确认发送报告邮件？" : "是否允许下载此文件？"}
+            </strong>
             {isQuestion ? (
               <>
                 {missing ? <span>待补充：{missing}</span> : null}
@@ -723,7 +742,14 @@ function InterruptCard({
               </>
             ) : (
               <>
-                <code>{filePath}</code>
+                {isEmail ? (
+                  <div className="interrupt-card__email-details">
+                    <span><b>收件邮箱</b>{recipient}</span>
+                    <span><b>邮件主题</b>{emailSubject}</span>
+                    <span><b>PDF 附件</b>{pdfFilename}</span>
+                    <span><b>完整 ZIP</b>{zipFilename}</span>
+                  </div>
+                ) : <code>{filePath}</code>}
                 <div className="interrupt-card__choices">
                   {allowed.includes("approve") ? (
                     <button
@@ -732,7 +758,7 @@ function InterruptCard({
                       onClick={() => setChoices((current) => ({ ...current, [index]: "approve" }))}
                       disabled={submitting}
                     >
-                      批准下载
+                      {isEmail ? "确认发送" : "批准下载"}
                     </button>
                   ) : null}
                   {allowed.includes("reject") ? (
@@ -742,7 +768,7 @@ function InterruptCard({
                       onClick={() => setChoices((current) => ({ ...current, [index]: "reject" }))}
                       disabled={submitting}
                     >
-                      拒绝
+                      {isEmail ? "取消发送" : "拒绝"}
                     </button>
                   ) : null}
                 </div>

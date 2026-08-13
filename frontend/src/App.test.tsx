@@ -1072,6 +1072,75 @@ describe("研究工作台", () => {
     await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
   });
 
+  it("邮件发送在简略模式展示完整确认信息并经批准恢复", async () => {
+    streamState.interrupt = {
+      id: "interrupt-email",
+      value: {
+        action_requests: [{
+          name: "send_report_email",
+          args: {
+            recipient: "reader@example.com",
+            subject: "月度物流分析",
+            pdf_path: "/workspace/output/logistics.pdf",
+            markdown_path: "/workspace/output/logistics.md",
+          },
+        }],
+        review_configs: [{
+          action_name: "send_report_email",
+          allowed_decisions: ["approve", "reject"],
+        }],
+      },
+    };
+    render(<App />);
+
+    expect(screen.getByText("是否确认发送报告邮件？")).toBeTruthy();
+    expect(screen.getByText("reader@example.com")).toBeTruthy();
+    expect(screen.getByText("月度物流分析")).toBeTruthy();
+    expect(screen.getByText("logistics.pdf")).toBeTruthy();
+    expect(screen.getByText("logistics-bundle.zip")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认发送" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交并继续" }));
+
+    await waitFor(() => expect(submit).toHaveBeenCalledWith(null, {
+      command: { resume: { decisions: [{ type: "approve" }] } },
+      streamSubgraphs: true,
+      streamResumable: true,
+      onDisconnect: "continue",
+    }));
+  });
+
+  it("取消邮件发送会以 reject 恢复且不执行原工具", async () => {
+    streamState.interrupt = {
+      id: "interrupt-email-reject",
+      value: {
+        action_requests: [{
+          name: "send_report_email",
+          args: { recipient: "reader@example.com" },
+        }],
+        review_configs: [{
+          action_name: "send_report_email",
+          allowed_decisions: ["approve", "reject"],
+        }],
+      },
+    };
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "取消发送" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交并继续" }));
+
+    await waitFor(() => expect(submit).toHaveBeenCalledWith(null, {
+      command: {
+        resume: {
+          decisions: [{ type: "reject", message: "用户拒绝执行该操作。" }],
+        },
+      },
+      streamSubgraphs: true,
+      streamResumable: true,
+      onDisconnect: "continue",
+    }));
+  });
+
   it("研究产物按钮通过鉴权接口下载文件", async () => {
     window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-a");
     const createObjectURL = vi.fn().mockReturnValue("blob:report");

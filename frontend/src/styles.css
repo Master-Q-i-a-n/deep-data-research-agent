@@ -838,6 +838,23 @@ code, pre {
   .jump-to-bottom { left: calc(50% - 15px); }
   .workspace-shell--compact .jump-to-bottom { left: calc(50% + 125px); }
 }
+.interrupt-card__email-details {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid rgba(206, 219, 225, 0.85);
+  border-radius: 8px;
+  background: rgba(247, 250, 251, 0.86);
+}
+.interrupt-card__email-details span {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 10px;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 0.7rem;
+}
+.interrupt-card__email-details b { color: var(--muted); font-weight: 600; }
 
 @media (max-width: 900px) {
   .workspace-shell { display: block; }
