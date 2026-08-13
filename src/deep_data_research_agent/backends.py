@@ -7,7 +7,6 @@ from typing import Any
 from deepagents import FilesystemPermission
 from deepagents.backends import (
     CompositeBackend,
-    FilesystemBackend,
     StateBackend,
     StoreBackend,
 )
@@ -15,17 +14,10 @@ from deepagents.backends import (
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.identity import assigned_skill_namespace
 from deep_data_research_agent.memory import (
-    AGENT_MEMORY_ROOT,
-    user_preferences_namespace,
+    failure_memory_namespace,
+    user_memory_namespace,
 )
 from deep_data_research_agent.skill_storage import public_skill_namespace
-
-# Shared Agent experience is managed only by system middleware.  The virtual
-# route keeps it outside sandboxes while still letting DeepAgents memory load it.
-_AGENT_MEMORY_BACKEND = FilesystemBackend(
-    root_dir=AGENT_MEMORY_ROOT,
-    virtual_mode=True,
-)
 
 
 def _thread_id(runtime: Any) -> str:
@@ -48,13 +40,16 @@ def _sandbox_backend(
     )
     routes: dict[str, Any] = {
         "/state/": StateBackend(),
-        "/memories/agent/": _AGENT_MEMORY_BACKEND,
         "/memories/user/": StoreBackend(
-            namespace=user_preferences_namespace,
+            namespace=user_memory_namespace,
             file_format="v2",
         ),
     }
     for agent_name in skill_agents:
+        routes[f"/memories/agent/{agent_name}/"] = StoreBackend(
+            namespace=lambda _rt, name=agent_name: failure_memory_namespace(name),
+            file_format="v2",
+        )
         # Route at the Agent directory so the remaining StoreBackend key keeps
         # the required /active/... prefix used in MongoDB.
         routes[f"/skills/public/{agent_name}/"] = StoreBackend(
@@ -124,6 +119,15 @@ FILESYSTEM_PERMISSIONS = [
         mode="allow",
     ),
     FilesystemPermission(
+        operations=["read"],
+        paths=[
+            "/memories/agent/supervisor/archive/**",
+            "/memories/agent/data-analyst/archive/**",
+            "/memories/agent/crawl-worker/archive/**",
+        ],
+        mode="deny",
+    ),
+    FilesystemPermission(
         operations=["write"],
         paths=["/memories/**"],
         mode="deny",
@@ -137,6 +141,11 @@ FILESYSTEM_PERMISSIONS = [
 
 
 WORKER_FILESYSTEM_PERMISSIONS = [
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/memories/agent/crawl-worker/archive/**"],
+        mode="deny",
+    ),
     FilesystemPermission(
         operations=["write"],
         paths=["/skills/**"],

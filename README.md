@@ -24,8 +24,10 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
 - LangSmith 记录 Agent、模型、工具及沙箱生命周期。
 - React 三栏研究工作台，左侧显示用户会话，中间流式展示对话，右侧集中显示计划和异步任务轨迹。
 - 可选注册登录；账户、会话、Skill 和检查点按用户隔离，匿名请求使用共享默认账户。
+- MongoDB 长期记忆只保留当前用户偏好/行为反馈和每个 Agent 独立的公共失败经验；三个
+  Agent 均按用户及 Agent namespace 直接加载，写入由显式工具和后台 worker 控制。
 
-当前不包含通用长期记忆、LangGraph interrupt 和 Playwright 网页采集能力。
+当前不包含向量记忆、周期记忆整理和 Playwright 网页采集能力。
 
 ## 配置
 
@@ -49,6 +51,10 @@ OPEN_SANDBOX_IMAGE=python:3.13-slim
 APP_ENV=development
 LOCAL_DEV_USER_ID=local-user
 MONGODB_URI=mongodb://127.0.0.1:27017
+MONGODB_MEMORY_COLLECTION=memories
+MONGODB_MEMORY_JOB_COLLECTION=memory_update_jobs
+MEMORY_MODEL=
+MEMORY_CONSOLIDATION_TIMEOUT_SECONDS=30
 MYSQL_URI=mysql+asyncmy://root:your-password@127.0.0.1:3306/deep_data_research_agent?charset=utf8mb4
 AUTH_SESSION_DAYS=7
 ```
@@ -66,6 +72,15 @@ COLLATE utf8mb4_0900_ai_ci;
 动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。无 Bearer Token 时
 LangGraph Auth 注入共享身份 `local-user`；注册用户使用独立 UUID。MongoDB 不配置 TTL 和
 向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要写入 MySQL。
+
+如需清空所有用户记忆和失败经验并重新开始，应先停止应用，再执行：
+
+```powershell
+uv run reset-agent-memory
+```
+
+该命令只清理旧偏好、`memories`、`memory_update_jobs` 和记忆 worker 租约，不会清理用户、
+Skill、checkpoint、会话或异步任务。
 
 ## OpenSandbox
 

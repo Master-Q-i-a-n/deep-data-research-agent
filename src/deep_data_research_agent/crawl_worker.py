@@ -22,9 +22,10 @@ from deep_data_research_agent.backends import (
 from deep_data_research_agent.config import create_chat_model
 from deep_data_research_agent.identity import user_identity_from_config
 from deep_data_research_agent.memory import (
-    AGENT_MEMORY_PATHS,
-    AgentExperienceEnqueueMiddleware,
+    CRAWL_WORKER_FAILURE_TOOL,
+    USER_MEMORY_PATH,
     MemoryRefreshMiddleware,
+    agent_memory_path,
 )
 from deep_data_research_agent.model_profile import register_mvp_profile
 from deep_data_research_agent.prompts import CRAWL_WORKER_PROMPT
@@ -95,12 +96,12 @@ class CrawlWorkerState(DeepAgentState):
 crawl_agent = create_deep_agent(
     name="crawl-worker-agent",
     model=create_chat_model(worker=True),
-    tools=CRAWL_TOOLS,
+    tools=[*CRAWL_TOOLS, CRAWL_WORKER_FAILURE_TOOL],
     system_prompt=CRAWL_WORKER_PROMPT,
     middleware=[
         MemoryRefreshMiddleware(
             backend_factory=create_worker_backend,
-            sources=[AGENT_MEMORY_PATHS["crawl-worker"]],
+            sources=[USER_MEMORY_PATH, agent_memory_path("crawl-worker")],
         ),
         MongoSkillsRestoreMiddleware(
             component="crawl-worker",
@@ -113,7 +114,6 @@ crawl_agent = create_deep_agent(
                 (f"{user_skill_root('crawl-worker')}/", "用户"),
             ],
         ),
-        AgentExperienceEnqueueMiddleware(agent_name="crawl-worker"),
     ],
     backend=create_worker_backend,
     permissions=WORKER_FILESYSTEM_PERMISSIONS,

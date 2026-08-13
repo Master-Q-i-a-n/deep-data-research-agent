@@ -20,6 +20,8 @@ def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
     assert "assign_skill" in tools
     assert "ask_user" in tools
     assert "request_report_download" in tools
+    assert "capture_user_memory" in tools
+    assert "record_failure_lesson" in tools
     assert "start_async_task" in tools
     assert "check_async_task" in tools
     assert "task" in tools
@@ -45,7 +47,12 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
         "export_workspace",
         "build_result",
     } <= set(worker_graph.nodes)
-    assert {"tavily_search", "tavily_crawl", "tavily_extract"} <= set(tools)
+    assert {
+        "tavily_search",
+        "tavily_crawl",
+        "tavily_extract",
+        "record_failure_lesson",
+    } <= set(tools)
     assert "execute" in tools
     assert "task" not in tools
 
@@ -72,6 +79,7 @@ def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() ->
         "database_get_object_details",
         "database_query_preview",
         "database_query_to_file",
+        "record_failure_lesson",
     } <= set(tools)
     assert not {
         "task",
@@ -102,6 +110,9 @@ def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() ->
     assert "在报告同目录\n   生成同名 PDF" in SUPERVISOR_PROMPT
     assert "不得仅\n  完成探查、部分指标或某个报告章节" in DATA_ANALYST_PROMPT
     assert "相对于报告文件的路径嵌入" in DATA_ANALYST_PROMPT
+    assert "capture_user_memory" in SUPERVISOR_PROMPT
+    assert "record_failure_lesson" in SUPERVISOR_PROMPT
+    assert "record_failure_lesson" in DATA_ANALYST_PROMPT
 
 
 @pytest.mark.asyncio
@@ -145,6 +156,13 @@ def test_agents_enable_the_expected_memory_sources() -> None:
     # both refresh and read-only prompt injection.
     assert "MemoryMiddleware.before_agent" not in supervisor_names
     assert "MemoryMiddleware.before_agent" not in worker_names
+
+    task_tool = supervisor_graph.nodes["tools"].bound.tools_by_name["task"]
+    child_graphs = inspect.getclosurevars(task_tool.coroutine).nonlocals[
+        "subagent_graphs"
+    ]
+    data_analyst_names = set(child_graphs["data-analyst"].get_graph().nodes)
+    assert "MemoryRefreshMiddleware.before_agent" in data_analyst_names
 
 
 def test_supervisor_sandbox_lifecycle_precedes_skill_loading() -> None:

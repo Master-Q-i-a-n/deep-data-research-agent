@@ -4,358 +4,557 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command
 from pydantic import ValidationError
 
 from deep_data_research_agent import memory
 
 
-def _runtime(store: InMemoryStore, user_id: str = "user-a") -> SimpleNamespace:
+def _runtime(messages=None, *, tool_call_id="call-memory"):
     return SimpleNamespace(
-        store=store,
-        server_info=SimpleNamespace(
-            user=SimpleNamespace(identity=user_id),
-        ),
-        execution_info=SimpleNamespace(thread_id="thread-a"),
+        state={"messages": list(messages or [])},
+        config={
+            "run_id": "run-a",
+            "configurable": {
+                "thread_id": "thread-a",
+                "langgraph_auth_user_id": "user-a",
+            },
+        },
+        tool_call_id=tool_call_id,
+        server_info=None,
     )
 
 
-@pytest.mark.asyncio
-async def test_new_user_gets_isolated_default_preferences() -> None:
-    store = InMemoryStore()
-    user_a = _runtime(store, "user-a")
-    user_b = _runtime(store, "user-b")
+class InMemoryMemoryQueue(memory.MemoryQueue):
+    def __init__(self) -> None:
+        super().__init__()
+        self.documents: dict[tuple[tuple[str, ...], str], dict] = {}
 
-    preferences = await memory.load_or_initialize_preferences(user_a)
+    async def _memory_documents(self, namespace, *, key_prefix=None):
+        return [
+            document
+            for (stored_namespace, key), document in self.documents.items()
+            if stored_namespace == namespace
+            and (key_prefix is None or key.startswith(key_prefix))
+        ]
 
-    assert preferences == memory.UserPreferences()
-    assert await store.aget(memory.user_preferences_namespace(user_a), "/preferences.md")
-    assert await store.aget(memory.user_preferences_namespace(user_b), "/preferences.md") is None
+    async def _memory_document(self, namespace, key):
+        return self.documents.get((namespace, key))
+
+    async def _put_memory_file(self, namespace, key, value):
+        self.documents[(namespace, key)] = {
+            "namespace": list(namespace),
+            "namespace_str": "/".join(namespace),
+            "key": key,
+            "value": value,
+        }
+
+    async def _delete_memory_file(self, namespace, key):
+        self.documents.pop((namespace, key), None)
 
 
-@pytest.mark.asyncio
-async def test_preference_update_merges_only_latest_patch(monkeypatch) -> None:
-    store = InMemoryStore()
-    runtime = _runtime(store)
+def _lesson(title: str = "查询前未确认字段类型") -> memory.FailureLesson:
+    return memory.FailureLesson(
+        title=title,
+        applicability="数据库字段类型可能与查询条件不一致时",
+        symptom="只读 SQL 查询因类型不匹配而执行失败",
+        cause="查询前没有读取表结构，直接使用了不兼容的比较条件",
+        remedy="先读取对象详情确认字段类型，再构造类型匹配的只读查询",
+        verification="预览查询成功并返回符合预期的列",
+        boundary="只适用于数据库字段类型尚未确认的场景",
+        tags=["postgresql", "schema"],
+    )
 
-    async def extract_patch(**_kwargs) -> memory.PreferencePatch:
-        return memory.PreferencePatch(
-            preferred_currency="usd",
-            recent_suppliers=["供应商 A"],
-            recent_queries=["服务器采购比价"],
+
+def _record(
+    agent: memory.AgentName = "data-analyst",
+    *,
+    title: str = "查询前未确认字段类型",
+    count: int = 1,
+    timestamp: str = "2026-08-01T00:00:00+00:00",
+) -> memory.StoredFailure:
+    lesson = _lesson(title)
+    return memory.StoredFailure(
+        lesson_id=memory._failure_id(lesson),
+        agent=agent,
+        lesson=lesson,
+        count=count,
+        created_at=timestamp,
+        last_seen=timestamp,
+        source_fingerprints=[memory._failure_fingerprint(title)],
+    )
+
+
+def test_memory_namespaces_are_isolated() -> None:
+    runtime = _runtime()
+
+    user_namespace = memory.user_memory_namespace(runtime)
+    assert user_namespace[1:] == ("memories", "user")
+    assert memory.failure_memory_namespace("supervisor") == (
+        "public",
+        "memories",
+        "supervisor",
+    )
+    assert memory.failure_memory_namespace("data-analyst") != (
+        "public",
+        "memories",
+        "crawl-worker",
+    )
+
+
+def test_user_memory_round_trip_uses_null_defaults_and_new_fields() -> None:
+    source = memory.UserMemory(
+        updated_at="2026-08-13T00:00:00+00:00",
+        preferences=memory.UserPreferences(preferred_currency="usd"),
+        avoid_behaviors=["不要重复委派", "不要重复委派"],
+        reinforce_behaviors=["继续生成 PDF"],
+    )
+
+    content = memory._render_user_memory(source)
+    restored = memory._parse_user_memory(content)
+
+    assert restored.preferences.preferred_currency == "USD"
+    assert restored.preferences.preferred_output is None
+    assert restored.avoid_behaviors == ["不要重复委派"]
+    assert "recent_suppliers" not in content
+    assert "recent_queries" not in content
+
+
+def test_invalid_or_old_user_memory_is_treated_as_empty() -> None:
+    old = "# 用户偏好\n```yaml\npreferred_currency: USD\nrecent_queries: [x]\n```"
+
+    assert memory._parse_user_memory(old) == memory.UserMemory()
+
+
+def test_user_patch_updates_clears_and_resolves_behavior_conflicts() -> None:
+    current = memory.UserMemory(
+        updated_at="old",
+        preferences=memory.UserPreferences(
+            preferred_output="chart",
+            preferred_currency="USD",
+        ),
+        avoid_behaviors=["不要使用饼图", "不要重复委派"],
+        reinforce_behaviors=["继续生成 PDF"],
+    )
+    patch = memory.UserMemoryPatch(
+        action="update",
+        preference_updates=[
+            memory.PreferenceUpdate(field="preferred_output", value=None),
+            memory.PreferenceUpdate(field="preferred_language", value="zh"),
+        ],
+        add_avoid=["不要生成冗长报告"],
+        remove_avoid=["不要重复委派"],
+        add_reinforce=["不要使用饼图", "继续提供 ZIP"],
+        remove_reinforce=["继续生成 PDF"],
+    )
+
+    updated = memory._apply_user_patch(current, patch)
+
+    assert updated.preferences.preferred_output is None
+    assert updated.preferences.preferred_currency == "USD"
+    assert updated.preferences.preferred_language == "zh"
+    assert updated.avoid_behaviors == ["不要生成冗长报告"]
+    assert updated.reinforce_behaviors == ["不要使用饼图", "继续提供 ZIP"]
+    assert updated.updated_at != "old"
+
+
+def test_user_patch_drops_behavior_text_that_still_contains_sensitive_data() -> None:
+    updated = memory._apply_user_patch(
+        memory.UserMemory(),
+        memory.UserMemoryPatch(
+            action="update",
+            add_avoid=["不要访问 https://example.com", "不要重复委派"],
+            add_reinforce=["继续读取 /workspace/private.csv"],
+        ),
+    )
+
+    assert updated.avoid_behaviors == ["不要重复委派"]
+    assert updated.reinforce_behaviors == []
+
+
+def test_user_patch_rejects_unknown_and_invalid_fields() -> None:
+    with pytest.raises(ValidationError):
+        memory.UserMemoryPatch.model_validate({"action": "update", "unknown": 1})
+    with pytest.raises(ValidationError):
+        memory.PreferenceUpdate(field="preferred_currency", value="US")
+    bounded = memory.UserMemory(avoid_behaviors=[str(index) for index in range(21)])
+    assert len(bounded.avoid_behaviors) == 20
+    with pytest.raises(ValidationError):
+        memory.UserMemoryPatch(
+            action="update",
+            preference_updates=[
+                memory.PreferenceUpdate(field="preferred_language", value="zh"),
+                memory.PreferenceUpdate(field="preferred_language", value="en"),
+            ],
         )
 
-    monkeypatch.setattr(memory, "_extract_preference_patch", extract_patch)
-    middleware = memory.UserPreferenceUpdateMiddleware()
-    await middleware.aafter_agent(
-        {
-            "messages": [
-                HumanMessage(content="以后用美元，比较供应商 A 的服务器报价"),
-                AIMessage(content="已按美元整理。"),
-            ]
-        },
-        runtime,
+
+def test_capture_evidence_uses_visible_user_and_previous_assistant() -> None:
+    messages = [
+        HumanMessage(content="先前问题"),
+        AIMessage(content="上一条实际回复"),
+        HumanMessage(content="内部续跑", name="async-task-monitor"),
+        AIMessage(content="内部状态"),
+        HumanMessage(content="以后不要重复委派"),
+        AIMessage(content="", tool_calls=[]),
+    ]
+
+    user_message, previous_assistant = memory._capture_user_evidence(
+        {"messages": messages}
     )
 
-    updated = await memory.load_or_initialize_preferences(runtime)
-    assert updated.preferred_currency == "USD"
-    assert updated.recent_suppliers == ["供应商 A"]
-    assert updated.recent_queries == ["服务器采购比价"]
-    assert updated.preferred_chart_type == "bar"
+    assert user_message == "以后不要重复委派"
+    assert previous_assistant == "上一条实际回复"
 
 
 @pytest.mark.asyncio
-async def test_preference_workflow_keeps_existing_data_when_extraction_fails(
-    monkeypatch,
-) -> None:
-    store = InMemoryStore()
-    runtime = _runtime(store)
-    original = memory.UserPreferences(preferred_currency="USD")
-    await memory.save_preferences(runtime, original)
+async def test_capture_user_memory_enqueues_without_model_wait(monkeypatch) -> None:
+    calls: list[dict] = []
 
-    async def invalid_extraction(**_kwargs):
-        raise ValidationError.from_exception_data("PreferencePatch", [])
+    class Queue:
+        async def enqueue(self, **kwargs):
+            calls.append(kwargs)
+            return True
 
-    monkeypatch.setattr(memory, "_extract_preference_patch", invalid_extraction)
-    await memory.UserPreferenceUpdateMiddleware().aafter_agent(
-        {
-            "messages": [
-                HumanMessage(content="以后都用欧元"),
-                AIMessage(content="好的。"),
-            ]
-        },
-        runtime,
+    monkeypatch.setattr(memory, "MEMORY_QUEUE", Queue())
+    runtime = _runtime(
+        [
+            HumanMessage(content="生成了三个委派"),
+            AIMessage(content="这是上一条回复"),
+            HumanMessage(content="以后同一数据任务只委派一次"),
+        ]
     )
 
-    assert await memory.load_or_initialize_preferences(runtime) == original
+    result = await memory.capture_user_memory.coroutine(runtime=runtime)
+
+    assert result.status == "success"
+    assert calls[0]["kind"] == "user_memory"
+    assert len(calls[0]["scope"]) == 64
+    assert calls[0]["payload"] == {
+        "user_message": "以后同一数据任务只委派一次",
+        "previous_assistant": "这是上一条回复",
+    }
+    assert len(calls[0]["idempotency_key"]) == 64
 
 
 @pytest.mark.asyncio
-async def test_preference_extractor_detaches_internal_model_callbacks(monkeypatch) -> None:
-    captured: dict[str, object] = {}
+async def test_failure_tool_requires_and_redacts_tool_evidence(monkeypatch) -> None:
+    calls: list[dict] = []
 
-    class StructuredModel:
-        async def ainvoke(self, _prompt, config=None):
-            captured.update(config or {})
-            return memory.PreferenceExtraction(
-                should_update=False,
-                changes=memory.PreferencePatch(),
-            )
+    class Queue:
+        async def enqueue(self, **kwargs):
+            calls.append(kwargs)
+            return True
 
-    class MemoryModel:
-        def with_structured_output(self, schema, *, method):
-            assert schema is memory.PreferenceExtraction
-            assert method == "json_mode"
-            return StructuredModel()
+    monkeypatch.setattr(memory, "MEMORY_QUEUE", Queue())
+    no_evidence = await memory.DATA_ANALYST_FAILURE_TOOL.coroutine(
+        content="查询失败是因为字段类型不匹配，读取结构后修复并验证成功",
+        runtime=_runtime([HumanMessage(content="分析数据库")]),
+    )
+    assert no_evidence.status == "error"
+    assert calls == []
 
-    monkeypatch.setattr(memory, "create_memory_model", lambda: MemoryModel())
-    patch = await memory._extract_preference_patch(
-        user_message="你好",
-        final_answer="你好。",
-        current=memory.UserPreferences(),
+    runtime = _runtime(
+        [
+            HumanMessage(content="分析数据库"),
+            ToolMessage(
+                content="https://example.com /workspace/a.sql token=secret123 查询类型错误",
+                tool_call_id="query-a",
+                name="database_query_preview",
+                status="error",
+            ),
+        ]
+    )
+    result = await memory.DATA_ANALYST_FAILURE_TOOL.coroutine(
+        content="查询失败是因为字段类型不匹配，读取结构后修复并验证成功",
+        runtime=runtime,
     )
 
-    assert patch == memory.PreferencePatch()
-    assert captured["callbacks"] == []
-    assert "memory-internal" in captured["tags"]
-
-
-def test_preference_patch_rejects_unknown_or_invalid_fields() -> None:
-    with pytest.raises(ValidationError):
-        memory.PreferencePatch.model_validate({"unknown": "value"})
-    with pytest.raises(ValidationError):
-        memory.PreferencePatch(preferred_currency="人民币")
-
-
-def test_preference_workflow_has_explicit_validation_branches() -> None:
-    nodes = set(memory.PREFERENCE_UPDATE_GRAPH.get_graph().nodes)
-
-    assert {"load", "extract", "merge", "save"} <= nodes
+    assert result.status == "success"
+    assert calls[0]["kind"] == "failure_lesson"
+    assert calls[0]["scope"] == "data-analyst"
+    assert "user-a" not in str(calls[0])
+    assert "example.com" not in str(calls[0]["payload"])
+    assert "/workspace/" not in str(calls[0]["payload"])
+    assert "secret123" not in str(calls[0]["payload"])
 
 
 @pytest.mark.asyncio
-async def test_memory_refresh_overwrites_checkpoint_cached_contents() -> None:
+async def test_memory_refresh_replaces_checkpoint_cached_contents() -> None:
     class Backend:
         async def adownload_files(self, paths):
             return [
-                SimpleNamespace(
-                    error=None,
-                    content=f"fresh:{path}".encode(),
-                )
+                SimpleNamespace(error=None, content=f"fresh:{path}".encode())
                 for path in paths
             ]
 
+    sources = [memory.USER_MEMORY_PATH, memory.agent_memory_path("supervisor")]
     middleware = memory.MemoryRefreshMiddleware(
         backend_factory=lambda _runtime: Backend(),
-        sources=[memory.AGENT_MEMORY_PATHS["supervisor"]],
+        sources=sources,
     )
+
     update = await middleware.abefore_agent(
-        {"memory_contents": {"old": "stale"}},
+        {"memory_contents": {sources[0]: "stale"}},
         SimpleNamespace(),
         {},
     )
 
     assert update == {
         "memory_contents": {
-            memory.AGENT_MEMORY_PATHS["supervisor"]: (
-                "fresh:/memories/agent/supervisor.md"
-            )
+            sources[0]: f"fresh:{sources[0]}",
+            sources[1]: f"fresh:{sources[1]}",
         }
     }
-    assert "不得调用 write_file 或 edit_file" in middleware.system_prompt
 
 
 @pytest.mark.asyncio
-async def test_async_task_forwarding_adds_preferences_once() -> None:
-    class Request:
-        def __init__(self, tool_call, state):
-            self.tool = SimpleNamespace(name=tool_call["name"])
-            self.tool_call = tool_call
-            self.state = state
-
-        def override(self, *, tool_call):
-            return Request(tool_call, self.state)
-
-    state = {
-        "memory_contents": {
-            memory.USER_PREFERENCES_PATH: "preferred_currency: CNY",
-        }
-    }
-    request = Request(
-        {
+async def test_async_bridge_does_not_copy_user_memory_into_task() -> None:
+    request = SimpleNamespace(
+        tool=SimpleNamespace(name="start_async_task"),
+        tool_call={
             "name": "start_async_task",
-            "args": {
-                "description": "搜索服务器报价",
-                "subagent_type": "crawl-worker",
-            },
+            "args": {"subagent_type": "crawl-worker", "description": "采集文档"},
         },
-        state,
+        state={"memory_contents": {memory.USER_MEMORY_PATH: "secret preference"}},
     )
-    seen: list[str] = []
+    seen: list[object] = []
 
-    async def handler(modified):
-        seen.append(modified.tool_call["args"]["description"])
+    async def handler(value):
+        seen.append(value)
         return "ok"
 
-    middleware = memory.AsyncTaskBridgeMiddleware()
-    assert await middleware.awrap_tool_call(request, handler) == "ok"
-    assert seen[0].count("<user_preferences>") == 1
-    assert "preferred_currency: CNY" in seen[0]
+    result = await memory.AsyncTaskBridgeMiddleware().awrap_tool_call(request, handler)
+
+    assert result == "ok"
+    assert seen == [request]
+    assert seen[0].tool_call["args"]["description"] == "采集文档"
 
 
-def test_async_task_bridge_parses_structured_child_result() -> None:
-    child_result = {
-        "status": "success",
-        "summary": "采集完成",
-        "artifacts": [],
-        "sources": [],
-        "warnings": [],
-    }
+def test_async_bridge_normalizes_completed_child_json() -> None:
     outer = {
         "status": "success",
-        "thread_id": "child-thread",
-        "result": json.dumps(child_result, ensure_ascii=False),
+        "result": json.dumps(
+            {
+                "status": "success",
+                "summary": "done",
+                "artifacts": [],
+                "sources": [],
+                "warnings": [],
+            }
+        ),
     }
     response = Command(
         update={
             "messages": [
                 ToolMessage(
-                    content=json.dumps(outer, ensure_ascii=False),
-                    tool_call_id="call-check",
+                    content=json.dumps(outer),
+                    tool_call_id="check-a",
+                    name="check_async_task",
                 )
-            ],
-            "async_tasks": {},
-        }
-    )
-
-    normalized = memory.AsyncTaskBridgeMiddleware._normalize_check_response(
-        response
-    )
-    payload = json.loads(normalized.update["messages"][0].content)
-
-    assert payload["result"] == child_result
-
-
-def test_experience_payload_is_bounded_and_redacted() -> None:
-    payload = memory._experience_payload(
-        {
-            "messages": [
-                HumanMessage(content="访问 https://example.com，密钥 sk-secret123456"),
-                ToolMessage(
-                    content="Bearer abc.secret.token 请求失败 https://example.com/a",
-                    tool_call_id="call-a",
-                    name="tavily_search",
-                    status="error",
-                ),
-                AIMessage(content="网页搜索失败，稍后重试。"),
             ]
         }
     )
 
-    encoded = str(payload)
-    assert payload is not None
-    assert "example.com" not in encoded
-    assert "sk-secret" not in encoded
-    assert "Bearer" not in encoded
-    assert payload["tools"][0]["status"] == "error"
-
-
-def test_read_only_file_tools_do_not_enqueue_experience() -> None:
-    payload = memory._experience_payload(
-        {
-            "messages": [
-                HumanMessage(content="我的偏好是什么"),
-                ToolMessage(
-                    content="preferred_currency: USD",
-                    tool_call_id="call-read",
-                    name="read_file",
-                    status="success",
-                ),
-                ToolMessage(
-                    content="/memories/user/preferences.md",
-                    tool_call_id="call-list",
-                    name="ls",
-                    status="success",
-                ),
-                AIMessage(content="你偏好使用美元。"),
-            ]
-        }
-    )
-
-    assert payload is None
+    normalized = memory.AsyncTaskBridgeMiddleware._normalize_check_response(response)
+    content = json.loads(normalized.update["messages"][0].content)
+    assert content["result"]["summary"] == "done"
 
 
 @pytest.mark.asyncio
-async def test_experience_extractor_spells_out_fixed_json_fields(monkeypatch) -> None:
-    captured: dict[str, object] = {}
+async def test_structured_model_repairs_once_and_detaches_callbacks(monkeypatch) -> None:
+    calls: list[dict] = []
 
     class StructuredModel:
-        async def ainvoke(self, prompt):
-            captured["prompt"] = prompt
-            return memory.ExperiencePatch(entries=[])
+        async def ainvoke(self, prompt, config=None):
+            calls.append({"prompt": prompt, "config": config})
+            if len(calls) == 1:
+                raise OutputParserException("bad json")
+            return memory.UserMemoryPatch(action="discard")
 
-    class MemoryModel:
+    class Model:
         def with_structured_output(self, schema, *, method):
-            assert schema is memory.ExperiencePatch
+            assert schema is memory.UserMemoryPatch
             assert method == "json_mode"
             return StructuredModel()
 
-    def create_model(*, background=False):
-        captured["background"] = background
-        return MemoryModel()
-
-    monkeypatch.setattr(memory, "create_memory_model", create_model)
-    result = await memory._extract_experience_patch(
-        agent_name="supervisor",
-        payload={"user_signal": "test", "final_summary": "test", "tools": []},
-    )
-
-    assert result == memory.ExperiencePatch(entries=[])
-    assert captured["background"] is True
-    prompt = str(captured["prompt"])
-    assert '"kind": "success"' in prompt
-    assert '"lesson"' in prompt
-    assert '"action"' in prompt
-    assert "禁止使用 type、content" in prompt
-
-
-def test_memory_error_retry_classification_and_text() -> None:
-    assert memory._is_retryable_memory_error(TimeoutError()) is True
-    assert memory._is_retryable_memory_error(OutputParserException("bad json")) is False
-    assert memory._is_retryable_memory_error(ValueError("bad schema")) is False
-    assert memory._memory_error_text(TimeoutError()) == "TimeoutError"
-
-
-@pytest.mark.asyncio
-async def test_parser_failure_is_marked_non_retryable(monkeypatch) -> None:
-    queue = memory.MemoryQueue()
-    captured: dict[str, object] = {}
-
-    async def invalid_patch(**_kwargs):
-        raise OutputParserException("bad json")
-
-    async def mark_failed(job, error, *, retryable):
-        captured.update({"job": job, "error": error, "retryable": retryable})
-
-    monkeypatch.setattr(memory, "_extract_experience_patch", invalid_patch)
-    monkeypatch.setattr(queue, "_mark_failed", mark_failed)
     monkeypatch.setattr(
         memory,
-        "get_settings",
-        lambda: SimpleNamespace(memory_experience_timeout_seconds=30),
+        "create_memory_model",
+        lambda: Model(),
     )
-    job = {"_id": "job-a", "agent_name": "supervisor", "payload": {}}
 
-    await queue._process_job(job)
+    result = await memory._extract_user_memory_patch(
+        current=memory.UserMemory(),
+        user_message="本轮只导出 CSV",
+        previous_assistant="",
+    )
 
-    assert captured["job"] == job
-    assert isinstance(captured["error"], OutputParserException)
-    assert captured["retryable"] is False
+    assert result.action == "discard"
+    assert len(calls) == 2
+    assert calls[0]["config"]["callbacks"] == []
+    assert "memory-internal" in calls[0]["config"]["tags"]
+    assert '"action": "update"' in calls[0]["prompt"]
+    assert '"action": "discard"' in calls[0]["prompt"]
+    assert '"field": "preferred_currency", "value": "CNY"' in calls[0]["prompt"]
+    assert "禁止返回 schema_version" in calls[0]["prompt"]
+    assert "上一输出未通过" in calls[1]["prompt"]
 
 
 @pytest.mark.asyncio
-async def test_non_retryable_failure_skips_retry_state(monkeypatch) -> None:
+async def test_user_memory_job_writes_only_when_patch_changes(monkeypatch) -> None:
+    queue = InMemoryMemoryQueue()
+    identity_hash = "a" * 64
+
+    async def extract(**_kwargs):
+        return memory.UserMemoryPatch(
+            action="update",
+            preference_updates=[
+                memory.PreferenceUpdate(field="preferred_language", value="zh")
+            ],
+            add_avoid=["不要重复委派"],
+        )
+
+    monkeypatch.setattr(memory, "_extract_user_memory_patch", extract)
+    await queue._process_user_memory(
+        {
+            "scope": identity_hash,
+            "payload": {"user_message": "以后不要重复委派"},
+        }
+    )
+
+    namespace = memory.user_memory_namespace_from_hash(identity_hash)
+    document = queue.documents[(namespace, "/MEMORY.md")]
+    restored = memory._parse_user_memory(document["value"]["content"])
+    assert restored.preferences.preferred_language == "zh"
+    assert restored.avoid_behaviors == ["不要重复委派"]
+
+
+@pytest.mark.asyncio
+async def test_failure_job_adds_then_exactly_deduplicates(monkeypatch) -> None:
+    queue = InMemoryMemoryQueue()
+    calls = 0
+
+    async def decide(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return memory.FailureDecision(action="add", lesson=_lesson())
+
+    monkeypatch.setattr(memory, "_extract_failure_decision", decide)
+    job = {
+        "scope": "data-analyst",
+        "payload": {
+            "content": "字段类型不匹配；读取表结构后改正查询并验证成功",
+            "evidence": [{"name": "database_query_preview", "status": "error"}],
+        },
+    }
+
+    await queue._process_failure_lesson(job)
+    await queue._process_failure_lesson(job)
+
+    records = await queue._active_failures("data-analyst")
+    assert calls == 1
+    assert len(records) == 1
+    assert records[0].count == 2
+    namespace = memory.failure_memory_namespace("data-analyst")
+    index = queue.documents[(namespace, "/MEMORY.md")]["value"]["content"]
+    assert records[0].lesson_id in index
+    assert f"/pitfalls/{records[0].lesson_id}.md" in index
+    detail = queue.documents[
+        (namespace, f"/pitfalls/{records[0].lesson_id}.md")
+    ]["value"]["content"]
+    assert "## 已确认原因" in detail
+    assert "## 验证方式" in detail
+
+
+@pytest.mark.asyncio
+async def test_failure_job_semantically_merges_existing_target(monkeypatch) -> None:
+    queue = InMemoryMemoryQueue()
+    existing = _record(count=2)
+    await queue._put_failure(existing)
+
+    merged_lesson = _lesson("查询前必须读取字段类型")
+
+    async def decide(**_kwargs):
+        return memory.FailureDecision(
+            action="merge",
+            merge_target_id=existing.lesson_id,
+            lesson=merged_lesson,
+        )
+
+    monkeypatch.setattr(memory, "_extract_failure_decision", decide)
+    await queue._process_failure_lesson(
+        {
+            "scope": "data-analyst",
+            "payload": {
+                "content": "另一次类型不匹配，读取 schema 后修复并验证",
+                "evidence": [{"name": "database_get_object_details", "status": "success"}],
+            },
+        }
+    )
+
+    records = await queue._active_failures("data-analyst")
+    assert len(records) == 1
+    assert records[0].lesson_id == existing.lesson_id
+    assert records[0].lesson.title == "查询前必须读取字段类型"
+    assert records[0].count == 3
+
+
+@pytest.mark.asyncio
+async def test_failure_job_discards_model_output_with_sensitive_text(monkeypatch) -> None:
+    queue = InMemoryMemoryQueue()
+    unsafe = _lesson().model_copy(
+        update={"remedy": "读取 /workspace/private.sql 后重试并验证查询结果"}
+    )
+
+    async def decide(**_kwargs):
+        return memory.FailureDecision(action="add", lesson=unsafe)
+
+    monkeypatch.setattr(memory, "_extract_failure_decision", decide)
+    await queue._process_failure_lesson(
+        {
+            "scope": "data-analyst",
+            "payload": {
+                "content": "字段类型不匹配，读取结构后修复",
+                "evidence": [{"name": "database_query_preview", "status": "error"}],
+            },
+        }
+    )
+
+    assert await queue._active_failures("data-analyst") == []
+
+
+@pytest.mark.asyncio
+async def test_capacity_archives_low_frequency_oldest(monkeypatch) -> None:
+    queue = InMemoryMemoryQueue()
+    old = _record(title="旧的低频失败经验", timestamp="2026-01-01T00:00:00+00:00")
+    recent = _record(
+        title="最近发生的失败经验",
+        timestamp="2026-08-01T00:00:00+00:00",
+    )
+    await queue._put_failure(old)
+    await queue._put_failure(recent)
+    monkeypatch.setattr(memory, "MAX_ACTIVE_FAILURES", 1)
+
+    await queue._enforce_failure_capacity("data-analyst")
+    await queue._rebuild_failure_index("data-analyst")
+
+    namespace = memory.failure_memory_namespace("data-analyst")
+    assert (namespace, f"/pitfalls/{old.lesson_id}.md") not in queue.documents
+    assert (namespace, f"/archive/{old.lesson_id}.md") in queue.documents
+    index = queue.documents[(namespace, "/MEMORY.md")]["value"]["content"]
+    assert old.lesson_id not in index
+    assert recent.lesson_id in index
+
+
+def test_memory_error_retry_classification() -> None:
+    assert memory._is_retryable_memory_error(TimeoutError()) is True
+    assert memory._is_retryable_memory_error(OutputParserException("bad")) is False
+    assert memory._is_retryable_memory_error(ValueError("bad")) is False
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_job_failure_preserves_terminal_state(monkeypatch) -> None:
     updates: list[tuple[dict, dict]] = []
 
     class Jobs:
@@ -365,7 +564,7 @@ async def test_non_retryable_failure_skips_retry_state(monkeypatch) -> None:
     queue = memory.MemoryQueue()
 
     async def collections():
-        return Jobs(), SimpleNamespace()
+        return Jobs(), SimpleNamespace(), SimpleNamespace()
 
     monkeypatch.setattr(queue, "_collections", collections)
     await queue._mark_failed(
@@ -376,26 +575,10 @@ async def test_non_retryable_failure_skips_retry_state(monkeypatch) -> None:
 
     update = updates[0][1]["$set"]
     assert update["status"] == "failed"
-    assert update["last_error"].startswith("OutputParserException:")
     assert "expires_at" in update
 
 
-@pytest.mark.asyncio
-async def test_shared_experience_is_deduplicated_and_persisted(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    monkeypatch.setattr(memory, "AGENT_MEMORY_ROOT", tmp_path)
-    entry = memory.ExperienceEntry(
-        kind="pitfall",
-        lesson="同步 SDK 调用会阻塞异步请求事件循环",
-        action="使用 asyncio.to_thread 包装阻塞调用并设置超时",
-    )
-
-    assert await memory.persist_experience_entries("supervisor", [entry]) == 1
-    assert await memory.persist_experience_entries("supervisor", [entry]) == 1
-
-    content = (tmp_path / "supervisor.md").read_text("utf-8")
-    assert "出现 2 次" in content
-    assert "同步 SDK 调用" in content
-    assert "memory-data" in content
+def test_legacy_automatic_middlewares_are_removed() -> None:
+    assert not hasattr(memory, "UserPreferenceUpdateMiddleware")
+    assert not hasattr(memory, "AgentExperienceEnqueueMiddleware")
+    assert not hasattr(memory, "PREFERENCE_UPDATE_GRAPH")

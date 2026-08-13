@@ -535,7 +535,7 @@ def test_worker_backend_uses_sandbox_as_default(tmp_path, monkeypatch) -> None:
     assert isinstance(backend.default, OpensandboxBackend)
     assert set(backend.routes) == {
         "/state/",
-        "/memories/agent/",
+        "/memories/agent/crawl-worker/",
         "/memories/user/",
         "/skills/public/crawl-worker/",
         "/skills/user/crawl-worker/",

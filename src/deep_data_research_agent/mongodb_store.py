@@ -30,11 +30,11 @@ from deep_data_research_agent.skill_storage import (
 
 
 class NamespaceRoutedStore(BaseStore):
-    """Route preference namespaces to a dedicated Store collection."""
+    """Route all memory namespaces to the dedicated memory collection."""
 
-    def __init__(self, *, default: BaseStore, preferences: BaseStore) -> None:
+    def __init__(self, *, default: BaseStore, memories: BaseStore) -> None:
         self._default = default
-        self._preferences = preferences
+        self._memories = memories
 
     @staticmethod
     def _namespace(op: Op) -> tuple[str, ...] | None:
@@ -45,22 +45,22 @@ class NamespaceRoutedStore(BaseStore):
         return None
 
     @staticmethod
-    def _is_preferences_namespace(namespace: tuple[str, ...]) -> bool:
-        # Current namespaces are: (user_hash, "memories", "preferences").
+    def _is_memory_namespace(namespace: tuple[str, ...]) -> bool:
+        # User and public Agent memories both use "memories" as component two.
         return len(namespace) >= 2 and namespace[1] == "memories"
 
     def _store_for(self, op: Op) -> BaseStore | None:
         namespace = self._namespace(op)
         if namespace is not None:
-            return self._preferences if self._is_preferences_namespace(namespace) else self._default
+            return self._memories if self._is_memory_namespace(namespace) else self._default
         if isinstance(op, ListNamespacesOp) and op.match_conditions:
             prefixes = [
                 tuple(condition.path)
                 for condition in op.match_conditions
                 if condition.match_type == "prefix"
             ]
-            if prefixes and all(self._is_preferences_namespace(path) for path in prefixes):
-                return self._preferences
+            if prefixes and all(self._is_memory_namespace(path) for path in prefixes):
+                return self._memories
             if prefixes and all(
                 len(path) >= 2 and path[1] != "memories"
                 for path in prefixes
@@ -95,7 +95,7 @@ class NamespaceRoutedStore(BaseStore):
                 self._merge_namespace_results(
                     op,
                     self._default.batch([expanded])[0],
-                    self._preferences.batch([expanded])[0],
+                    self._memories.batch([expanded])[0],
                 )
             )
         return results
@@ -110,37 +110,11 @@ class NamespaceRoutedStore(BaseStore):
             expanded = self._expanded_list_op(op)
             first, second = await asyncio.gather(
                 self._default.abatch([expanded]),
-                self._preferences.abatch([expanded]),
+                self._memories.abatch([expanded]),
             )
             return self._merge_namespace_results(op, first[0], second[0])
 
         return list(await asyncio.gather(*(run(op) for op in ops)))
-
-
-def _migrate_preferences(
-    skill_store: MongoDBStore,
-    preferences_store: MongoDBStore,
-) -> int:
-    """Move legacy preference documents without overwriting newer target data."""
-
-    migrated = 0
-    legacy_documents = skill_store.collection.find(
-        {"namespace.1": "memories", "namespace.2": "preferences"}
-    )
-    for document in legacy_documents:
-        source_id = document.pop("_id")
-        preferences_store.collection.update_one(
-            {
-                "namespace_str": document["namespace_str"],
-                "key": document["key"],
-            },
-            {"$setOnInsert": document},
-            upsert=True,
-        )
-        # Deleting only after the target write makes an interrupted migration resumable.
-        skill_store.collection.delete_one({"_id": source_id})
-        migrated += 1
-    return migrated
 
 
 def _search_all(store: BaseStore, namespace: tuple[str, ...]) -> list[Any]:
@@ -323,14 +297,14 @@ def _sync_public_skills(skill_store: BaseStore) -> dict[str, int]:
 
 @contextmanager
 def create_mongodb_store() -> Iterator[NamespaceRoutedStore]:
-    """Create one logical Store backed by separate Skill and preference collections."""
+    """Create one logical Store backed by separate Skill and memory collections."""
 
     settings = get_settings()
     if not settings.mongodb_uri.strip():
         raise RuntimeError("MONGODB_URI 未配置，无法初始化用户 Skill Store")
 
-    if settings.mongodb_skill_collection == settings.mongodb_user_preferences_collection:
-        raise RuntimeError("Skill 和用户偏好必须配置为不同的 MongoDB collection")
+    if settings.mongodb_skill_collection == settings.mongodb_memory_collection:
+        raise RuntimeError("Skill 和长期记忆必须配置为不同的 MongoDB collection")
 
     with MongoDBStore.from_conn_string(
         conn_string=settings.mongodb_uri,
@@ -339,12 +313,11 @@ def create_mongodb_store() -> Iterator[NamespaceRoutedStore]:
     ) as skill_store, MongoDBStore.from_conn_string(
         conn_string=settings.mongodb_uri,
         db_name=settings.mongodb_database,
-        collection_name=settings.mongodb_user_preferences_collection,
-    ) as preferences_store:
-        _migrate_preferences(skill_store, preferences_store)
+        collection_name=settings.mongodb_memory_collection,
+    ) as memory_store:
         _migrate_legacy_skill_namespaces(skill_store)
         _sync_public_skills(skill_store)
         yield NamespaceRoutedStore(
             default=skill_store,
-            preferences=preferences_store,
+            memories=memory_store,
         )

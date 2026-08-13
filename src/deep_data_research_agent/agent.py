@@ -11,12 +11,12 @@ from deep_data_research_agent.config import create_chat_model
 from deep_data_research_agent.database_tools import DATABASE_TOOLS
 from deep_data_research_agent.interaction_tools import INTERACTION_TOOLS
 from deep_data_research_agent.memory import (
-    AGENT_MEMORY_PATHS,
-    USER_PREFERENCES_PATH,
-    AgentExperienceEnqueueMiddleware,
+    DATA_ANALYST_FAILURE_TOOL,
+    SUPERVISOR_MEMORY_TOOLS,
+    USER_MEMORY_PATH,
     AsyncTaskBridgeMiddleware,
     MemoryRefreshMiddleware,
-    UserPreferenceUpdateMiddleware,
+    agent_memory_path,
 )
 from deep_data_research_agent.model_profile import register_mvp_profile
 from deep_data_research_agent.prompts import (
@@ -39,7 +39,7 @@ graph = create_deep_agent(
     name="supervisor",
     model=create_chat_model(),
     system_prompt=SUPERVISOR_PROMPT,
-    tools=[*ASSIGN_SKILL_TOOL, *INTERACTION_TOOLS],
+    tools=[*ASSIGN_SKILL_TOOL, *INTERACTION_TOOLS, *SUPERVISOR_MEMORY_TOOLS],
     subagents=[
         SubAgent(
             name="data-analyst",
@@ -50,12 +50,16 @@ graph = create_deep_agent(
                 "PNG 产物；信息不足时返回 needs_input。"
             ),
             system_prompt=DATA_ANALYST_PROMPT,
-            tools=DATABASE_TOOLS,
+            tools=[*DATABASE_TOOLS, DATA_ANALYST_FAILURE_TOOL],
             skills=[
                 f"{public_skill_root('data-analyst')}/",
                 f"{user_skill_root('data-analyst')}/",
             ],
             middleware=[
+                MemoryRefreshMiddleware(
+                    backend_factory=create_backend,
+                    sources=[USER_MEMORY_PATH, agent_memory_path("data-analyst")],
+                ),
                 MongoSkillsRestoreMiddleware(
                     component="supervisor",
                     agent_name="data-analyst",
@@ -73,8 +77,7 @@ graph = create_deep_agent(
         # prompt, while refreshing checkpoint-cached contents every run.
         MemoryRefreshMiddleware(
             backend_factory=create_backend,
-            sources=[AGENT_MEMORY_PATHS["supervisor"], USER_PREFERENCES_PATH],
-            initialize_preferences=True,
+            sources=[USER_MEMORY_PATH, agent_memory_path("supervisor")],
         ),
         MongoSkillsRestoreMiddleware(
             component="supervisor",
@@ -105,8 +108,6 @@ graph = create_deep_agent(
                 (f"{user_skill_root('supervisor')}/", "用户"),
             ],
         ),
-        AgentExperienceEnqueueMiddleware(agent_name="supervisor"),
-        UserPreferenceUpdateMiddleware(),
     ],
     backend=create_backend,
     permissions=FILESYSTEM_PERMISSIONS,

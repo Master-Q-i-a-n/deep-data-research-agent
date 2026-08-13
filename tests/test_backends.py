@@ -47,8 +47,9 @@ def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
     assert crawl.default is initialized_backends["crawl-worker"]
     assert set(supervisor.routes) == {
         "/state/",
-        "/memories/agent/",
         "/memories/user/",
+        "/memories/agent/supervisor/",
+        "/memories/agent/data-analyst/",
         "/skills/public/supervisor/",
         "/skills/user/supervisor/",
         "/skills/public/data-analyst/",
@@ -56,7 +57,7 @@ def test_agent_backends_use_component_sandbox(initialized_backends) -> None:
     }
     assert set(crawl.routes) == {
         "/state/",
-        "/memories/agent/",
+        "/memories/agent/crawl-worker/",
         "/memories/user/",
         "/skills/public/crawl-worker/",
         "/skills/user/crawl-worker/",
@@ -92,7 +93,15 @@ def test_agent_skill_routes_use_isolated_store_backends(initialized_backends) ->
         "skills",
         "data-analyst",
     )
-    assert "/memories/agent/" in backend.routes
+    assert backend.routes["/memories/agent/supervisor/"]._namespace(
+        _runtime("thread-a")
+    ) == ("public", "memories", "supervisor")
+    assert backend.routes["/memories/agent/data-analyst/"]._namespace(
+        _runtime("thread-a")
+    ) == ("public", "memories", "data-analyst")
+    assert backend.routes["/memories/user/"]._namespace(
+        _runtime("thread-a")
+    )[1:] == ("memories", "user")
     assert isinstance(backend.routes["/memories/user/"], StoreBackend)
 
 

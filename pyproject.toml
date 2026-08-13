@@ -52,6 +52,7 @@ dependencies = [
 
 [project.scripts]
 deep-data-research-agent = "deep_data_research_agent:main"
+reset-agent-memory = "deep_data_research_agent.reset_memory:main"
 
 [build-system]
 requires = ["uv_build>=0.11.32,<0.12.0"]
