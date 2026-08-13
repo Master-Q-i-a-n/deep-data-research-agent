@@ -131,7 +131,7 @@ describe("研究工作台", () => {
     expect((capturedOptions?.onFinish as ((state: unknown) => void)).length).toBe(1);
   });
 
-  it("简洁模式只显示当前轮问答，并可切换完整历史", () => {
+  it("简洁模式显示全部可见轮次且每轮只保留最终 AI 回复", () => {
     streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
     streamState.isLoading = true;
     streamState.messages = [
@@ -152,19 +152,21 @@ describe("研究工作台", () => {
 
     const view = render(<App />);
 
+    expect(screen.getByText("旧问题")).toBeTruthy();
+    expect(screen.getByText("旧回答")).toBeTruthy();
     expect(screen.getByText("当前问题")).toBeTruthy();
-    expect(screen.getByText(/先检查数据。[\s\S]*最终回答。/)).toBeTruthy();
-    expect(screen.queryByText("旧问题")).toBeNull();
+    expect(screen.getByText("最终回答。")).toBeTruthy();
+    expect(screen.queryByText("先检查数据。")).toBeNull();
     expect(screen.queryByText("内部续跑消息")).toBeNull();
     expect(screen.queryByText("分配 Skill")).toBeNull();
-    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(1);
+    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(2);
 
     streamState.messages = [
       ...streamState.messages.slice(0, -1),
       { id: "ai-current-2", type: "ai", content: "最终回答继续流式增长。" },
     ];
     view.rerender(<App />);
-    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(1);
+    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(2);
     expect(screen.getByText(/最终回答继续流式增长。/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "停止回答" }));
@@ -177,8 +179,88 @@ describe("研究工作台", () => {
     expect(screen.getByLabelText("研究执行状态")).toBeTruthy();
 
     enableDetailedMode();
-    expect(screen.queryByText("旧问题")).toBeNull();
+    expect(screen.getByText("旧问题")).toBeTruthy();
+    expect(screen.queryByText("先检查数据。")).toBeNull();
     expect(screen.queryByLabelText("研究执行状态")).toBeNull();
+  });
+
+  it("当前轮在同一个 AI 卡中显示流式文本与执行阶段", () => {
+    streamState.isLoading = true;
+    streamState.values.todos = [];
+    streamState.messages = [
+      { id: "human-live", type: "human", content: "分析数据库" },
+      {
+        id: "ai-task",
+        type: "ai",
+        content: "",
+        tool_calls: [{
+          id: "call-task",
+          name: "task",
+          args: { subagent_type: "data-analyst" },
+        }],
+      },
+    ];
+    const view = render(<App />);
+
+    expect(screen.getByText("正在调用 data-analyst…")).toBeTruthy();
+    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(1);
+
+    streamState.messages = [
+      ...streamState.messages,
+      { id: "tool-task", type: "tool", tool_call_id: "call-task", content: "done" },
+    ];
+    view.rerender(<App />);
+    expect(screen.getByText("正在整理工具结果…")).toBeTruthy();
+
+    streamState.messages = [{ id: "human-live", type: "human", content: "分析数据库" }];
+    streamState.values.todos = [{ content: "核验数据库结构", status: "in_progress" }];
+    view.rerender(<App />);
+    expect(screen.getByText("正在核验数据库结构…")).toBeTruthy();
+
+    streamState.values.todos = [];
+    view.rerender(<App />);
+    expect(screen.getByText("正在规划任务…")).toBeTruthy();
+
+    streamState.messages = [
+      { id: "human-live", type: "human", content: "分析数据库" },
+      { id: "ai-live", type: "ai", content: "正在形成最终结论" },
+    ];
+    view.rerender(<App />);
+    expect(screen.getByText("正在形成最终结论")).toBeTruthy();
+    expect(screen.getByText("生成中")).toBeTruthy();
+    expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(1);
+  });
+
+  it("排队消息只进入等待卡且不会替代当前执行轮次", () => {
+    streamState.isLoading = true;
+    streamState.values.todos = [];
+    streamState.messages = [
+      { id: "human-active", type: "human", content: "先分析当前数据" },
+      { id: "ai-active", type: "ai", content: "正在计算核心指标" },
+      { id: "human-queued", type: "human", content: "再增加区域对比" },
+    ];
+    streamState.queue.entries = [{
+      id: "queued-run-1",
+      values: { messages: [{ type: "human", content: "再增加区域对比" }] },
+      createdAt: new Date("2026-07-28T12:00:00Z"),
+    }];
+    streamState.queue.size = 1;
+
+    const view = render(<App />);
+
+    expect(screen.getByText("正在计算核心指标")).toBeTruthy();
+    expect(screen.getByText("再增加区域对比")).toBeTruthy();
+    expect(view.container.querySelectorAll(".compact-turn")).toHaveLength(1);
+  });
+
+  it("已结束但没有 AI 回复的轮次显示明确状态", () => {
+    streamState.values.todos = [];
+    streamState.messages = [{ id: "human-empty", type: "human", content: "未完成请求" }];
+
+    render(<App />);
+
+    expect(screen.getByText("本轮未产生最终回复。")).toBeTruthy();
+    expect(screen.getByText("未完成")).toBeTruthy();
   });
 
   it("详细模式选择不跨页面挂载持久化", () => {
@@ -660,7 +742,7 @@ describe("研究工作台", () => {
     render(<App />);
 
     expect(capturedOptions?.reconnectOnMount).toBe(true);
-    expect(capturedOptions?.throttle).toBe(60);
+    expect(capturedOptions?.throttle).toBe(false);
   });
 
   it("直接轮询后台任务状态而不启动 Supervisor run", async () => {

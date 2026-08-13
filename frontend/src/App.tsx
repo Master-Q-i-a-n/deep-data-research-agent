@@ -31,11 +31,29 @@ type Row =
   | { kind: "message"; key: string; role: "human" | "ai"; body: string; report: boolean }
   | { kind: "tool"; key: string; card: ToolCard };
 
-type CurrentTurn = {
+type CompactActivityKind = "planning" | "streaming" | "tool" | "todo" | "synthesizing" | "complete";
+type CompactActivity = {
+  kind: CompactActivityKind;
+  text: string;
+  statusLabel: string;
+};
+type CompactToolCall = {
+  id: string;
+  name: string;
+  args: unknown;
+  completed: boolean;
+};
+type CompactTurnData = {
   userKey: string;
   userBody: string;
+  assistantKey: string;
   assistantBody: string;
   assistantReport: boolean;
+  lastEvent: "none" | "monitor" | "ai-text" | "ai-tool" | "tool";
+  tools: CompactToolCall[];
+};
+type CompactTurn = CompactTurnData & {
+  activity: CompactActivity;
 };
 
 type SubmitMode = "enqueue" | "interrupt";
@@ -328,36 +346,154 @@ export function buildRows(messages: Message[]): Row[] {
   return rows;
 }
 
-function currentTurn(messages: Message[]): CurrentTurn | null {
-  let userIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
+export function buildCompactTurns(messages: Message[]): CompactTurnData[] {
+  const turns: CompactTurnData[] = [];
+  const toolOwners = new Map<string, CompactToolCall>();
+  let current: CompactTurnData | undefined;
+
+  for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
-    if (message?.type === "human" && message.name !== "async-task-monitor") {
-      userIndex = index;
-      break;
+    if (message.type === "human") {
+      if (message.name === "async-task-monitor") {
+        if (current) current.lastEvent = "monitor";
+        continue;
+      }
+      const userBody = messageText(message.content).trim();
+      if (!userBody) continue;
+      const userKey = message.id ?? `human-${index}`;
+      current = {
+        userKey,
+        userBody,
+        assistantKey: `assistant-${userKey}`,
+        assistantBody: "",
+        assistantReport: false,
+        lastEvent: "none",
+        tools: [],
+      };
+      turns.push(current);
+      continue;
+    }
+    if (!current) continue;
+
+    if (message.type === "ai") {
+      const body = messageText(message.content).trim();
+      if (body) {
+        // 简略历史只保留本轮最后一条非空 AI 回复，不合并中间说明。
+        current.assistantKey = message.id ?? `assistant-${current.userKey}-${index}`;
+        current.assistantBody = body;
+        current.assistantReport = isReport(body);
+      }
+      const calls = message.tool_calls ?? [];
+      current.lastEvent = calls.length > 0 ? "ai-tool" : body ? "ai-text" : current.lastEvent;
+      for (const call of calls) {
+        const toolCall: CompactToolCall = {
+          id: call.id ?? `${message.id ?? current.userKey}-${call.name ?? "tool"}-${index}`,
+          name: call.name ?? "tool",
+          args: call.args ?? {},
+          completed: false,
+        };
+        current.tools.push(toolCall);
+        toolOwners.set(toolCall.id, toolCall);
+      }
+      continue;
+    }
+
+    if (message.type === "tool") {
+      if (message.tool_call_id) {
+        const owner = toolOwners.get(message.tool_call_id);
+        if (owner) owner.completed = true;
+      }
+      current.lastEvent = "tool";
     }
   }
-  if (userIndex < 0) return null;
 
-  const userMessage = messages[userIndex];
-  const userBody = messageText(userMessage.content).trim();
-  if (!userBody) return null;
+  return turns;
+}
 
-  // 一个可见用户请求可能被内部监控消息续跑；把该请求之后的 Supervisor
-  // 文本合并到同一个输出框，但不把工具和子智能体消息带入轻量视图。
-  const assistantBody = messages
-    .slice(userIndex + 1)
-    .filter((message) => message.type === "ai")
-    .map((message) => messageText(message.content).trim())
-    .filter(Boolean)
-    .join("\n\n");
+function withoutQueuedTurns(turns: CompactTurnData[], queuedBodies: string[]): CompactTurnData[] {
+  if (queuedBodies.length === 0 || turns.length === 0) return turns;
+  const visible = [...turns];
+  // enqueue 的 optimisticValues 可能把等待消息临时放进主状态；尾部精确匹配后
+  // 交给现有队列卡展示，避免把它误判成当前正在执行的轮次。
+  for (let index = queuedBodies.length - 1; index >= 0; index -= 1) {
+    if (visible.at(-1)?.userBody !== queuedBodies[index]) break;
+    visible.pop();
+  }
+  return visible;
+}
 
-  return {
-    userKey: userMessage.id ?? `human-${userIndex}`,
-    userBody,
-    assistantBody,
-    assistantReport: isReport(assistantBody),
+function compactToolActivity(toolCall: CompactToolCall): string {
+  const args = typeof toolCall.args === "object" && toolCall.args !== null
+    ? toolCall.args as Record<string, unknown>
+    : {};
+  if (toolCall.name === "task") {
+    const agent = typeof args.subagent_type === "string" ? args.subagent_type : "同步子智能体";
+    return `正在调用 ${agent}…`;
+  }
+  if (toolCall.name === "start_async_task") {
+    const agent = typeof args.subagent_type === "string" ? args.subagent_type : "后台智能体";
+    return `正在启动 ${agent}…`;
+  }
+  const labels: Record<string, string> = {
+    write_todos: "正在更新研究计划…",
+    read_file: "正在读取研究产物…",
+    write_file: "正在写入研究产物…",
+    edit_file: "正在编辑研究产物…",
+    execute: "正在执行分析脚本…",
+    database_list_schemas: "正在读取数据库结构…",
+    database_list_objects: "正在读取数据库对象…",
+    database_get_object_details: "正在检查数据库字段…",
+    database_query_preview: "正在查询数据库…",
+    database_query_to_file: "正在导出数据库结果…",
+    tavily_search: "正在搜索网页…",
+    tavily_crawl: "正在采集网页…",
+    tavily_extract: "正在提取网页内容…",
+    request_report_download: "正在准备报告下载…",
   };
+  return labels[toolCall.name] ?? `正在执行 ${toolCall.name}…`;
+}
+
+function compactActivity(
+  turn: CompactTurnData,
+  options: {
+    active: boolean;
+    latest: boolean;
+    todos: TodoItem[];
+    interrupted: boolean;
+    failed: boolean;
+  },
+): CompactActivity {
+  if (!options.active) {
+    if (turn.assistantBody) return { kind: "complete", text: turn.assistantBody, statusLabel: "已完成" };
+    if (options.latest && options.interrupted) {
+      return { kind: "complete", text: "任务已暂停，等待你的确认。", statusLabel: "已暂停" };
+    }
+    if (options.latest && options.failed) {
+      return { kind: "complete", text: "本轮执行失败，未产生最终回复。", statusLabel: "失败" };
+    }
+    return { kind: "complete", text: "本轮未产生最终回复。", statusLabel: "未完成" };
+  }
+
+  // 只有最后事件仍是纯 AI 文本时，才把最后回复视为当前正在生成的文本；
+  // 带工具调用的 AI 消息已经结束生成，应转而展示工具执行状态。
+  if (turn.lastEvent === "ai-text" && turn.assistantBody) {
+    return { kind: "streaming", text: turn.assistantBody, statusLabel: "生成中" };
+  }
+  const pendingTool = [...turn.tools].reverse().find((toolCall) => !toolCall.completed);
+  if (pendingTool) {
+    return { kind: "tool", text: compactToolActivity(pendingTool), statusLabel: "执行中" };
+  }
+  const activeTodo = options.todos.find((todo) => todo.status === "in_progress");
+  if (activeTodo) {
+    return { kind: "todo", text: `正在${activeTodo.content.replace(/^正在/, "")}…`, statusLabel: "执行中" };
+  }
+  if (turn.lastEvent === "tool" || turn.tools.length > 0) {
+    return { kind: "synthesizing", text: "正在整理工具结果…", statusLabel: "整理中" };
+  }
+  if (turn.lastEvent === "monitor") {
+    return { kind: "planning", text: "正在读取后台任务结果…", statusLabel: "执行中" };
+  }
+  return { kind: "planning", text: "正在规划任务…", statusLabel: "规划中" };
 }
 
 function BrandMark() {
@@ -428,8 +564,9 @@ const MessageCard = memo(function MessageCard({
   && previous.threadId === next.threadId
 ));
 
-type CompactTurnViewProps = CurrentTurn & {
-  streaming: boolean;
+type CompactTurnViewProps = {
+  turn: CompactTurn;
+  active: boolean;
   apiUrl: string;
   authHeaders: Record<string, string>;
   threadId?: string;
@@ -437,68 +574,77 @@ type CompactTurnViewProps = CurrentTurn & {
 };
 
 const CompactTurnView = memo(function CompactTurnView({
-  userKey,
-  userBody,
-  assistantBody,
-  assistantReport,
-  streaming,
+  turn,
+  active,
   apiUrl,
   authHeaders,
   threadId,
   onStop,
 }: CompactTurnViewProps) {
-  const placeholder = streaming ? "正在规划或调用工具…" : "本轮尚未产生模型输出。";
+  const streamingText = turn.activity.kind === "streaming";
+  const finalReply = turn.activity.kind === "complete" && Boolean(turn.assistantBody);
   return (
-    <div className="compact-turn">
+    <section className={`compact-turn${active ? " compact-turn--active" : ""}`}>
       <MessageCard
-        messageKey={userKey}
+        messageKey={turn.userKey}
         role="human"
-        body={userBody}
+        body={turn.userBody}
         report={false}
         streaming={false}
         apiUrl={apiUrl}
         authHeaders={authHeaders}
         threadId={threadId}
       />
-      <article className={`message message--ai compact-turn__output${assistantReport ? " message--report" : ""}`}>
+      <article className={`message message--ai compact-turn__output${turn.assistantReport && finalReply ? " message--report" : ""}`}>
         <header>
           <span>Supervisor</span>
           <i aria-hidden="true" />
-          <span className={`compact-turn__status${streaming ? " is-running" : ""}`}>
-            {streaming ? "生成中" : "已完成"}
+          <span className={`compact-turn__status${active ? " is-running" : ""}`}>
+            {turn.activity.statusLabel}
           </span>
-          {streaming ? (
+          {active ? (
             <button type="button" onClick={onStop}>停止回答</button>
           ) : null}
         </header>
         <div
-          className={`markdown-body${streaming ? " markdown-body--streaming" : ""}${assistantBody ? "" : " compact-turn__placeholder"}`}
+          className={`markdown-body${streamingText ? " markdown-body--streaming" : ""}${finalReply || streamingText ? "" : " compact-turn__activity"}`}
           aria-live="polite"
         >
-          {assistantBody ? (
-            streaming ? assistantBody : (
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={{
-                  img: (props) => (
-                    <AuthenticatedMarkdownImage
-                      {...props}
-                      apiUrl={apiUrl}
-                      authHeaders={authHeaders}
-                      threadId={threadId}
-                    />
-                  ),
-                }}
-              >
-                {assistantBody}
-              </ReactMarkdown>
-            )
-          ) : placeholder}
+          {finalReply ? (
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                img: (props) => (
+                  <AuthenticatedMarkdownImage
+                    {...props}
+                    apiUrl={apiUrl}
+                    authHeaders={authHeaders}
+                    threadId={threadId}
+                  />
+                ),
+              }}
+            >
+              {turn.assistantBody}
+            </ReactMarkdown>
+          ) : turn.activity.text}
         </div>
       </article>
-    </div>
+    </section>
   );
-});
+}, (previous, next) => (
+  previous.turn.userKey === next.turn.userKey
+  && previous.turn.userBody === next.turn.userBody
+  && previous.turn.assistantKey === next.turn.assistantKey
+  && previous.turn.assistantBody === next.turn.assistantBody
+  && previous.turn.assistantReport === next.turn.assistantReport
+  && previous.turn.activity.kind === next.turn.activity.kind
+  && previous.turn.activity.text === next.turn.activity.text
+  && previous.turn.activity.statusLabel === next.turn.activity.statusLabel
+  && previous.active === next.active
+  && previous.apiUrl === next.apiUrl
+  && previous.authHeaders === next.authHeaders
+  && previous.threadId === next.threadId
+));
 
 function InterruptCard({
   request,
@@ -794,8 +940,9 @@ export default function App() {
     apiUrl,
     assistantId,
     threadId,
-    // 合并密集 token/state 事件，避免每个事件都触发整页 React 渲染。
-    throttle: 60,
+    // SDK 的数字 throttle 实际采用尾部防抖；连续 token 会不断重置计时器，
+    // 导致整段回答结束后才刷新。关闭它以保留逐 token 的流式显示。
+    throttle: false,
     reconnectOnMount: true,
     // 子智能体消息保留在独立流中，避免混入 Supervisor 主对话。
     filterSubagentMessages: true,
@@ -839,13 +986,9 @@ export default function App() {
     };
   }, [liveMessages, liveValues, threadId]);
 
-  // 轻量模式不构造工具卡和完整历史，避免每次流事件都扫描并挂载重型轨迹组件。
+  // 轻量模式不构造工具卡和完整轨迹，只整理每轮最终回复与当前活动状态。
   const rows = useMemo(
     () => showDetails ? buildRows(displayedMessages) : EMPTY_ROWS,
-    [displayedMessages, showDetails],
-  );
-  const compactTurn = useMemo(
-    () => showDetails ? null : currentTurn(displayedMessages),
     [displayedMessages, showDetails],
   );
   const visibleRows = useMemo(
@@ -861,6 +1004,31 @@ export default function App() {
     return undefined;
   }, [rows]);
   const todos = Array.isArray(displayedValues?.todos) ? displayedValues.todos : [];
+  const pendingInterrupt = useMemo(
+    () => hitlRequest(stream.interrupt?.value),
+    [stream.interrupt?.value],
+  );
+  const queuedEntries = stream.queue.entries;
+  const compactTurns = useMemo(() => {
+    if (showDetails) return [];
+    const queuedBodies = queuedEntries.map((entry) => queuedMessageText(entry.values));
+    const baseTurns = withoutQueuedTurns(buildCompactTurns(displayedMessages), queuedBodies);
+    const activeIndex = stream.isLoading ? baseTurns.length - 1 : -1;
+    return baseTurns.map((turn, index): CompactTurn => ({
+      ...turn,
+      activity: compactActivity(turn, {
+        active: index === activeIndex,
+        latest: index === baseTurns.length - 1,
+        todos,
+        interrupted: pendingInterrupt !== null,
+        failed: Boolean(stream.error),
+      }),
+    }));
+  }, [displayedMessages, pendingInterrupt, queuedEntries, showDetails, stream.error, stream.isLoading, todos]);
+  const activeCompactTurn = stream.isLoading ? compactTurns.at(-1) : undefined;
+  const compactFollowKey = activeCompactTurn
+    ? `${activeCompactTurn.userKey}:${activeCompactTurn.activity.kind}:${activeCompactTurn.activity.text}`
+    : `${compactTurns.length}:${compactTurns.at(-1)?.assistantKey ?? ""}`;
   const trackedTasks = useMemo(
     () => Object.values(displayedValues?.async_tasks ?? {}).reverse(),
     [displayedValues?.async_tasks],
@@ -886,10 +1054,6 @@ export default function App() {
   const runningTaskCount = tasks.filter(
     (task) => task.status === "running" || task.status === "pending",
   ).length;
-  const pendingInterrupt = useMemo(
-    () => hitlRequest(stream.interrupt?.value),
-    [stream.interrupt?.value],
-  );
   const latestPreparedDownload = useMemo(() => {
     for (let index = displayedMessages.length - 1; index >= 0; index -= 1) {
       const message = displayedMessages[index] as Message;
@@ -1153,7 +1317,7 @@ export default function App() {
     // 只有用户原本位于底部时才跟随新内容；滚轮离开底部后保持阅读位置。
     scrollViewportToBottom();
     setShowJumpToBottom(false);
-  }, [compactTurn?.assistantBody, compactTurn?.userKey, rows, showDetails, stream.isLoading]);
+  }, [compactFollowKey, rows, showDetails, stream.isLoading]);
 
   useEffect(() => {
     if (!showDetails) return undefined;
@@ -1675,7 +1839,7 @@ export default function App() {
         </header>
 
         <section ref={conversationRef} className="conversation" aria-label="研究对话">
-          {(showDetails ? rows.length === 0 : compactTurn === null) ? (
+          {(showDetails ? rows.length === 0 : compactTurns.length === 0) ? (
             <div className="empty-state">
               <p className="empty-state__index">研究入口 / 01</p>
               <h2>把一个问题，变成一条证据链。</h2>
@@ -1723,15 +1887,20 @@ export default function App() {
                 threadId={threadId}
               />
             ),
-          ) : compactTurn ? (
-            <CompactTurnView
-              {...compactTurn}
-              streaming={stream.isLoading}
-              apiUrl={apiUrl}
-              authHeaders={authHeaders}
-              threadId={threadId}
-              onStop={stopStream}
-            />
+          ) : compactTurns.length > 0 ? (
+            <div className="compact-conversation">
+              {compactTurns.map((turn, index) => (
+                <CompactTurnView
+                  key={turn.userKey}
+                  turn={turn}
+                  active={stream.isLoading && index === compactTurns.length - 1}
+                  apiUrl={apiUrl}
+                  authHeaders={authHeaders}
+                  threadId={threadId}
+                  onStop={stopStream}
+                />
+              ))}
+            </div>
           ) : null}
 
           {failedTasks.length > 0 ? (
@@ -1875,7 +2044,7 @@ export default function App() {
           ) : null}
         </section>
 
-        {showJumpToBottom && (showDetails ? rows.length > 0 : compactTurn !== null) ? (
+        {showJumpToBottom && (showDetails ? rows.length > 0 : compactTurns.length > 0) ? (
           <button
             type="button"
             className="jump-to-bottom"
