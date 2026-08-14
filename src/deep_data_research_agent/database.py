@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import logging
+import math
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, delete, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, delete, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -24,6 +29,9 @@ from deep_data_research_agent.config import get_settings
 
 DEFAULT_USER_ID = "local-user"
 DEFAULT_USERNAME = "default"
+logger = logging.getLogger(__name__)
+_DEVELOPMENT_RATE_LIMIT_SECRET = secrets.token_bytes(32)
+_development_secret_warning_emitted = False
 
 
 def _utcnow() -> datetime:
@@ -80,6 +88,18 @@ class AgentThread(Base):
     )
 
 
+class RateLimitBucket(Base):
+    """One fixed-window counter keyed by a non-reversible request identity."""
+
+    __tablename__ = "rate_limit_buckets"
+
+    scope: Mapped[str] = mapped_column(String(32), primary_key=True)
+    key_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
 class EmailDelivery(Base):
     """Durable idempotency and audit state for an external SMTP side effect."""
 
@@ -131,6 +151,16 @@ class EmailDeliveryRecord:
     error_summary: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class RateLimitDecision:
+    """Result of atomically consuming one fixed-window allowance."""
+
+    allowed: bool
+    count: int
+    limit: int
+    retry_after_seconds: int
+
+
 class UsernameExistsError(ValueError):
     """Raised when a normalized username is already registered."""
 
@@ -147,6 +177,41 @@ _initialized = False
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _rate_limit_secret() -> bytes:
+    """Return a stable production secret or an ephemeral development secret."""
+
+    global _development_secret_warning_emitted
+    configured = get_settings().rate_limit_key_secret.get_secret_value()
+    if configured:
+        return configured.encode("utf-8")
+    if not _development_secret_warning_emitted:
+        logger.warning(
+            "RATE_LIMIT_KEY_SECRET 未配置；开发环境限流键将在进程重启后变化"
+        )
+        _development_secret_warning_emitted = True
+    return _DEVELOPMENT_RATE_LIMIT_SECRET
+
+
+def _rate_limit_key_hash(scope: str, raw_key: str) -> str:
+    """Hash low-entropy IP and username keys before persistence."""
+
+    payload = f"{scope}\0{raw_key}".encode()
+    return hmac.new(_rate_limit_secret(), payload, hashlib.sha256).hexdigest()
+
+
+def _rate_limit_window(
+    now: datetime,
+    window_seconds: int,
+) -> tuple[datetime, datetime]:
+    """Return deterministic UTC fixed-window boundaries."""
+
+    aware = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    epoch = int(aware.timestamp())
+    start_epoch = epoch - (epoch % window_seconds)
+    start = datetime.fromtimestamp(start_epoch, UTC).replace(tzinfo=None)
+    return start, start + timedelta(seconds=window_seconds)
 
 
 def get_engine() -> AsyncEngine:
@@ -344,6 +409,88 @@ async def revoke_login_session(token: str) -> bool:
         auth_session.revoked_at = _utcnow()
         await session.commit()
     return True
+
+
+async def consume_rate_limit(
+    scope: str,
+    raw_key: str,
+    *,
+    limit: int,
+    window_seconds: int,
+    now: datetime | None = None,
+) -> RateLimitDecision:
+    """Atomically consume one allowance from a PostgreSQL fixed window."""
+
+    if not scope or not raw_key:
+        raise ValueError("限流作用域和键不能为空")
+    if limit < 1 or window_seconds < 1:
+        raise ValueError("限流次数和窗口必须为正数")
+
+    await ensure_schema()
+    current = now or _utcnow()
+    if current.tzinfo is not None:
+        current = current.astimezone(UTC).replace(tzinfo=None)
+    window_start, window_end = _rate_limit_window(current, window_seconds)
+    key_hash = _rate_limit_key_hash(scope, raw_key)
+    values = {
+        "scope": scope,
+        "key_hash": key_hash,
+        "window_start": window_start,
+        "count": 1,
+        "expires_at": window_end,
+    }
+
+    async with session_factory()() as session:
+        # PostgreSQL is authoritative in production; SQLite keeps unit tests
+        # representative without adding a second external service dependency.
+        dialect = session.get_bind().dialect.name
+        if dialect == "postgresql":
+            insert_statement = postgresql_insert(RateLimitBucket).values(**values)
+        elif dialect == "sqlite":
+            insert_statement = sqlite_insert(RateLimitBucket).values(**values)
+        else:
+            raise RuntimeError(f"不支持的限流数据库方言：{dialect}")
+
+        await session.execute(
+            delete(RateLimitBucket).where(RateLimitBucket.expires_at <= current)
+        )
+        statement = insert_statement.on_conflict_do_update(
+            index_elements=[
+                RateLimitBucket.scope,
+                RateLimitBucket.key_hash,
+                RateLimitBucket.window_start,
+            ],
+            set_={
+                "count": RateLimitBucket.count + 1,
+                "expires_at": window_end,
+            },
+        ).returning(RateLimitBucket.count)
+        result = await session.execute(statement)
+        count = int(result.scalar_one())
+        await session.commit()
+
+    retry_after = max(1, math.ceil((window_end - current).total_seconds()))
+    return RateLimitDecision(
+        allowed=count <= limit,
+        count=count,
+        limit=limit,
+        retry_after_seconds=retry_after,
+    )
+
+
+async def clear_rate_limit(scope: str, raw_key: str) -> None:
+    """Clear all active windows for one hashed key after successful login."""
+
+    await ensure_schema()
+    key_hash = _rate_limit_key_hash(scope, raw_key)
+    async with session_factory()() as session:
+        await session.execute(
+            delete(RateLimitBucket).where(
+                RateLimitBucket.scope == scope,
+                RateLimitBucket.key_hash == key_hash,
+            )
+        )
+        await session.commit()
 
 
 async def claim_thread(thread_id: str, user_id: str) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import ipaddress
 import logging
 import mimetypes
 import re
@@ -34,6 +35,7 @@ from deep_data_research_agent.artifacts import (
     workspace_artifacts,
 )
 from deep_data_research_agent.auth import bearer_token
+from deep_data_research_agent.config import get_settings
 from deep_data_research_agent.memory import start_memory_worker
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
@@ -107,11 +109,61 @@ async def _authenticated_user_id(authorization: str | None) -> str:
 
     token = bearer_token(authorization)
     if token is None:
+        if get_settings().app_env == "production":
+            raise HTTPException(
+                status_code=401,
+                detail="请先登录",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return database.DEFAULT_USER_ID
     user = await database.resolve_login_session(token)
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
     return user.id
+
+
+def _client_ip(request: Request) -> str:
+    """Return the ASGI peer address without trusting forwarded headers."""
+
+    raw = request.client.host if request.client is not None else "unknown"
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError:
+        return raw.casefold()
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return str(address.ipv4_mapped)
+    return address.compressed
+
+
+async def _enforce_rate_limit(
+    *,
+    scope: str,
+    raw_key: str,
+    limit: int,
+    window_seconds: int,
+    detail: str,
+) -> None:
+    """Translate durable limiter decisions into safe HTTP responses."""
+
+    try:
+        decision = await database.consume_rate_limit(
+            scope,
+            raw_key,
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+    except Exception as exc:
+        logger.exception("%s 限流存储不可用", scope)
+        raise HTTPException(
+            status_code=503,
+            detail="请求保护服务暂不可用，请稍后重试",
+        ) from exc
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=detail,
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
 
 
 def _workspace_artifacts(root: Path) -> list[dict[str, object]]:
@@ -345,7 +397,15 @@ app = FastAPI(title="深研账户 API", lifespan=lifespan)
 
 
 @app.post("/auth/register", status_code=201)
-async def register(payload: RegisterRequest) -> dict[str, object]:
+async def register(payload: RegisterRequest, request: Request) -> dict[str, object]:
+    settings = get_settings()
+    await _enforce_rate_limit(
+        scope="auth_register",
+        raw_key=_client_ip(request),
+        limit=settings.auth_register_limit,
+        window_seconds=settings.auth_register_window_seconds,
+        detail="注册请求过于频繁，请稍后再试",
+    )
     username = payload.username.strip()
     if not _USERNAME_PATTERN.fullmatch(username):
         raise HTTPException(
@@ -364,8 +424,19 @@ async def register(payload: RegisterRequest) -> dict[str, object]:
 
 
 @app.post("/auth/login")
-async def login(payload: LoginRequest) -> dict[str, object]:
-    user = await database.get_user_by_username(payload.username.strip())
+async def login(payload: LoginRequest, request: Request) -> dict[str, object]:
+    settings = get_settings()
+    username = payload.username.strip()
+    login_key = f"{_client_ip(request)}\0{username.casefold()}"
+    await _enforce_rate_limit(
+        scope="auth_login",
+        raw_key=login_key,
+        limit=settings.auth_login_failure_limit,
+        window_seconds=settings.auth_login_window_seconds,
+        detail="登录尝试过于频繁，请稍后再试",
+    )
+
+    user = await database.get_user_by_username(username)
     if user is None or user.is_system or not user.password_hash:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     try:
@@ -376,6 +447,14 @@ async def login(payload: LoginRequest) -> dict[str, object]:
         )
     except (VerificationError, InvalidHashError) as exc:
         raise HTTPException(status_code=401, detail="用户名或密码错误") from exc
+    try:
+        await database.clear_rate_limit("auth_login", login_key)
+    except Exception as exc:
+        logger.exception("清除登录限流记录失败")
+        raise HTTPException(
+            status_code=503,
+            detail="请求保护服务暂不可用，请稍后重试",
+        ) from exc
     return await _issue_token(user)
 
 
@@ -393,6 +472,12 @@ async def current_user(
 ) -> dict[str, object]:
     token = bearer_token(authorization)
     if token is None:
+        if get_settings().app_env == "production":
+            raise HTTPException(
+                status_code=401,
+                detail="请先登录",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return {
             "user": {
                 "id": database.DEFAULT_USER_ID,
@@ -607,6 +692,12 @@ async def async_task_status(
 
     token = bearer_token(authorization)
     if token is None:
+        if get_settings().app_env == "production":
+            raise HTTPException(
+                status_code=401,
+                detail="请先登录",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         user_id = database.DEFAULT_USER_ID
     else:
         user = await database.resolve_login_session(token)

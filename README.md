@@ -23,7 +23,8 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
 - Supervisor 读取 `skill-manage` 后通过 `assign_skill` 一步分配 Skill，不创建 Skill 子智能体。
 - LangSmith 记录 Agent、模型、工具及沙箱生命周期。
 - React 三栏研究工作台，左侧显示用户会话，中间流式展示对话，右侧集中显示计划和异步任务轨迹。
-- 可选注册登录；账户、会话、Skill 和检查点按用户隔离，匿名请求使用共享默认账户。
+- 可选注册登录；账户、会话、Skill 和检查点按用户隔离。开发环境匿名请求使用共享默认账户，
+  生产环境必须登录。
 - 账户、thread 归属、邮件投递与 LangGraph checkpoint 统一持久化到 PostgreSQL；Skill 与
   长期记忆继续使用 MongoDB。
 - MongoDB 长期记忆只保留当前用户偏好/行为反馈和每个 Agent 独立的公共失败经验；三个
@@ -65,9 +66,17 @@ POSTGRES_CHECKPOINT_POOL_MAX_SIZE=5
 POSTGRES_POOL_TIMEOUT_SECONDS=30
 LANGGRAPH_STRICT_MSGPACK=true
 AUTH_SESSION_DAYS=7
+RATE_LIMIT_KEY_SECRET=
+AUTH_LOGIN_FAILURE_LIMIT=5
+AUTH_LOGIN_WINDOW_SECONDS=900
+AUTH_REGISTER_LIMIT=3
+AUTH_REGISTER_WINDOW_SECONDS=3600
+AGENT_RUN_LIMIT=10
+AGENT_RUN_WINDOW_SECONDS=60
 ```
 
-不要提交 `.env`，也不要把 API Key 作为命令行参数传递。
+不要提交 `.env`，也不要把 API Key 作为命令行参数传递。`APP_ENV=production` 时
+`RATE_LIMIT_KEY_SECRET` 必须是至少 32 字符的稳定随机值；生产环境会拒绝所有未登录请求。
 
 如需使用 QQ 邮箱发送报告，在本地 `.env` 中启用固定发件邮箱。`SMTP_PASSWORD` 必须填写
 QQ 邮箱生成的授权码，而不是登录密码：
@@ -103,9 +112,11 @@ uv run setup-agent-postgres
 `LANGGRAPH_STRICT_MSGPACK=true` 写入本地 `.env`。应用启动后，账户、登录令牌、thread
 归属、邮件投递和 LangGraph checkpoint 均直接使用该 PostgreSQL 数据库。
 
-动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。无 Bearer Token 时
-LangGraph Auth 注入共享身份 `local-user`；注册用户使用独立 UUID。MongoDB 不配置 TTL 和
-向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要写入 PostgreSQL。
+动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。开发环境无 Bearer
+Token 时 LangGraph Auth 注入共享身份 `local-user`；生产环境无 Token 返回 401。注册用户使用
+独立 UUID。MongoDB 不配置 TTL 和向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要
+写入 PostgreSQL。注册、登录失败和外部 Agent run 使用 PostgreSQL 固定窗口限流；应用只读取
+ASGI peer 地址，不直接信任 `X-Forwarded-For`。
 
 如需清空所有用户记忆和失败经验并重新开始，应先停止应用，再执行：
 
@@ -183,8 +194,9 @@ npm run dev
 - 注册、登录、注销和刷新后的登录恢复。
 - 用户明确要求时，经确认将 PDF 主报告和完整材料 ZIP 发送到本次提供的单个邮箱。
 
-登录、注册或注销后，前端会清除当前 thread 并进入对应身份的新空间。默认账户由所有未登录
-浏览器共享，不会在登录时把其会话或 Skill 复制到个人账户。
+登录、注册或注销后，前端会清除当前 thread 并进入对应身份的新空间。开发环境的默认账户由
+所有未登录浏览器共享，不会在登录时把其会话或 Skill 复制到个人账户；生产环境未登录时保留
+首页，但会锁定会话、上传和任务操作。
 
 ## 交互方式
 

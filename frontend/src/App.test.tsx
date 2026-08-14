@@ -92,6 +92,25 @@ function enableDetailedMode() {
   fireEvent.click(screen.getByRole("switch", { name: "详细模式" }));
 }
 
+type FetchHandler = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<unknown>;
+
+function withDevelopmentAuth(handler: FetchHandler) {
+  return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith("/auth/me")) {
+      return {
+        ok: true,
+        json: async () => ({
+          user: { id: "local-user", username: "默认账户", is_default: true },
+        }),
+      };
+    }
+    return handler(input, init);
+  });
+}
+
 vi.mock("@langchain/react", () => ({
   useStream: (options: Record<string, unknown>) => {
     capturedOptions = options;
@@ -106,10 +125,16 @@ beforeEach(() => {
   window.sessionStorage.clear();
   vi.spyOn(window, "confirm").mockReturnValue(true);
   vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
-  vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => ({
-    ok: true,
-    json: async () => (String(input).endsWith("/async-tasks/status") ? { tasks: [] } : []),
-  })));
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith("/auth/me")) {
+      return { ok: true, json: async () => ({ user: { id: "local-user", username: "默认账户", is_default: true } }) };
+    }
+    return {
+      ok: true,
+      json: async () => (url.endsWith("/async-tasks/status") ? { tasks: [] } : []),
+    };
+  }));
 });
 
 afterEach(() => {
@@ -132,7 +157,7 @@ afterEach(() => {
 describe("研究工作台", () => {
   it("新任务取得 thread ID 后立即刷新左侧会话记录", async () => {
     let searchCount = 0;
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       if (String(input).endsWith("/threads/search")) {
         searchCount += 1;
         return {
@@ -145,7 +170,7 @@ describe("研究工作台", () => {
         };
       }
       return { ok: true, json: async () => ({}) };
-    }));
+    })));
 
     render(<App />);
     await waitFor(() => expect(searchCount).toBe(1));
@@ -170,7 +195,7 @@ describe("研究工作台", () => {
       multitask_strategy: null,
     }]);
     joinStream.mockResolvedValue(undefined);
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       if (String(input).endsWith("/threads/search")) {
         return {
           ok: true,
@@ -182,7 +207,7 @@ describe("研究工作台", () => {
         };
       }
       return { ok: true, json: async () => ({}) };
-    }));
+    })));
 
     render(<App />);
 
@@ -193,16 +218,97 @@ describe("研究工作台", () => {
     await waitFor(() => expect(joinStream).toHaveBeenCalledWith("run-active"));
   });
 
-  it("未登录时使用默认账户且不发送认证头", () => {
+  it("未登录时使用默认账户且不发送认证头", async () => {
     render(<App />);
 
-    expect(screen.getByText("默认账户")).toBeTruthy();
+    expect(await screen.findByText("默认账户")).toBeTruthy();
     expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("false");
     expect(screen.queryByLabelText("研究执行状态")).toBeNull();
     expect(capturedOptions?.defaultHeaders).toEqual({});
     expect(capturedOptions?.filterSubagentMessages).toBe(true);
     expect(capturedOptions?.onFinish).toEqual(expect.any(Function));
     expect((capturedOptions?.onFinish as ((state: unknown) => void)).length).toBe(1);
+  });
+
+  it("生产环境未登录时保留首页并锁定任务功能", async () => {
+    streamState.messages = [];
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/auth/me")) {
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({ detail: "请先登录" }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText("需要认证")).toBeTruthy();
+    expect(screen.getByText("请登录或注册后开始研究任务。")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "开始新任务" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByLabelText("选择本地表格文件") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText("登录后可开始研究任务") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "发送分析任务" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "登录" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "注册" }) as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(screen.getByRole("switch", { name: "详细模式" }));
+    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/threads/search"))).toBe(false);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/async-tasks/status"))).toBe(false);
+  });
+
+  it("受保护请求返回 401 后清除失效令牌并重新锁定", async () => {
+    window.localStorage.setItem("deep-data-auth-token", "expired-token");
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const headers = init?.headers as Record<string, string> | undefined;
+      if (url.endsWith("/auth/me") && headers?.Authorization) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ user: { id: "user-a", username: "Alice", is_default: false } }),
+        };
+      }
+      if (url.endsWith("/auth/me") || url.endsWith("/threads/search")) {
+        return { ok: false, status: 401, json: async () => ({ detail: "登录已失效，请重新登录" }) };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText("需要认证")).toBeTruthy();
+    expect(window.localStorage.getItem("deep-data-auth-token")).toBeNull();
+    expect(screen.getByText("登录已失效，请重新登录")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "开始新任务" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("认证表单直接展示服务端限流提示", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/auth/login")) {
+        return {
+          ok: false,
+          status: 429,
+          json: async () => ({ detail: "登录尝试过于频繁，请稍后再试" }),
+        };
+      }
+      return { ok: false, status: 401, json: async () => ({ detail: "请先登录" }) };
+    }));
+    render(<App />);
+    await screen.findByText("需要认证");
+
+    fireEvent.click(screen.getByRole("button", { name: "登录" }));
+    fireEvent.change(screen.getByLabelText("用户名"), { target: { value: "Alice" } });
+    fireEvent.change(screen.getByLabelText("密码"), { target: { value: "password8" } });
+    fireEvent.click(screen.getByRole("button", { name: "登录并进入个人空间" }));
+
+    expect(await screen.findByText("登录尝试过于频繁，请稍后再试")).toBeTruthy();
   });
 
   it("简洁模式显示全部可见轮次且每轮只保留最终 AI 回复", () => {
@@ -403,7 +509,7 @@ describe("研究工作台", () => {
         },
       ]),
     });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     render(<App />);
 
     expect(await screen.findByText("比较三家产品价格")).toBeTruthy();
@@ -440,7 +546,7 @@ describe("研究工作台", () => {
         }]),
       };
     });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "删除会话：待删除的采购会话" }));
@@ -455,8 +561,9 @@ describe("研究工作台", () => {
     expect(screen.queryByText("待删除的采购会话")).toBeNull();
   });
 
-  it("展示 DeepAgents 计划、异步任务和工具调用", () => {
+  it("展示 DeepAgents 计划、异步任务和工具调用", async () => {
     render(<App />);
+    await screen.findByText("默认账户");
     enableDetailedMode();
 
     expect(screen.getByText("研究步骤")).toBeTruthy();
@@ -614,9 +721,10 @@ describe("研究工作台", () => {
     expect((screen.getByText("profile_table").closest("details") as HTMLDetailsElement).open).toBe(true);
   });
 
-  it("提交自然语言任务到 supervisor", () => {
+  it("提交自然语言任务到 supervisor", async () => {
     streamState.messages = [];
     render(<App />);
+    await screen.findByText("默认账户");
 
     const input = screen.getByLabelText("描述你的网页或文件分析任务");
     fireEvent.change(input, { target: { value: "抓取官网并生成报告" } });
@@ -739,8 +847,9 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     render(<App />);
+    await screen.findByText("默认账户");
 
     const file = new File(["id,amount\n001,10\n"], "orders.csv", { type: "text/csv" });
     fireEvent.change(screen.getByLabelText("选择本地表格文件"), {
@@ -799,7 +908,7 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     render(<App />);
 
     expect(await screen.findByText("history.xlsx")).toBeTruthy();
@@ -812,9 +921,10 @@ describe("研究工作台", () => {
     );
   });
 
-  it("配置刷新恢复当前活动流", () => {
+  it("配置刷新恢复当前活动流", async () => {
     render(<App />);
 
+    await screen.findByText("默认账户");
     expect(capturedOptions?.reconnectOnMount).toBe(true);
     expect(capturedOptions?.throttle).toBe(false);
   });
@@ -826,7 +936,7 @@ describe("研究工作台", () => {
         ? { tasks: [{ ...streamState.values.async_tasks["task-123456789"], status: "running" }] }
         : []),
     }));
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
 
     render(<App />);
@@ -848,7 +958,7 @@ describe("研究工作台", () => {
         ? { tasks: [{ ...streamState.values.async_tasks["task-123456789"], status: "success" }] }
         : []),
     }));
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
 
     render(<App />);
@@ -888,7 +998,7 @@ describe("研究工作台", () => {
           }
         : []),
     }));
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
 
     render(<App />);
@@ -903,9 +1013,10 @@ describe("研究工作台", () => {
     expect(screen.queryByText("有 1 个任务未正常完成")).toBeNull();
   });
 
-  it("Supervisor 忙碌时保持输入可用并把普通消息排队", () => {
+  it("Supervisor 忙碌时保持输入可用并把普通消息排队", async () => {
     streamState.isLoading = true;
     render(<App />);
+    await screen.findByText("默认账户");
 
     const input = screen.getByLabelText("补充要求或纠正方向") as HTMLTextAreaElement;
     expect(input.disabled).toBe(false);
@@ -924,9 +1035,10 @@ describe("研究工作台", () => {
     });
   });
 
-  it("可以立即纠正正在运行的 Supervisor", () => {
+  it("可以立即纠正正在运行的 Supervisor", async () => {
     streamState.isLoading = true;
     render(<App />);
+    await screen.findByText("默认账户");
 
     fireEvent.change(screen.getByLabelText("补充要求或纠正方向"), {
       target: { value: "停止国外数据，只分析国内数据" },
@@ -944,8 +1056,9 @@ describe("研究工作台", () => {
     });
   });
 
-  it("任务卡通过 Supervisor 检查完整 task id", () => {
+  it("任务卡通过 Supervisor 检查完整 task id", async () => {
     render(<App />);
+    await screen.findByText("默认账户");
     enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "检查进度" }));
@@ -963,9 +1076,10 @@ describe("研究工作台", () => {
     });
   });
 
-  it("任务卡可以立即补充 crawl-worker 要求", () => {
+  it("任务卡可以立即补充 crawl-worker 要求", async () => {
     streamState.isLoading = true;
     render(<App />);
+    await screen.findByText("默认账户");
     enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "补充要求" }));
@@ -988,9 +1102,10 @@ describe("研究工作台", () => {
     });
   });
 
-  it("任务卡可以取消 crawl-worker", () => {
+  it("任务卡可以取消 crawl-worker", async () => {
     streamState.isLoading = true;
     render(<App />);
+    await screen.findByText("默认账户");
     enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
@@ -1031,8 +1146,9 @@ describe("研究工作台", () => {
     expect(clearQueue).toHaveBeenCalled();
   });
 
-  it("把新 thread id 写入 URL", () => {
+  it("把新 thread id 写入 URL", async () => {
     render(<App />);
+    await screen.findByText("默认账户");
 
     act(() => {
       (capturedOptions?.onThreadId as ((id: string) => void) | undefined)?.("thread-abc");
@@ -1087,7 +1203,7 @@ describe("研究工作台", () => {
     Object.defineProperty(window.URL, "createObjectURL", { configurable: true, value: createObjectURL });
     Object.defineProperty(window.URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes("/artifacts/thread-a/bundle")) {
         return { ok: true, blob: async () => new Blob(["# 报告"]) };
@@ -1096,7 +1212,7 @@ describe("研究工作台", () => {
         return { ok: true, json: async () => ({ artifacts: [] }) };
       }
       return { ok: true, json: async () => [] };
-    }));
+    })));
     streamState.interrupt = {
       id: "interrupt-download",
       value: {
@@ -1242,7 +1358,7 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("final_report.md")).toBeTruthy());
@@ -1271,7 +1387,7 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
     streamState.messages = [
       { id: "human-chart", type: "human", content: "显示图表" },
       { id: "ai-chart", type: "ai", content: "![价格对比](charts/price.png)" },
@@ -1286,8 +1402,9 @@ describe("研究工作台", () => {
     );
   });
 
-  it("开始新任务时清空草稿并切换到空 thread", () => {
+  it("开始新任务时清空草稿并切换到空 thread", async () => {
     render(<App />);
+    await screen.findByText("默认账户");
 
     const input = screen.getByLabelText("描述你的网页或文件分析任务") as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: "尚未提交的研究任务" } });

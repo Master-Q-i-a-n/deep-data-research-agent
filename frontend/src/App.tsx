@@ -58,6 +58,7 @@ type CompactTurn = CompactTurnData & {
 
 type SubmitMode = "enqueue" | "interrupt";
 type AuthMode = "login" | "register";
+type AuthStatus = "checking" | "ready" | "required" | "unavailable";
 type AsyncTaskStatusResponse = { tasks?: AsyncTask[] };
 type DownloadableArtifact = {
   path: string;
@@ -573,6 +574,11 @@ type CompactTurnViewProps = {
   threadId?: string;
   onStop: () => void;
 };
+const SIGNED_OUT_USER: AuthUser = {
+  id: "",
+  username: "未登录",
+  is_default: false,
+};
 
 const CompactTurnView = memo(function CompactTurnView({
   turn,
@@ -800,6 +806,7 @@ export default function App() {
     () => window.localStorage.getItem(AUTH_TOKEN_KEY),
   );
   const [authUser, setAuthUser] = useState<AuthUser>(DEFAULT_USER);
+  const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
   const [authMode, setAuthMode] = useState<AuthMode | null>(null);
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
@@ -851,8 +858,22 @@ export default function App() {
     },
     [authToken],
   );
+  const authReady = authStatus === "ready";
+  const workspaceLocked = !authReady;
+  const expireAuthentication = useCallback(() => {
+    // 保留当前页面数据，只撤销失效凭据并锁定后续服务端操作。
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    setAuthToken(null);
+    setAuthUser(SIGNED_OUT_USER);
+    setAuthStatus("required");
+    setAuthError("登录已失效，请重新登录");
+  }, []);
 
   const loadSessions = useCallback(async (signal?: AbortSignal) => {
+    if (!authReady) {
+      setSessions([]);
+      return;
+    }
     setSessionsLoading(true);
     setSessionsError("");
     try {
@@ -882,6 +903,7 @@ export default function App() {
           signal,
         });
         if (!response.ok) {
+          if (response.status === 401) expireAuthentication();
           throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法读取会话记录");
         }
         const batch = await response.json() as ConversationThread[];
@@ -897,10 +919,10 @@ export default function App() {
     } finally {
       if (!signal?.aborted) setSessionsLoading(false);
     }
-  }, [apiUrl, assistantId, authHeaders]);
+  }, [apiUrl, assistantId, authHeaders, authReady, expireAuthentication]);
 
   const loadArtifacts = useCallback(async (signal?: AbortSignal) => {
-    if (!threadId) {
+    if (!authReady || !threadId) {
       setArtifacts([]);
       return;
     }
@@ -911,6 +933,7 @@ export default function App() {
         signal,
       });
       if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
         throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法读取研究产物");
       }
       const payload = await response.json() as ArtifactListResponse;
@@ -922,10 +945,10 @@ export default function App() {
     } finally {
       if (!signal?.aborted) setArtifactsLoading(false);
     }
-  }, [apiUrl, authHeaders, threadId]);
+  }, [apiUrl, authHeaders, authReady, expireAuthentication, threadId]);
 
   const loadUploadedFiles = useCallback(async (signal?: AbortSignal) => {
-    if (!threadId) {
+    if (!authReady || !threadId) {
       setUploadedFiles([]);
       return;
     }
@@ -936,6 +959,7 @@ export default function App() {
         signal,
       });
       if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
         throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法读取已上传文件");
       }
       const payload = await response.json() as FileListResponse;
@@ -959,18 +983,18 @@ export default function App() {
     } finally {
       if (!signal?.aborted) setFilesLoading(false);
     }
-  }, [apiUrl, authHeaders, threadId]);
+  }, [apiUrl, authHeaders, authReady, expireAuthentication, threadId]);
 
   // 当前前端只持有远程图的状态类型，无法把 Python DeepAgent 类型直接传给
   // useStream；使用宽化后的选项仍可启用 SDK 内置的子智能体跟踪能力。
   const streamOptions = {
     apiUrl,
     assistantId,
-    threadId,
+    threadId: authReady ? threadId : undefined,
     // SDK 的数字 throttle 实际采用尾部防抖；连续 token 会不断重置计时器，
     // 导致整段回答结束后才刷新。关闭它以保留逐 token 的流式显示。
     throttle: false,
-    reconnectOnMount: true,
+    reconnectOnMount: authReady,
     // 子智能体消息保留在独立流中，避免混入 Supervisor 主对话。
     filterSubagentMessages: true,
     defaultHeaders: authHeaders,
@@ -981,6 +1005,7 @@ export default function App() {
       void state;
     },
     onThreadId: (id: string) => {
+      if (!authReady) return;
       setThreadId(id);
       const url = new URL(window.location.href);
       url.searchParams.set("thread", id);
@@ -994,6 +1019,17 @@ export default function App() {
   const stream = baseStream as typeof baseStream & {
     subagents: Map<string, SubagentTraceStream>;
   };
+  useEffect(() => {
+    if (!authToken || !stream.error || typeof stream.error !== "object") return;
+    const error = stream.error as {
+      status?: unknown;
+      statusCode?: unknown;
+      response?: { status?: unknown };
+    };
+    if (error.status === 401 || error.statusCode === 401 || error.response?.status === 401) {
+      expireAuthentication();
+    }
+  }, [authToken, expireAuthentication, stream.error]);
   const joinStreamRef = useRef(stream.joinStream);
   const streamLoadingRef = useRef(stream.isLoading);
   joinStreamRef.current = stream.joinStream;
@@ -1123,7 +1159,7 @@ export default function App() {
     signal?: AbortSignal,
     showLoading = false,
   ) => {
-    if (!threadId || taskPollInFlightRef.current) return;
+    if (!authReady || !threadId || taskPollInFlightRef.current) return;
     taskPollInFlightRef.current = true;
     if (showLoading) setTasksRefreshing(true);
     try {
@@ -1134,6 +1170,7 @@ export default function App() {
         signal,
       });
       if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
         throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法刷新后台任务");
       }
       const payload = await response.json() as AsyncTaskStatusResponse;
@@ -1156,12 +1193,13 @@ export default function App() {
       taskPollInFlightRef.current = false;
       if (showLoading && !signal?.aborted) setTasksRefreshing(false);
     }
-  }, [apiUrl, authHeaders, threadId]);
+  }, [apiUrl, authHeaders, authReady, expireAuthentication, threadId]);
 
   const downloadArtifact = useCallback(async (
     artifact: DownloadableArtifact,
     mode: "auto" | "raw" | "bundle" = "auto",
   ) => {
+    if (!authReady) throw new Error("请先登录");
     if (!threadId) throw new Error("请先打开包含该文件的会话");
     const markdown = artifact.path.toLowerCase().endsWith(".md");
     const bundle = mode === "bundle" || (mode === "auto" && markdown);
@@ -1175,6 +1213,7 @@ export default function App() {
         { headers: authHeaders },
       );
       if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
         throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "文件下载失败");
       }
       const blob = await response.blob();
@@ -1194,7 +1233,7 @@ export default function App() {
     } finally {
       setDownloadingPath(undefined);
     }
-  }, [apiUrl, authHeaders, threadId]);
+  }, [apiUrl, authHeaders, authReady, expireAuthentication, threadId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1241,7 +1280,7 @@ export default function App() {
   }, [loadArtifacts, loadSessions, stream.isLoading]);
 
   useEffect(() => {
-    if (!threadId || stream.isLoading || currentSession?.status !== "busy") return undefined;
+    if (!authReady || !threadId || stream.isLoading || currentSession?.status !== "busy") return undefined;
 
     const controller = new AbortController();
     // 先给 SDK 使用 sessionStorage 中的 run ID 自动重连；如果它没有启动
@@ -1290,43 +1329,49 @@ export default function App() {
       window.clearTimeout(timerId);
       controller.abort();
     };
-  }, [currentSession?.status, stream.client, stream.isLoading, threadId]);
+  }, [authReady, currentSession?.status, stream.client, stream.isLoading, threadId]);
 
   useEffect(() => {
-    if (!threadId || (!stream.isLoading && currentSession?.status !== "busy")) {
+    if (!authReady || !threadId || (!stream.isLoading && currentSession?.status !== "busy")) {
       return undefined;
     }
     // 长任务期间保持左栏的服务端状态新鲜；最终完成刷新仍由 isLoading
     // 的下降沿负责，这里的低频轮询只用于跨刷新/断线场景。
     const intervalId = window.setInterval(() => void loadSessions(), 5_000);
     return () => window.clearInterval(intervalId);
-  }, [currentSession?.status, loadSessions, stream.isLoading, threadId]);
+  }, [authReady, currentSession?.status, loadSessions, stream.isLoading, threadId]);
 
   useEffect(() => {
-    if (!authToken) {
-      setAuthUser(DEFAULT_USER);
-      return;
-    }
     const controller = new AbortController();
-    void fetch(`${apiUrl}/auth/me`, {
-      headers: authHeaders,
-      signal: controller.signal,
-    })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "账户服务不可用");
-        return response.json() as Promise<{ user: AuthUser }>;
-      })
-      .then(({ user }) => setAuthUser(user))
-      .catch((error: unknown) => {
-        if (controller.signal.aborted) return;
-        const message = error instanceof Error ? error.message : "账户服务不可用";
-        setAuthError(message);
-        if (message.includes("登录已失效")) {
+    setAuthStatus("checking");
+    void (async () => {
+      try {
+        const response = await fetch(`${apiUrl}/auth/me`, {
+          headers: authHeaders,
+          signal: controller.signal,
+        });
+        if (response.status === 401) {
+          const hadToken = Boolean(authToken);
           window.localStorage.removeItem(AUTH_TOKEN_KEY);
-          setAuthToken(null);
-          setAuthUser(DEFAULT_USER);
+          if (hadToken) setAuthToken(null);
+          setAuthUser(SIGNED_OUT_USER);
+          setAuthStatus("required");
+          setAuthError(hadToken ? "登录已失效，请重新登录" : "");
+          return;
         }
-      });
+        if (!response.ok) throw new Error("账户服务不可用");
+        const { user } = await response.json() as { user?: AuthUser };
+        if (!user?.id || !user.username) throw new Error("账户服务返回了无效数据");
+        setAuthUser(user);
+        setAuthStatus("ready");
+        setAuthError("");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setAuthUser(SIGNED_OUT_USER);
+        setAuthStatus("unavailable");
+        setAuthError(error instanceof Error ? error.message : "账户服务不可用");
+      }
+    })();
     return () => controller.abort();
   }, [apiUrl, authHeaders, authToken]);
 
@@ -1346,7 +1391,7 @@ export default function App() {
   }, [threadId]);
 
   useEffect(() => {
-    if (!threadId || !pollingTaskKey) return undefined;
+    if (!authReady || !threadId || !pollingTaskKey) return undefined;
     const controller = new AbortController();
     const poll = () => {
       if (!document.hidden) void refreshTaskStatuses(controller.signal);
@@ -1363,10 +1408,10 @@ export default function App() {
       window.clearInterval(intervalId);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [pollingTaskKey, refreshTaskStatuses, threadId]);
+  }, [authReady, pollingTaskKey, refreshTaskStatuses, threadId]);
 
   useEffect(() => {
-    if (stream.isLoading || stream.queue.size > 0) return;
+    if (!authReady || stream.isLoading || stream.queue.size > 0) return;
     const trackedById = new Map(trackedTasks.map((task) => [task.task_id, task]));
     const completed = tasks.filter((task) => {
       const tracked = trackedById.get(task.task_id);
@@ -1393,7 +1438,7 @@ export default function App() {
       runKeys.forEach((key) => autoCollectedTaskRunsRef.current.delete(key));
       setTaskRefreshError("任务已完成，但自动读取结果失败，请点击“读取结果”重试");
     });
-  }, [stream.isLoading, stream.queue.size, stream.submit, tasks, trackedTasks]);
+  }, [authReady, stream.isLoading, stream.queue.size, stream.submit, tasks, trackedTasks]);
 
   useEffect(() => {
     const updateAutoFollow = () => {
@@ -1434,6 +1479,7 @@ export default function App() {
   }, [showDetails]);
 
   async function createThreadForUpload(firstFilename: string): Promise<string> {
+    if (!authReady) throw new Error("请先登录");
     const nextThreadId = window.crypto.randomUUID();
     const response = await fetch(`${apiUrl}/threads`, {
       method: "POST",
@@ -1448,6 +1494,7 @@ export default function App() {
       }),
     });
     if (!response.ok) {
+      if (response.status === 401) expireAuthentication();
       throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "创建文件分析会话失败");
     }
     stream.switchThread(nextThreadId);
@@ -1471,6 +1518,7 @@ export default function App() {
     const payload = await response.json().catch(() => ({})) as FileListResponse & { detail?: string };
     const uploaded = payload.files?.[0];
     if (!response.ok || !uploaded?.path) {
+      if (response.status === 401) expireAuthentication();
       throw new Error(payload.detail || "文件上传失败，请稍后重试");
     }
     setUploadedFiles((current) => current.map((file) => (
@@ -1481,6 +1529,7 @@ export default function App() {
   }
 
   async function onFilesSelected(event: ChangeEvent<HTMLInputElement>) {
+    if (!authReady) return;
     const selected = Array.from(event.target.files ?? []);
     event.target.value = "";
     if (selected.length === 0) return;
@@ -1590,7 +1639,10 @@ export default function App() {
         { method: "DELETE", headers: authHeaders },
       );
       const payload = await response.json().catch(() => ({})) as { detail?: string };
-      if (!response.ok) throw new Error(payload.detail || "删除上传文件失败");
+      if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
+        throw new Error(payload.detail || "删除上传文件失败");
+      }
       setUploadedFiles((current) => current.filter((file) => file.key !== item.key));
     } catch (error) {
       const message = error instanceof Error ? error.message : "删除上传文件失败";
@@ -1605,7 +1657,7 @@ export default function App() {
 
   function submitText(text: string, mode: SubmitMode = "enqueue") {
     const value = text.trim();
-    if (!value || !filesReadyForAnalysis) return;
+    if (!authReady || !value || !filesReadyForAnalysis) return;
     const uploadedPaths = uploadedFiles
       .filter((file): file is UploadedTableFile & { path: string } => file.status === "ready" && Boolean(file.path))
       .map((file) => `- ${file.path}`);
@@ -1712,6 +1764,7 @@ export default function App() {
   }
 
   function startNewThread() {
+    if (!authReady) return;
     const activeWorkCount = runningTaskCount
       + stream.queue.size
       + Number(stream.isLoading)
@@ -1733,7 +1786,7 @@ export default function App() {
   }
 
   function selectSession(nextThreadId: string) {
-    if (nextThreadId === threadId || stream.isLoading || stream.queue.size > 0 || filesUploading) return;
+    if (!authReady || nextThreadId === threadId || stream.isLoading || stream.queue.size > 0 || filesUploading) return;
     stream.switchThread(nextThreadId);
     setThreadId(nextThreadId);
     setInput("");
@@ -1744,7 +1797,7 @@ export default function App() {
   }
 
   async function deleteSession(targetThreadId: string) {
-    if (deletingThreadId || (targetThreadId === threadId && identitySwitchBlocked)) return;
+    if (!authReady || deletingThreadId || (targetThreadId === threadId && identitySwitchBlocked)) return;
     setDeletingThreadId(targetThreadId);
     setSessionsError("");
     try {
@@ -1753,6 +1806,7 @@ export default function App() {
         headers: authHeaders,
       });
       if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
         throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "删除会话失败，请稍后重试");
       }
       setSessions((current) => current.filter((session) => session.thread_id !== targetThreadId));
@@ -1781,7 +1835,8 @@ export default function App() {
   }
 
   function openAuth(mode: AuthMode) {
-    if (identitySwitchBlocked) return;
+    // 认证失效时不能要求用户先操作已经无权访问的旧运行。
+    if (!workspaceLocked && identitySwitchBlocked) return;
     setAuthMode(mode);
     setAuthUsername("");
     setAuthPassword("");
@@ -1821,6 +1876,7 @@ export default function App() {
       window.localStorage.setItem(AUTH_TOKEN_KEY, body.token);
       setAuthToken(body.token);
       setAuthUser(body.user);
+      setAuthStatus("ready");
       setAuthMode(null);
       resetThreadForIdentityChange();
     } catch (error) {
@@ -1841,7 +1897,7 @@ export default function App() {
       if (!response.ok) throw new Error("注销失败，请稍后重试");
       window.localStorage.removeItem(AUTH_TOKEN_KEY);
       setAuthToken(null);
-      setAuthUser(DEFAULT_USER);
+      setAuthStatus("checking");
       resetThreadForIdentityChange();
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "账户服务不可用");
@@ -1862,10 +1918,10 @@ export default function App() {
         <div className="session-card">
           <div className="session-card__status">
             <span className="status-dot" aria-hidden="true" />
-            <span>{stream.isLoading ? "Supervisor 正在回答" : "Supervisor 入口就绪"}</span>
+            <span>{workspaceLocked ? "登录后启用 Supervisor" : stream.isLoading ? "Supervisor 正在回答" : "Supervisor 入口就绪"}</span>
           </div>
-          <code title={threadId ?? "等待创建"}>{threadId ?? "新会话 · 等待首次消息"}</code>
-          <button type="button" onClick={startNewThread}>开始新任务</button>
+          <code title={threadId ?? "等待创建"}>{workspaceLocked ? "会话功能已锁定" : threadId ?? "新会话 · 等待首次消息"}</code>
+          <button type="button" disabled={workspaceLocked} onClick={startNewThread}>开始新任务</button>
         </div>
 
         <SessionHistory
@@ -1873,9 +1929,9 @@ export default function App() {
           currentThreadId={threadId}
           loading={sessionsLoading}
           error={sessionsError}
-          switchingDisabled={stream.isLoading || stream.queue.size > 0 || filesUploading}
+          switchingDisabled={workspaceLocked || stream.isLoading || stream.queue.size > 0 || filesUploading}
           deletingThreadId={deletingThreadId}
-          deleteCurrentDisabled={identitySwitchBlocked}
+          deleteCurrentDisabled={workspaceLocked || identitySwitchBlocked}
           onSelect={selectSession}
           onDelete={(targetThreadId) => void deleteSession(targetThreadId)}
           onRefresh={() => void loadSessions()}
@@ -1883,21 +1939,21 @@ export default function App() {
 
         <section className="account-card" aria-label="当前账户">
           <div className="account-card__identity">
-            <span aria-hidden="true">{authUser.is_default ? "访" : authUser.username.slice(0, 1).toUpperCase()}</span>
+            <span aria-hidden="true">{workspaceLocked ? "访" : authUser.is_default ? "访" : authUser.username.slice(0, 1).toUpperCase()}</span>
             <div>
-              <small>{authUser.is_default ? "共享身份" : "个人空间"}</small>
-              <strong>{authUser.username}</strong>
+              <small>{authStatus === "checking" ? "正在确认身份" : workspaceLocked ? "需要认证" : authUser.is_default ? "共享身份" : "个人空间"}</small>
+              <strong>{workspaceLocked ? SIGNED_OUT_USER.username : authUser.username}</strong>
             </div>
           </div>
           <div className="account-card__actions">
-            {authUser.is_default ? (
+            {workspaceLocked || authUser.is_default ? (
               <>
-                <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("login")}>登录</button>
-                <button type="button" disabled={identitySwitchBlocked} onClick={() => openAuth("register")}>注册</button>
+                <button type="button" disabled={!workspaceLocked && identitySwitchBlocked} onClick={() => openAuth("login")}>登录</button>
+                <button type="button" disabled={!workspaceLocked && identitySwitchBlocked} onClick={() => openAuth("register")}>注册</button>
               </>
             ) : null}
             <button
-              className={`account-card__mode-toggle${authUser.is_default ? " account-card__mode-toggle--wide" : ""}`}
+              className={`account-card__mode-toggle${workspaceLocked || authUser.is_default ? " account-card__mode-toggle--wide" : ""}`}
               type="button"
               role="switch"
               aria-checked={showDetails}
@@ -1906,13 +1962,14 @@ export default function App() {
               <span>详细模式</span>
               <i aria-hidden="true"><b /></i>
             </button>
-            {!authUser.is_default ? (
+            {authReady && !authUser.is_default ? (
               <button className="account-card__logout" type="button" disabled={identitySwitchBlocked} onClick={() => void logout()}>
                 注销
               </button>
             ) : null}
           </div>
-          {identitySwitchBlocked ? <p>结束当前运行和后台任务后可切换账户。</p> : null}
+          {!workspaceLocked && identitySwitchBlocked ? <p>结束当前运行和后台任务后可切换账户。</p> : null}
+          {authStatus === "required" ? <p>请登录或注册后开始研究任务。</p> : null}
           {!authMode && authError ? <p className="account-card__error">{authError}</p> : null}
         </section>
 
@@ -2161,6 +2218,8 @@ export default function App() {
             <label htmlFor="research-input">
               {pendingInterrupt
                 ? "请先处理上方待确认事项"
+                : workspaceLocked
+                  ? "登录后可开始研究任务"
                 : stream.isLoading
                   ? "补充要求或纠正方向"
                   : "描述你的网页或文件分析任务"}
@@ -2172,13 +2231,13 @@ export default function App() {
                 accept=".csv,.tsv,.xlsx"
                 multiple
                 onChange={(event) => void onFilesSelected(event)}
-                disabled={identitySwitchBlocked}
+                disabled={workspaceLocked || identitySwitchBlocked}
                 aria-label="选择本地表格文件"
               />
               <button
                 type="button"
                 className="attachment-button"
-                disabled={identitySwitchBlocked || uploadedFiles.filter((file) => file.status === "ready").length >= MAX_UPLOAD_FILES}
+                disabled={workspaceLocked || identitySwitchBlocked || uploadedFiles.filter((file) => file.status === "ready").length >= MAX_UPLOAD_FILES}
                 onClick={() => fileInputRef.current?.click()}
               >
                 <span aria-hidden="true">＋</span>
@@ -2231,8 +2290,8 @@ export default function App() {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onComposerKeyDown}
-              placeholder="例如：分析已上传订单表的月度趋势和异常值，并生成图表……"
-              disabled={pendingInterrupt !== null}
+              placeholder={workspaceLocked ? "请先登录或注册" : "例如：分析已上传订单表的月度趋势和异常值，并生成图表……"}
+              disabled={workspaceLocked || pendingInterrupt !== null}
             />
             <span>
               {pendingInterrupt
@@ -2246,7 +2305,7 @@ export default function App() {
             <button
               className="send-button"
               type="submit"
-              disabled={!input.trim() || pendingInterrupt !== null || !filesReadyForAnalysis}
+              disabled={workspaceLocked || !input.trim() || pendingInterrupt !== null || !filesReadyForAnalysis}
               aria-label={stream.isLoading ? "排队发送消息" : "发送分析任务"}
             >
               <span>{stream.isLoading ? "排队发送" : "发送任务"}</span>

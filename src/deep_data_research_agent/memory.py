@@ -409,8 +409,8 @@ def _capture_user_evidence(state: Any) -> tuple[str, str]:
     )
 
 
-def _capture_failure_evidence(state: Any) -> list[dict[str, str]]:
-    """Keep only bounded tool evidence from the current visible user turn."""
+def _capture_execution_evidence(state: Any) -> list[dict[str, str]]:
+    """Keep bounded tool, subtask, and artifact-check evidence from this turn."""
 
     messages = list((state or {}).get("messages", []))
     human_index = next(
@@ -792,11 +792,12 @@ async def _extract_failure_decision(
 
 Agent：{agent_name}
 Agent 提交的候选教训：{content}
-已脱敏的工具证据：{json.dumps(evidence, ensure_ascii=False)}
+已脱敏的执行证据（来自工具、子任务、产物核验或其他确定性检查）：
+{json.dumps(evidence, ensure_ascii=False)}
 当前活动索引：{json.dumps(compact_index, ensure_ascii=False)}
 
 规则：
-1. 只有工具证据同时确认失败表现、确定原因和可执行解决方法时才能 add 或 merge。
+1. 只有执行证据能够确认失败表现、确定原因和解决方法的有效性时才能 add 或 merge。
 2. 临时网络、限流、偶发超时、未知原因、仅有报错原文、成功经验必须 discard。
 3. 内容必须跨用户、跨任务复用；不得包含身份、供应商、URL、路径、密钥或具体业务数据。
 4. 与已有条目语义相同或高度重叠时 merge，并使用真实存在的 merge_target_id。
@@ -971,8 +972,10 @@ def create_failure_lesson_tool(agent_name: AgentName):
     @tool(
         "record_failure_lesson",
         description=(
-            "仅当工具结果已确认失败表现、确定原因和可执行解决方法时，记录一条可跨任务复用"
-            "的失败教训。临时网络错误、未知原因、原始日志或成功经验不要调用。"
+            "仅当当前任务中出现已被执行证据确认的失败或踩坑，并已确定失败表现、原因、"
+            "可执行解决方法及验证结果时，记录一条可跨任务复用的失败教训。"
+            "执行证据可以来自工具结果，以及通过工具结果返回的子任务结果、产物核验或其他确定性检查。"
+            "临时网络错误、限流、偶发超时、未知原因、原始日志、用户或业务特定问题以及成功经验不要调用。"
         ),
     )
     async def record_failure_lesson(
@@ -981,15 +984,15 @@ def create_failure_lesson_tool(agent_name: AgentName):
             Field(
                 min_length=16,
                 max_length=1200,
-                description="简述已确认的失败、原因、解决方法和验证结果",
+                description="简述已确认的执行失败或踩坑、原因、解决方法和验证结果",
             ),
         ],
         runtime: ToolRuntime,
     ) -> ToolMessage:
-        evidence = _capture_failure_evidence(runtime.state)
+        evidence = _capture_execution_evidence(runtime.state)
         if not evidence:
             return ToolMessage(
-                content="未记录：当前轮没有可核验的工具证据。",
+                content="未记录：当前轮没有可核验的执行证据。",
                 tool_call_id=runtime.tool_call_id,
                 name="record_failure_lesson",
                 status="error",

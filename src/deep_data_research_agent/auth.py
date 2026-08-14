@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from langgraph_sdk import Auth
 from starlette.requests import Request
 
 from deep_data_research_agent import database
+from deep_data_research_agent.config import get_settings
 
 auth = Auth()
+logger = logging.getLogger(__name__)
 
 
 def bearer_token(authorization: str | None) -> str | None:
@@ -54,6 +57,21 @@ async def authenticate_request(request: Request) -> Auth.types.MinimalUserDict:
 
     token = bearer_token(request.headers.get("authorization"))
     if token is None:
+        # Auth-first mode still runs this hook for custom routes. Keep only the
+        # credential entry points public; all other production routes fail shut.
+        if request.url.path in {"/auth/register", "/auth/login", "/auth/logout"}:
+            return {
+                "identity": "public-auth",
+                "display_name": "认证入口",
+                "is_authenticated": False,
+                "permissions": ["public-auth"],
+            }
+        if get_settings().app_env == "production":
+            raise Auth.exceptions.HTTPException(
+                status_code=401,
+                detail="请先登录",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         await database.ensure_schema()
         return {
             "identity": database.DEFAULT_USER_ID,
@@ -109,6 +127,27 @@ async def create_run(
     ctx: Auth.types.AuthContext,
     value: Auth.types.on.threads.create_run.value,
 ) -> dict[str, str]:
+    settings = get_settings()
+    try:
+        decision = await database.consume_rate_limit(
+            "agent_run",
+            ctx.user.identity,
+            limit=settings.agent_run_limit,
+            window_seconds=settings.agent_run_window_seconds,
+        )
+    except Exception as exc:
+        logger.exception("Agent run 限流存储不可用")
+        raise Auth.exceptions.HTTPException(
+            status_code=503,
+            detail="请求保护服务暂不可用，请稍后重试",
+        ) from exc
+    if not decision.allowed:
+        raise Auth.exceptions.HTTPException(
+            status_code=429,
+            detail="请求过于频繁，请稍后再试",
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
+
     metadata = value.setdefault("metadata", {})
     metadata["owner"] = ctx.user.identity
     thread_id = value.get("thread_id")

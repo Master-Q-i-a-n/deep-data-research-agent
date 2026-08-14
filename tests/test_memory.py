@@ -238,7 +238,7 @@ async def test_capture_user_memory_enqueues_without_model_wait(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_failure_tool_requires_and_redacts_tool_evidence(monkeypatch) -> None:
+async def test_failure_tool_requires_and_redacts_execution_evidence(monkeypatch) -> None:
     calls: list[dict] = []
 
     class Queue:
@@ -263,6 +263,12 @@ async def test_failure_tool_requires_and_redacts_tool_evidence(monkeypatch) -> N
                 name="database_query_preview",
                 status="error",
             ),
+            ToolMessage(
+                content="修正字段类型后预览查询成功，返回列符合预期",
+                tool_call_id="query-b",
+                name="database_query_preview",
+                status="success",
+            ),
         ]
     )
     result = await memory.DATA_ANALYST_FAILURE_TOOL.coroutine(
@@ -277,6 +283,41 @@ async def test_failure_tool_requires_and_redacts_tool_evidence(monkeypatch) -> N
     assert "example.com" not in str(calls[0]["payload"])
     assert "/workspace/" not in str(calls[0]["payload"])
     assert "secret123" not in str(calls[0]["payload"])
+    assert [item["status"] for item in calls[0]["payload"]["evidence"]] == [
+        "error",
+        "success",
+    ]
+
+
+def test_failure_tool_description_covers_reusable_execution_pitfalls() -> None:
+    description = memory.DATA_ANALYST_FAILURE_TOOL.description
+
+    assert "失败或踩坑" in description
+    assert "工具结果、子任务结果、产物核验或其他确定性检查" in description
+    assert "用户或业务特定问题" in description
+    assert "仅当工具结果" not in description
+
+
+@pytest.mark.asyncio
+async def test_failure_consolidator_uses_execution_evidence_scope(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    async def invoke(_schema, prompt):
+        captured["prompt"] = prompt
+        return memory.FailureDecision(action="discard")
+
+    monkeypatch.setattr(memory, "_invoke_structured_memory_model", invoke)
+    result = await memory._extract_failure_decision(
+        agent_name="supervisor",
+        content="重复委派造成同一报告被覆盖；改为单次委派后产物核验通过",
+        evidence=[{"name": "task", "status": "success", "result": "产物核验通过"}],
+        existing=[],
+    )
+
+    assert result.action == "discard"
+    assert "工具、子任务、产物核验或其他确定性检查" in captured["prompt"]
+    assert "只有执行证据能够确认" in captured["prompt"]
+    assert "只有工具证据" not in captured["prompt"]
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from langchain_openai import ChatOpenAI
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     postgres_checkpoint_pool_max_size: int = Field(default=5, ge=1, le=50)
     postgres_pool_timeout_seconds: float = Field(default=30.0, ge=1, le=120)
     auth_session_days: int = Field(default=7, ge=1, le=90)
+    rate_limit_key_secret: SecretStr = SecretStr("")
+    auth_login_failure_limit: int = Field(default=5, ge=1, le=100)
+    auth_login_window_seconds: int = Field(default=900, ge=1, le=86400)
+    auth_register_limit: int = Field(default=3, ge=1, le=100)
+    auth_register_window_seconds: int = Field(default=3600, ge=1, le=86400)
+    agent_run_limit: int = Field(default=10, ge=1, le=1000)
+    agent_run_window_seconds: int = Field(default=60, ge=1, le=86400)
     mongodb_uri: str = ""
     mongodb_database: str = "deep_data_research_agent"
     mongodb_skill_collection: str = "skill_files"
@@ -95,6 +102,15 @@ class Settings(BaseSettings):
     memory_consolidation_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
 
     artifact_root: Path = Path("data/users")
+
+    @model_validator(mode="after")
+    def validate_production_security(self) -> Settings:
+        """Require a stable keyed hash secret for distributed production limits."""
+
+        secret = self.rate_limit_key_secret.get_secret_value()
+        if self.app_env == "production" and len(secret) < 32:
+            raise ValueError("生产环境 RATE_LIMIT_KEY_SECRET 至少需要 32 个字符")
+        return self
 
 
 @lru_cache(maxsize=1)
