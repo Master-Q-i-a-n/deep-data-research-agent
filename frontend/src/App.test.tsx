@@ -89,7 +89,17 @@ function createStreamState() {
 let streamState = createStreamState();
 
 function enableDetailedMode() {
+  fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
   fireEvent.click(screen.getByRole("switch", { name: "详细模式" }));
+  fireEvent.click(screen.getByRole("button", { name: "关闭设置" }));
+}
+
+function expectDetailedMode(enabled: boolean) {
+  fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+  expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe(String(enabled));
+  fireEvent.click(screen.getByRole("button", { name: "关闭设置" }));
 }
 
 type FetchHandler = (
@@ -222,7 +232,7 @@ describe("研究工作台", () => {
     render(<App />);
 
     expect(await screen.findByText("默认账户")).toBeTruthy();
-    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("false");
+    expectDetailedMode(false);
     expect(screen.queryByLabelText("研究执行状态")).toBeNull();
     expect(capturedOptions?.defaultHeaders).toEqual({});
     expect(capturedOptions?.filterSubagentMessages).toBe(true);
@@ -256,8 +266,8 @@ describe("研究工作台", () => {
     expect((screen.getByRole("button", { name: "登录" }) as HTMLButtonElement).disabled).toBe(false);
     expect((screen.getByRole("button", { name: "注册" }) as HTMLButtonElement).disabled).toBe(false);
 
-    fireEvent.click(screen.getByRole("switch", { name: "详细模式" }));
-    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");
+    enableDetailedMode();
+    expectDetailedMode(true);
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/threads/search"))).toBe(false);
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/async-tasks/status"))).toBe(false);
   });
@@ -353,7 +363,7 @@ describe("研究工作台", () => {
     expect(stop).toHaveBeenCalled();
 
     enableDetailedMode();
-    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");
+    expectDetailedMode(true);
     expect(screen.getByText("旧问题")).toBeTruthy();
     expect(screen.getByText("分配 Skill")).toBeTruthy();
     expect(screen.getByLabelText("研究执行状态")).toBeTruthy();
@@ -446,11 +456,11 @@ describe("研究工作台", () => {
   it("详细模式选择不跨页面挂载持久化", () => {
     const view = render(<App />);
     enableDetailedMode();
-    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");
+    expectDetailedMode(true);
 
     view.unmount();
     render(<App />);
-    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("false");
+    expectDetailedMode(false);
   });
 
   it("注册后保存令牌、切换身份并清空旧 thread", async () => {
@@ -489,6 +499,65 @@ describe("研究工作台", () => {
     );
     expect(switchThread).toHaveBeenCalledWith(null);
     await waitFor(() => expect(capturedOptions?.defaultHeaders).toEqual({ Authorization: "Bearer token-a" }));
+  });
+
+  it("账户菜单通过设置弹窗清除当前用户记忆", async () => {
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    window.localStorage.setItem("deep-data-auth-token", "token-a");
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ user: { id: "user-a", username: "Alice", is_default: false } }),
+        };
+      }
+      if (url.endsWith("/memories/user") && init?.method === "DELETE") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status: "cleared", cancelled_jobs: 1 }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText("Alice")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+    expect(screen.getByRole("menuitem", { name: "退出登录" })).toBeTruthy();
+    expect(screen.queryByText("注销")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    expect(screen.getByRole("dialog", { name: "设置" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "清除记忆" }));
+    expect(screen.getByText(/会话、文件、Skill 与公共失败经验不受影响/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "确认清除" }));
+
+    expect(await screen.findByText("记忆已清除，将从下一次任务起生效。")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/memories/user",
+      {
+        method: "DELETE",
+        headers: { Authorization: "Bearer token-a" },
+      },
+    );
+  });
+
+  it("运行期间设置弹窗允许切换显示但禁止清除记忆", async () => {
+    streamState.isLoading = true;
+    render(<App />);
+    await screen.findByText("默认账户");
+
+    fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+
+    expect((screen.getByRole("button", { name: "清除记忆" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("当前任务结束后才能清除记忆。")).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: "详细模式" }));
+    expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");
   });
 
   it("列出当前用户的会话并可切换历史 thread", async () => {

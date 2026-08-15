@@ -1,3 +1,4 @@
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,43 @@ async def test_valid_token_returns_registered_user(monkeypatch) -> None:
     assert user["identity"] == "user-a"
     assert user["display_name"] == "Alice"
     assert user["is_authenticated"] is True
+
+
+@pytest.mark.asyncio
+async def test_clear_memory_uses_only_authenticated_user_hash(monkeypatch) -> None:
+    captured: list[str] = []
+
+    async def resolve(_token: str) -> database.UserRecord:
+        return database.UserRecord("user-a", "Alice", False)
+
+    class Queue:
+        async def clear_user_memory(self, identity_hash: str) -> int:
+            captured.append(identity_hash)
+            return 2
+
+    monkeypatch.setattr(database, "resolve_login_session", resolve)
+    monkeypatch.setattr(webapp, "MEMORY_QUEUE", Queue())
+
+    result = await webapp.clear_current_user_memory("Bearer valid")
+
+    assert result == {"status": "cleared", "cancelled_jobs": 2}
+    assert captured == [hashlib.sha256(b"user-a").hexdigest()]
+
+
+@pytest.mark.asyncio
+async def test_clear_memory_returns_service_unavailable_without_leaking_error(
+    monkeypatch,
+) -> None:
+    class Queue:
+        async def clear_user_memory(self, _identity_hash: str) -> int:
+            raise RuntimeError("mongodb://secret-host")
+
+    monkeypatch.setattr(webapp, "MEMORY_QUEUE", Queue())
+
+    with pytest.raises(Exception, match="记忆服务暂不可用") as exc_info:
+        await webapp.clear_current_user_memory(None)
+
+    assert "secret-host" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio

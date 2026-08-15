@@ -58,6 +58,9 @@ MONGODB_MEMORY_COLLECTION=memories
 MONGODB_MEMORY_JOB_COLLECTION=memory_update_jobs
 MEMORY_MODEL=
 MEMORY_CONSOLIDATION_TIMEOUT_SECONDS=30
+FAILURE_REVIEW_SNAPSHOT_MAX_BYTES=4194304
+FAILURE_REVIEW_DELAY_SECONDS=1
+FAILURE_REVIEW_PAYLOAD_TTL_HOURS=24
 POSTGRES_URI=postgresql://deep_data_research_agent_app:your-password@127.0.0.1:5432/deep_data_research_agent
 POSTGRES_APP_POOL_SIZE=5
 POSTGRES_APP_MAX_OVERFLOW=10
@@ -117,6 +120,10 @@ Token 时 LangGraph Auth 注入共享身份 `local-user`；生产环境无 Token
 独立 UUID。MongoDB 不配置 TTL 和向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要
 写入 PostgreSQL。注册、登录失败和外部 Agent run 使用 PostgreSQL 固定窗口限流；应用只读取
 ASGI peer 地址，不直接信任 `X-Forwarded-For`。
+
+自动失败回顾在业务 Agent 结束后延迟 10 秒领取，以尽量复用 DeepSeek 上下文缓存；该延迟
+不阻塞 Agent 回复。登录用户也可以在前端设置中仅清除自己的偏好与行为反馈，不影响会话、
+Skill、产物和公共失败经验。
 
 如需清空所有用户记忆和失败经验并重新开始，应先停止应用，再执行：
 
@@ -191,10 +198,10 @@ npm run dev
 - 工具调用输入、结果和运行状态；
 - 停止生成、新建任务及 thread URL 恢复；
 - 当前用户的 Supervisor 会话历史、首条任务标题和历史 thread 切换；
-- 注册、登录、注销和刷新后的登录恢复。
+- 注册、登录、退出登录和刷新后的登录恢复。
 - 用户明确要求时，经确认将 PDF 主报告和完整材料 ZIP 发送到本次提供的单个邮箱。
 
-登录、注册或注销后，前端会清除当前 thread 并进入对应身份的新空间。开发环境的默认账户由
+登录、注册或退出登录后，前端会清除当前 thread 并进入对应身份的新空间。开发环境的默认账户由
 所有未登录浏览器共享，不会在登录时把其会话或 Skill 复制到个人账户；生产环境未登录时保留
 首页，但会锁定会话、上传和任务操作。
 

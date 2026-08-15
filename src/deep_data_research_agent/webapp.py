@@ -36,7 +36,7 @@ from deep_data_research_agent.artifacts import (
 )
 from deep_data_research_agent.auth import bearer_token
 from deep_data_research_agent.config import get_settings
-from deep_data_research_agent.memory import start_memory_worker
+from deep_data_research_agent.memory import MEMORY_QUEUE, start_memory_worker
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
 _PASSWORD_HASHER = PasswordHasher()
@@ -489,6 +489,26 @@ async def current_user(
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
     return {"user": _user_payload(user)}
+
+
+@app.delete("/memories/user")
+async def clear_current_user_memory(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Clear only the authenticated user's learned preferences and feedback."""
+
+    user_id = await _authenticated_user_id(authorization)
+    identity_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    try:
+        async with asyncio.timeout(5):
+            cancelled_jobs = await MEMORY_QUEUE.clear_user_memory(identity_hash)
+    except Exception as exc:
+        logger.exception("清除用户记忆失败")
+        raise HTTPException(
+            status_code=503,
+            detail="记忆服务暂不可用，请稍后重试",
+        ) from exc
+    return {"status": "cleared", "cancelled_jobs": cancelled_jobs}
 
 
 @app.get("/artifacts/{thread_id}")

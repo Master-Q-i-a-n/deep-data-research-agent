@@ -22,8 +22,8 @@ from deep_data_research_agent.backends import (
 from deep_data_research_agent.config import create_chat_model
 from deep_data_research_agent.identity import user_identity_from_config
 from deep_data_research_agent.memory import (
-    CRAWL_WORKER_FAILURE_TOOL,
     USER_MEMORY_PATH,
+    FailureReviewMiddleware,
     MemoryRefreshMiddleware,
     agent_memory_path,
 )
@@ -96,7 +96,7 @@ class CrawlWorkerState(DeepAgentState):
 crawl_agent = create_deep_agent(
     name="crawl-worker-agent",
     model=create_chat_model(worker=True),
-    tools=[*CRAWL_TOOLS, CRAWL_WORKER_FAILURE_TOOL],
+    tools=[*CRAWL_TOOLS],
     system_prompt=CRAWL_WORKER_PROMPT,
     middleware=[
         MemoryRefreshMiddleware(
@@ -113,6 +113,10 @@ crawl_agent = create_deep_agent(
                 (f"{public_skill_root('crawl-worker')}/", "公共"),
                 (f"{user_skill_root('crawl-worker')}/", "用户"),
             ],
+        ),
+        FailureReviewMiddleware(
+            agent_name="crawl-worker",
+            reviewable_tools={tool.name for tool in CRAWL_TOOLS},
         ),
     ],
     backend=create_worker_backend,

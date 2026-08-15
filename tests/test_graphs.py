@@ -22,7 +22,7 @@ def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
     assert "request_report_download" in tools
     assert "send_report_email" in tools
     assert "capture_user_memory" in tools
-    assert "record_failure_lesson" in tools
+    assert "record_failure_lesson" not in tools
     assert "start_async_task" in tools
     assert "check_async_task" in tools
     assert "task" in tools
@@ -48,12 +48,8 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
         "export_workspace",
         "build_result",
     } <= set(worker_graph.nodes)
-    assert {
-        "tavily_search",
-        "tavily_crawl",
-        "tavily_extract",
-        "record_failure_lesson",
-    } <= set(tools)
+    assert {"tavily_search", "tavily_crawl", "tavily_extract"} <= set(tools)
+    assert "record_failure_lesson" not in tools
     assert "execute" in tools
     assert "task" not in tools
 
@@ -80,7 +76,6 @@ def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() ->
         "database_get_object_details",
         "database_query_preview",
         "database_query_to_file",
-        "record_failure_lesson",
     } <= set(tools)
     assert not {
         "task",
@@ -89,6 +84,7 @@ def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() ->
         "request_report_download",
         "send_report_email",
         "tavily_search",
+        "record_failure_lesson",
     } & set(tools)
 
 
@@ -113,11 +109,11 @@ def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() ->
     assert "不得仅\n  完成探查、部分指标或某个报告章节" in DATA_ANALYST_PROMPT
     assert "相对于报告文件的路径嵌入" in DATA_ANALYST_PROMPT
     assert "capture_user_memory" in SUPERVISOR_PROMPT
-    assert "record_failure_lesson" in SUPERVISOR_PROMPT
+    assert "record_failure_lesson" not in SUPERVISOR_PROMPT
     assert "明确要求通过邮件发送报告" in SUPERVISOR_PROMPT
     assert "不从记忆或历史收件人中推测" in SUPERVISOR_PROMPT
     assert "不得自行创建新的邮件工具调用" in SUPERVISOR_PROMPT
-    assert "record_failure_lesson" in DATA_ANALYST_PROMPT
+    assert "record_failure_lesson" not in DATA_ANALYST_PROMPT
 
 
 @pytest.mark.asyncio
@@ -157,6 +153,8 @@ def test_agents_enable_the_expected_memory_sources() -> None:
 
     assert "MemoryRefreshMiddleware.before_agent" in supervisor_names
     assert "MemoryRefreshMiddleware.before_agent" in worker_names
+    assert "FailureReviewMiddleware.after_agent" in supervisor_names
+    assert "FailureReviewMiddleware.after_agent" in worker_names
     # The custom subclass replaces the duplicate memory= middleware and owns
     # both refresh and read-only prompt injection.
     assert "MemoryMiddleware.before_agent" not in supervisor_names
@@ -168,6 +166,7 @@ def test_agents_enable_the_expected_memory_sources() -> None:
     ]
     data_analyst_names = set(child_graphs["data-analyst"].get_graph().nodes)
     assert "MemoryRefreshMiddleware.before_agent" in data_analyst_names
+    assert "FailureReviewMiddleware.after_agent" in data_analyst_names
 
 
 def test_supervisor_sandbox_lifecycle_precedes_skill_loading() -> None:

@@ -102,6 +102,11 @@ type AuthUser = {
   username: string;
   is_default: boolean;
 };
+type MemoryClearResponse = {
+  status?: string;
+  cancelled_jobs?: number;
+  detail?: string;
+};
 
 const AUTH_TOKEN_KEY = "deep-data-auth-token";
 const TASK_POLL_INTERVAL_MS = 4_000;
@@ -834,6 +839,14 @@ export default function App() {
   const [interruptSubmitting, setInterruptSubmitting] = useState(false);
   const [interruptError, setInterruptError] = useState("");
   const [showDetails, setShowDetails] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [memoryClearConfirm, setMemoryClearConfirm] = useState(false);
+  const [memoryClearing, setMemoryClearing] = useState(false);
+  const [memoryStatus, setMemoryStatus] = useState<{
+    tone: "success" | "error";
+    message: string;
+  } | null>(null);
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const conversationRef = useRef<HTMLElement>(null);
@@ -844,6 +857,9 @@ export default function App() {
   const approvedSemanticDownloadRef = useRef(false);
   const semanticDownloadBaselineRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const accountMenuRef = useRef<HTMLElement>(null);
+  const accountMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const settingsCloseButtonRef = useRef<HTMLButtonElement>(null);
   const mainSnapshotRef = useRef<{
     threadId?: string;
     messages: Message[];
@@ -1376,6 +1392,40 @@ export default function App() {
   }, [apiUrl, authHeaders, authToken]);
 
   useEffect(() => {
+    if (!accountMenuOpen) return undefined;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!accountMenuRef.current?.contains(event.target as Node)) {
+        setAccountMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAccountMenuOpen(false);
+        accountMenuButtonRef.current?.focus();
+      }
+    };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [accountMenuOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen) return undefined;
+    settingsCloseButtonRef.current?.focus();
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || memoryClearing) return;
+      setSettingsOpen(false);
+      setMemoryClearConfirm(false);
+      accountMenuButtonRef.current?.focus();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [memoryClearing, settingsOpen]);
+
+  useEffect(() => {
     setPolledTasks({});
     setTaskRefreshError("");
     setDismissedTaskFailures(new Set());
@@ -1894,13 +1944,60 @@ export default function App() {
         method: "POST",
         headers: authHeaders,
       });
-      if (!response.ok) throw new Error("注销失败，请稍后重试");
+      if (!response.ok) throw new Error("退出登录失败，请稍后重试");
       window.localStorage.removeItem(AUTH_TOKEN_KEY);
       setAuthToken(null);
       setAuthStatus("checking");
       resetThreadForIdentityChange();
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "账户服务不可用");
+    }
+  }
+
+  function openSettings() {
+    setAccountMenuOpen(false);
+    setMemoryClearConfirm(false);
+    setMemoryStatus(null);
+    setSettingsOpen(true);
+  }
+
+  function closeSettings() {
+    if (memoryClearing) return;
+    setSettingsOpen(false);
+    setMemoryClearConfirm(false);
+    accountMenuButtonRef.current?.focus();
+  }
+
+  async function clearUserMemory() {
+    if (!authReady || identitySwitchBlocked || memoryClearing) return;
+    setMemoryClearing(true);
+    setMemoryStatus(null);
+    try {
+      const response = await fetch(`${apiUrl}/memories/user`, {
+        method: "DELETE",
+        headers: authHeaders,
+      });
+      const body = await response.json() as MemoryClearResponse;
+      if (response.status === 401) {
+        expireAuthentication();
+        setSettingsOpen(false);
+        return;
+      }
+      if (!response.ok || body.status !== "cleared") {
+        throw new Error(body.detail || "清除记忆失败，请稍后重试");
+      }
+      setMemoryClearConfirm(false);
+      setMemoryStatus({
+        tone: "success",
+        message: "记忆已清除，将从下一次任务起生效。",
+      });
+    } catch (error) {
+      setMemoryStatus({
+        tone: "error",
+        message: error instanceof Error ? error.message : "记忆服务暂不可用，请稍后重试",
+      });
+    } finally {
+      setMemoryClearing(false);
     }
   }
 
@@ -1937,37 +2034,53 @@ export default function App() {
           onRefresh={() => void loadSessions()}
         />
 
-        <section className="account-card" aria-label="当前账户">
+        <section className="account-card" aria-label="当前账户" ref={accountMenuRef}>
           <div className="account-card__identity">
             <span aria-hidden="true">{workspaceLocked ? "访" : authUser.is_default ? "访" : authUser.username.slice(0, 1).toUpperCase()}</span>
             <div>
               <small>{authStatus === "checking" ? "正在确认身份" : workspaceLocked ? "需要认证" : authUser.is_default ? "共享身份" : "个人空间"}</small>
               <strong>{workspaceLocked ? SIGNED_OUT_USER.username : authUser.username}</strong>
             </div>
+            <button
+              ref={accountMenuButtonRef}
+              className="account-card__menu-trigger"
+              type="button"
+              aria-label="打开账户菜单"
+              aria-haspopup="menu"
+              aria-expanded={accountMenuOpen}
+              onClick={() => setAccountMenuOpen((current) => !current)}
+            >
+              <span aria-hidden="true">•••</span>
+            </button>
           </div>
-          <div className="account-card__actions">
-            {workspaceLocked || authUser.is_default ? (
-              <>
+          {accountMenuOpen ? (
+            <div className="account-menu" role="menu" aria-label="账户菜单">
+              <button type="button" role="menuitem" onClick={openSettings}>
+                <span aria-hidden="true">⚙</span>
+                设置
+              </button>
+              {authReady && !authUser.is_default ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={identitySwitchBlocked}
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    void logout();
+                  }}
+                >
+                  <span aria-hidden="true">↪</span>
+                  退出登录
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {workspaceLocked || authUser.is_default ? (
+            <div className="account-card__actions">
                 <button type="button" disabled={!workspaceLocked && identitySwitchBlocked} onClick={() => openAuth("login")}>登录</button>
                 <button type="button" disabled={!workspaceLocked && identitySwitchBlocked} onClick={() => openAuth("register")}>注册</button>
-              </>
-            ) : null}
-            <button
-              className={`account-card__mode-toggle${workspaceLocked || authUser.is_default ? " account-card__mode-toggle--wide" : ""}`}
-              type="button"
-              role="switch"
-              aria-checked={showDetails}
-              onClick={() => setShowDetails((current) => !current)}
-            >
-              <span>详细模式</span>
-              <i aria-hidden="true"><b /></i>
-            </button>
-            {authReady && !authUser.is_default ? (
-              <button className="account-card__logout" type="button" disabled={identitySwitchBlocked} onClick={() => void logout()}>
-                注销
-              </button>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
           {!workspaceLocked && identitySwitchBlocked ? <p>结束当前运行和后台任务后可切换账户。</p> : null}
           {authStatus === "required" ? <p>请登录或注册后开始研究任务。</p> : null}
           {!authMode && authError ? <p className="account-card__error">{authError}</p> : null}
@@ -2339,6 +2452,80 @@ export default function App() {
           <TodoPanel todos={todos} />
           <SubagentPlanPanel subagents={stream.subagents} />
         </aside>
+      ) : null}
+
+      {settingsOpen ? (
+        <div className="settings-overlay" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) closeSettings();
+        }}>
+          <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <header>
+              <div>
+                <p className="eyebrow">个人工作台</p>
+                <h2 id="settings-title">设置</h2>
+              </div>
+              <button
+                ref={settingsCloseButtonRef}
+                type="button"
+                disabled={memoryClearing}
+                onClick={closeSettings}
+                aria-label="关闭设置"
+              >×</button>
+            </header>
+
+            <div className="settings-section">
+              <div className="settings-section__copy">
+                <strong>详细模式</strong>
+                <span>显示工具调用、子智能体轨迹和完整执行计划。</span>
+              </div>
+              <button
+                className="settings-toggle"
+                type="button"
+                role="switch"
+                aria-label="详细模式"
+                aria-checked={showDetails}
+                onClick={() => setShowDetails((current) => !current)}
+              >
+                <i aria-hidden="true"><b /></i>
+              </button>
+            </div>
+
+            <div className="settings-section settings-section--danger">
+              <div className="settings-section__copy">
+                <strong>清除记忆</strong>
+                <span>清除当前用户的偏好和行为反馈；会话、文件、Skill 与公共失败经验不受影响。</span>
+              </div>
+              {!memoryClearConfirm ? (
+                <button
+                  className="settings-danger-button"
+                  type="button"
+                  disabled={!authReady || identitySwitchBlocked || memoryClearing}
+                  onClick={() => {
+                    setMemoryClearConfirm(true);
+                    setMemoryStatus(null);
+                  }}
+                >清除记忆</button>
+              ) : (
+                <div className="settings-confirm" role="alert">
+                  <p>确认清除已记录的偏好和行为反馈？此操作无法撤销。</p>
+                  <div>
+                    <button type="button" disabled={memoryClearing} onClick={() => setMemoryClearConfirm(false)}>取消</button>
+                    <button type="button" disabled={memoryClearing} onClick={() => void clearUserMemory()}>
+                      {memoryClearing ? "正在清除…" : "确认清除"}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {!authReady ? <p className="settings-hint">登录后才能清除用户记忆。</p> : null}
+              {authReady && identitySwitchBlocked ? <p className="settings-hint">当前任务结束后才能清除记忆。</p> : null}
+              {memoryStatus ? (
+                <p className={`settings-status settings-status--${memoryStatus.tone}`} role="status">
+                  {memoryStatus.message}
+                </p>
+              ) : null}
+            </div>
+          </section>
+        </div>
       ) : null}
 
       {authMode ? (

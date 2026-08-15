@@ -11,10 +11,10 @@ from deep_data_research_agent.config import create_chat_model
 from deep_data_research_agent.database_tools import DATABASE_TOOLS
 from deep_data_research_agent.interaction_tools import INTERACTION_TOOLS
 from deep_data_research_agent.memory import (
-    DATA_ANALYST_FAILURE_TOOL,
     SUPERVISOR_MEMORY_TOOLS,
     USER_MEMORY_PATH,
     AsyncTaskBridgeMiddleware,
+    FailureReviewMiddleware,
     MemoryRefreshMiddleware,
     agent_memory_path,
 )
@@ -50,7 +50,7 @@ graph = create_deep_agent(
                 "PNG 产物；信息不足时返回 needs_input。"
             ),
             system_prompt=DATA_ANALYST_PROMPT,
-            tools=[*DATABASE_TOOLS, DATA_ANALYST_FAILURE_TOOL],
+            tools=[*DATABASE_TOOLS],
             skills=[
                 f"{public_skill_root('data-analyst')}/",
                 f"{user_skill_root('data-analyst')}/",
@@ -63,7 +63,11 @@ graph = create_deep_agent(
                 MongoSkillsRestoreMiddleware(
                     component="supervisor",
                     agent_name="data-analyst",
-                )
+                ),
+                FailureReviewMiddleware(
+                    agent_name="data-analyst",
+                    reviewable_tools={tool.name for tool in DATABASE_TOOLS},
+                ),
             ],
         )
     ],
@@ -107,6 +111,20 @@ graph = create_deep_agent(
                 (f"{public_skill_root('supervisor')}/", "公共"),
                 (f"{user_skill_root('supervisor')}/", "用户"),
             ],
+        ),
+        FailureReviewMiddleware(
+            agent_name="supervisor",
+            reviewable_tools={
+                "task",
+                "start_async_task",
+                "check_async_task",
+                "update_async_task",
+                "cancel_async_task",
+                "list_async_tasks",
+                "assign_skill",
+                "request_report_download",
+                "send_report_email",
+            },
         ),
     ],
     backend=create_backend,

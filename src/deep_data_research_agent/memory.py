@@ -1,7 +1,7 @@
 """MongoDB-backed user memory and shared per-Agent failure lessons.
 
-Agents can only read memory files. Explicit tools enqueue bounded evidence, and
-the lifespan-managed worker owns extraction, validation, merging, and writes.
+Agents can only read memory files. User feedback is captured explicitly, while
+tool-using Agent turns enqueue one automatic review for the background worker.
 """
 
 from __future__ import annotations
@@ -12,17 +12,32 @@ import inspect
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NotRequired
 
 import yaml
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.memory import MemoryMiddleware, MemoryState
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    AgentState,
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+)
+from langchain.agents.middleware.types import PrivateStateAttr
 from langchain.tools import ToolRuntime, tool
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    ToolMessage,
+    message_to_dict,
+    messages_from_dict,
+)
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import Command
 from langsmith import traceable
 from openai import APIConnectionError, APIStatusError, RateLimitError
@@ -38,14 +53,18 @@ from pydantic import (
 from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from deep_data_research_agent.config import create_memory_model, get_settings
+from deep_data_research_agent.config import (
+    create_failure_review_model,
+    create_memory_model,
+    get_settings,
+)
 from deep_data_research_agent.identity import user_hash
 from deep_data_research_agent.sandbox_manager import thread_id_from_runtime
 
 logger = logging.getLogger(__name__)
 
 AgentName = Literal["supervisor", "data-analyst", "crawl-worker"]
-MemoryJobKind = Literal["user_memory", "failure_lesson"]
+MemoryJobKind = Literal["user_memory", "failure_lesson", "failure_review"]
 
 AGENT_NAMES: tuple[AgentName, ...] = (
     "supervisor",
@@ -62,6 +81,9 @@ _QUEUE_JOB_LEASE_SECONDS = 120
 _WORKER_LEASE_SECONDS = 300
 _MAX_QUEUE_ATTEMPTS = 3
 _RETRY_DELAYS = (5, 30, 120)
+_COMMON_REVIEWABLE_TOOLS = frozenset(
+    {"execute", "ls", "read_file", "write_file", "edit_file", "glob", "grep"}
+)
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---(?:\s*\n|\Z)", re.DOTALL)
 _SENSITIVE_TEXT_PATTERNS = (
     re.compile(r"\b(?:sk|tvly)-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE),
@@ -295,6 +317,31 @@ class FailureDecision(BaseModel):
         return self
 
 
+class FailureReviewSnapshot(BaseModel):
+    """Serializable copy of the terminal model request used by the reviewer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    turn_id: str
+    final_message_id: str
+    model_name: str
+    system_message: dict[str, Any] | None = None
+    messages: list[dict[str, Any]]
+    final_response: dict[str, Any]
+    tool_schemas: list[dict[str, Any]]
+    model_settings: dict[str, Any]
+    executed_tools: list[str]
+
+
+class FailureReviewState(AgentState):
+    """Private per-invocation state contributed by failure review middleware."""
+
+    failure_review_snapshot: NotRequired[
+        Annotated[dict[str, Any] | None, PrivateStateAttr]
+    ]
+
+
 class StoredFailure(BaseModel):
     """Canonical metadata stored alongside each rendered detail file."""
 
@@ -409,26 +456,117 @@ def _capture_user_evidence(state: Any) -> tuple[str, str]:
     )
 
 
-def _capture_execution_evidence(state: Any) -> list[dict[str, str]]:
-    """Keep bounded tool, subtask, and artifact-check evidence from this turn."""
+def _json_safe(value: Any) -> Any:
+    """Convert request metadata to bounded Mongo/JSON-compatible primitives."""
 
-    messages = list((state or {}).get("messages", []))
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _current_turn(messages: list[Any]) -> tuple[str, list[Any]]:
     human_index = next(
-        (index for index in range(len(messages) - 1, -1, -1) if _is_visible_human(messages[index])),
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if _is_visible_human(messages[index])
+        ),
         -1,
     )
-    evidence: list[dict[str, str]] = []
-    for message in messages[human_index + 1 :]:
-        if not isinstance(message, ToolMessage):
-            continue
-        evidence.append(
-            {
-                "name": _normalize_short_text(message.name or "unknown", limit=80),
-                "status": _normalize_short_text(message.status or "success", limit=20),
-                "result": _redact_text(_message_text(message), limit=420),
-            }
+    turn_messages = messages[human_index:] if human_index >= 0 else messages
+    if human_index >= 0:
+        human = messages[human_index]
+        human_id = str(getattr(human, "id", "") or "")
+        if human_id:
+            return human_id, turn_messages
+        serialized = json.dumps(message_to_dict(human), ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:20], turn_messages
+    return "no-visible-user", turn_messages
+
+
+def _completed_tool_names(messages: list[Any]) -> set[str]:
+    """Resolve completed ToolMessages to names, including messages without name."""
+
+    call_names: dict[str, str] = {}
+    completed: set[str] = set()
+    for message in messages:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                call_id = str(call.get("id") or "")
+                name = str(call.get("name") or "")
+                if call_id and name:
+                    call_names[call_id] = name
+        elif isinstance(message, ToolMessage):
+            name = str(getattr(message, "name", "") or "")
+            if not name:
+                name = call_names.get(str(message.tool_call_id), "")
+            if name:
+                completed.add(name)
+    return completed
+
+
+def _model_response_message(response: ModelResponse[Any]) -> AIMessage | None:
+    return next(
+        (message for message in reversed(response.result) if isinstance(message, AIMessage)),
+        None,
+    )
+
+
+def _failure_review_snapshot(
+    request: ModelRequest[Any],
+    response: ModelResponse[Any],
+    *,
+    reviewable_tools: frozenset[str],
+) -> FailureReviewSnapshot | None:
+    final_message = _model_response_message(response)
+    if final_message is None or final_message.tool_calls:
+        return None
+
+    turn_id, turn_messages = _current_turn(list(request.messages))
+    executed_tools = sorted(
+        _completed_tool_names(turn_messages).intersection(reviewable_tools)
+    )
+    if not executed_tools:
+        return None
+
+    tool_schemas: list[dict[str, Any]] = []
+    for candidate in request.tools:
+        try:
+            tool_schemas.append(_json_safe(convert_to_openai_tool(candidate)))
+        except (TypeError, ValueError):
+            logger.warning("跳过无法序列化的回顾工具 Schema：%s", type(candidate).__name__)
+
+    final_message_id = str(final_message.id or "")
+    if not final_message_id:
+        serialized = json.dumps(
+            message_to_dict(final_message),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
         )
-    return evidence[-10:]
+        final_message_id = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:20]
+
+    model_name = str(
+        getattr(request.model, "model_name", "")
+        or getattr(request.model, "model", "")
+        or get_settings().openai_model
+    )
+    # Agent naming is added after the provider response. Do not replay it to
+    # DeepSeek because the original cached assistant output had no ``name``.
+    replay_final_message = final_message.model_copy(update={"name": None})
+    return FailureReviewSnapshot(
+        turn_id=turn_id,
+        final_message_id=final_message_id,
+        model_name=model_name,
+        system_message=(
+            _json_safe(message_to_dict(request.system_message))
+            if request.system_message is not None
+            else None
+        ),
+        messages=[_json_safe(message_to_dict(message)) for message in request.messages],
+        final_response=_json_safe(message_to_dict(replay_final_message)),
+        tool_schemas=tool_schemas,
+        model_settings=_json_safe(request.model_settings),
+        executed_tools=executed_tools,
+    )
 
 
 def _render_user_memory(memory: UserMemory) -> str:
@@ -464,6 +602,13 @@ def _store_content(document: dict[str, Any] | None) -> str | None:
         return None
     content = value.get("content")
     return content if isinstance(content, str) else None
+
+
+def _user_memory_generation(document: dict[str, Any] | None) -> int:
+    """Read the internal clear-generation; legacy documents start at zero."""
+
+    value = document.get("generation", 0) if document else 0
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def _apply_user_patch(current: UserMemory, patch: UserMemoryPatch) -> UserMemory:
@@ -807,6 +952,231 @@ Agent 提交的候选教训：{content}
     return FailureDecision.model_validate(result)
 
 
+def _parse_failure_decision(message: AIMessage) -> FailureDecision:
+    # The reviewer is invoked directly, so no tool could execute. Still reject
+    # every attempted call to keep the review contract explicit and auditable.
+    if message.tool_calls or message.invalid_tool_calls:
+        raise TypeError("失败回顾模型不得调用工具")
+    text = _message_text(message).strip()
+    if text.startswith("```"):
+        text = re.sub(r"\A```(?:json)?\s*", "", text, count=1, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```\Z", "", text, count=1)
+    return FailureDecision.model_validate(json.loads(text))
+
+
+def _cache_token_usage(message: AIMessage) -> tuple[int, int]:
+    """Normalize DeepSeek cache counters across OpenAI response adapters."""
+
+    usage = message.usage_metadata or {}
+    details = usage.get("input_token_details") or {}
+    metadata_usage = message.response_metadata.get("token_usage") or {}
+    hit_value = details.get("cache_read")
+    if hit_value is None:
+        hit_value = metadata_usage.get("prompt_cache_hit_tokens")
+    hit = int(hit_value or 0)
+
+    miss_value = details.get("cache_miss")
+    if miss_value is None:
+        miss_value = metadata_usage.get("prompt_cache_miss_tokens")
+    if miss_value is not None:
+        return hit, int(miss_value)
+
+    # ChatOpenAI's aggregated streaming response currently retains cache_read
+    # but may omit cache_miss. DeepSeek defines prompt_tokens as hit + miss,
+    # so derive the missing counter without treating it as a full cache hit.
+    input_tokens = usage.get("input_tokens")
+    if input_tokens is None:
+        input_tokens = metadata_usage.get("prompt_tokens")
+    miss = max(int(input_tokens or 0) - hit, 0)
+    return hit, miss
+
+
+@traceable(
+    name="memory.failure.review",
+    run_type="chain",
+    process_inputs=lambda inputs: {"agent": inputs.get("agent_name")},
+    process_outputs=lambda output: {"action": output[0].action},
+)
+async def _extract_failure_review_decision(
+    *,
+    agent_name: AgentName,
+    snapshot: FailureReviewSnapshot,
+    existing: list[StoredFailure],
+) -> tuple[FailureDecision, dict[str, Any]]:
+    compact_index = [
+        {
+            "id": item.lesson_id,
+            "title": item.lesson.title,
+            "applicability": item.lesson.applicability,
+            "cause": item.lesson.cause,
+            "remedy": item.lesson.remedy,
+            "tags": item.lesson.tags,
+        }
+        for item in sorted(existing, key=_failure_sort_key, reverse=True)
+    ]
+    review_prompt = f"""现在只回顾刚刚结束的 {agent_name} 执行，不继续完成用户任务。
+
+严禁调用任何工具。请求中保留的工具定义仅用于复用原始请求前缀，不是可执行能力。
+不得返回 tool_calls，不得继续原任务，只能直接输出符合 FailureDecision Schema 的单个 JSON 对象。
+
+本轮边界：{snapshot.turn_id}
+本轮已完成的执行工具：{json.dumps(snapshot.executed_tools, ensure_ascii=False)}
+当前公共失败索引：{json.dumps(compact_index, ensure_ascii=False)}
+
+只返回符合以下 JSON Schema 的一个 JSON 对象：
+{json.dumps(FailureDecision.model_json_schema(), ensure_ascii=False)}
+
+判断规则：
+1. 只分析本轮边界之后的工具调用、工具结果、修复动作、验证结果和最终回复。
+2. 只有失败表现、确定原因、可执行处理方法和验证方式均有执行证据时才能 add 或 merge。
+3. 纯成功过程、临时网络/限流/偶发超时、未知原因、只出现错误原文时必须 discard。
+4. 内容必须跨用户、跨任务复用，不得包含身份、业务数据、URL、路径、账号、密钥或原始日志。
+5. 与索引中条目语义相同或高度重叠时使用 merge，并返回真实 merge_target_id。
+6. 一轮存在多个问题时，只保留证据最完整、复用价值最高的一条；没有则 discard。
+7. add/merge 必须返回完整 lesson；discard 时 lesson 和 merge_target_id 均为 null。"""
+
+    request_messages = messages_from_dict(snapshot.messages)
+    final_response = messages_from_dict([snapshot.final_response])[0]
+    messages: list[Any] = []
+    if snapshot.system_message is not None:
+        messages.extend(messages_from_dict([snapshot.system_message]))
+    messages.extend([*request_messages, final_response, HumanMessage(content=review_prompt)])
+
+    model: Any = create_failure_review_model(
+        snapshot.model_name,
+        worker=agent_name == "crawl-worker",
+    )
+    if snapshot.tool_schemas:
+        # Keep the original binding shape for DeepSeek prefix-cache reuse. This
+        # direct model call is never routed through a tool execution node.
+        model = model.bind_tools(snapshot.tool_schemas)
+
+    started = time.perf_counter()
+    cache_hit_tokens = 0
+    cache_miss_tokens = 0
+    last_error: Exception | None = None
+    for attempt in range(2):
+        response = await model.ainvoke(
+            messages,
+            config={
+                "callbacks": [],
+                "tags": ["memory-internal", "failure-review", agent_name],
+            },
+        )
+        if not isinstance(response, AIMessage):
+            raise TypeError("失败回顾模型未返回 AIMessage")
+        hit, miss = _cache_token_usage(response)
+        cache_hit_tokens += hit
+        cache_miss_tokens += miss
+        try:
+            decision = _parse_failure_decision(response)
+            return decision, {
+                "action": decision.action,
+                "model": snapshot.model_name,
+                "cache_hit_tokens": cache_hit_tokens,
+                "cache_miss_tokens": cache_miss_tokens,
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+            }
+        except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+            last_error = exc
+            if attempt == 0:
+                messages.extend(
+                    [
+                        response,
+                        HumanMessage(
+                            content=(
+                                "上一输出未通过 FailureDecision Schema 校验。"
+                                "严禁调用任何工具或返回 tool_calls。"
+                                "请只返回字段完整、枚举正确的 JSON 对象。"
+                            )
+                        ),
+                    ]
+                )
+                continue
+            raise OutputParserException("失败回顾模型连续两次返回无效 JSON") from exc
+    raise OutputParserException("失败回顾模型未返回有效结果") from last_error
+
+
+class FailureReviewMiddleware(AgentMiddleware[FailureReviewState, Any, Any]):
+    """Capture one terminal request and enqueue one automatic review per turn."""
+
+    state_schema = FailureReviewState
+
+    def __init__(
+        self,
+        *,
+        agent_name: AgentName,
+        reviewable_tools: set[str] | frozenset[str],
+    ) -> None:
+        self.agent_name = _safe_agent_name(agent_name)
+        self.reviewable_tools = frozenset(reviewable_tools) | _COMMON_REVIEWABLE_TOOLS
+
+    async def awrap_model_call(self, request, handler):
+        response = await handler(request)
+        snapshot = _failure_review_snapshot(
+            request,
+            response,
+            reviewable_tools=self.reviewable_tools,
+        )
+        if snapshot is None:
+            return response
+        return ExtendedModelResponse(
+            model_response=response,
+            command=Command(
+                update={"failure_review_snapshot": snapshot.model_dump(mode="json")}
+            ),
+        )
+
+    async def aafter_agent(self, state, runtime):
+        raw_snapshot = (state or {}).get("failure_review_snapshot")
+        if not isinstance(raw_snapshot, dict):
+            return None
+        try:
+            snapshot = FailureReviewSnapshot.model_validate(raw_snapshot)
+            payload = {"snapshot": snapshot.model_dump(mode="json")}
+            serialized = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            try:
+                thread_id = thread_id_from_runtime(runtime)
+            except (RuntimeError, ValueError, KeyError, AttributeError):
+                configurable = (runtime.config or {}).get("configurable", {})
+                thread_id = str(configurable.get("thread_id") or "unknown-thread")
+            thread_digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
+            fingerprint = hashlib.sha256(serialized).hexdigest()
+            idempotency_key = hashlib.sha256(
+                (
+                    f"failure_review|{self.agent_name}|{thread_digest}|"
+                    f"{snapshot.final_message_id}|{fingerprint}"
+                ).encode()
+            ).hexdigest()
+            settings = get_settings()
+            async with asyncio.timeout(2):
+                if len(serialized) > settings.failure_review_snapshot_max_bytes:
+                    await MEMORY_QUEUE.record_skipped_failure_review(
+                        scope=self.agent_name,
+                        idempotency_key=idempotency_key,
+                        thread_digest=thread_digest,
+                        snapshot_bytes=len(serialized),
+                    )
+                else:
+                    await MEMORY_QUEUE.enqueue(
+                        kind="failure_review",
+                        scope=self.agent_name,
+                        idempotency_key=idempotency_key,
+                        thread_digest=thread_digest,
+                        payload=payload,
+                    )
+        except Exception:
+            # Background learning must never turn a successful business run
+            # into a failed Agent response.
+            logger.exception("自动失败回顾入队失败：%s", self.agent_name)
+        return {"failure_review_snapshot": None}
+
+
 class MemoryRefreshMiddleware(MemoryMiddleware):
     """Reload read-only MongoDB memory instead of reusing checkpoint contents."""
 
@@ -966,70 +1336,6 @@ async def capture_user_memory(runtime: ToolRuntime) -> ToolMessage:
     )
 
 
-def create_failure_lesson_tool(agent_name: AgentName):
-    """Create one graph-local tool while keeping the public tool name stable."""
-
-    @tool(
-        "record_failure_lesson",
-        description=(
-            "仅当当前任务中出现已被执行证据确认的失败或踩坑，并已确定失败表现、原因、"
-            "可执行解决方法及验证结果时，记录一条可跨任务复用的失败教训。"
-            "执行证据可以来自工具结果，以及通过工具结果返回的子任务结果、产物核验或其他确定性检查。"
-            "临时网络错误、限流、偶发超时、未知原因、原始日志、用户或业务特定问题以及成功经验不要调用。"
-        ),
-    )
-    async def record_failure_lesson(
-        content: Annotated[
-            str,
-            Field(
-                min_length=16,
-                max_length=1200,
-                description="简述已确认的执行失败或踩坑、原因、解决方法和验证结果",
-            ),
-        ],
-        runtime: ToolRuntime,
-    ) -> ToolMessage:
-        evidence = _capture_execution_evidence(runtime.state)
-        if not evidence:
-            return ToolMessage(
-                content="未记录：当前轮没有可核验的执行证据。",
-                tool_call_id=runtime.tool_call_id,
-                name="record_failure_lesson",
-                status="error",
-            )
-        normalized = _redact_text(content, limit=1200)
-        idempotency_key, thread_id = _job_idempotency_key(
-            runtime,
-            kind="failure_lesson",
-            scope=agent_name,
-        )
-        try:
-            async with asyncio.timeout(2):
-                await MEMORY_QUEUE.enqueue(
-                    kind="failure_lesson",
-                    scope=agent_name,
-                    idempotency_key=idempotency_key,
-                    thread_digest=hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12],
-                    payload={"content": normalized, "evidence": evidence},
-                )
-        except Exception as exc:
-            logger.exception("失败经验入队失败：%s", agent_name)
-            return ToolMessage(
-                content=f"未记录失败经验：{type(exc).__name__}",
-                tool_call_id=runtime.tool_call_id,
-                name="record_failure_lesson",
-                status="error",
-            )
-        return ToolMessage(
-            content="失败经验已可靠加入后台整理队列。",
-            tool_call_id=runtime.tool_call_id,
-            name="record_failure_lesson",
-            status="success",
-        )
-
-    return record_failure_lesson
-
-
 class MemoryQueue:
     """MongoDB-backed durable queue and single leased memory writer."""
 
@@ -1074,22 +1380,73 @@ class MemoryQueue:
         thread_digest: str,
         payload: dict[str, Any],
     ) -> bool:
+        jobs, _leases, memories = await self._collections()
+        now = datetime.now(UTC)
+        queued_payload = dict(payload)
+        if kind == "user_memory":
+            namespace = user_memory_namespace_from_hash(scope)
+            document = await memories.find_one(
+                {
+                    "namespace_str": _namespace_string(namespace),
+                    "key": USER_MEMORY_KEY,
+                }
+            )
+            queued_payload["memory_generation"] = _user_memory_generation(document)
+        inserted: dict[str, Any] = {
+            "kind": kind,
+            "scope": scope,
+            "idempotency_key": idempotency_key,
+            "thread_digest": thread_digest,
+            "payload": queued_payload,
+            "status": "pending",
+            "attempts": 0,
+            "available_at": (
+                now + timedelta(seconds=get_settings().failure_review_delay_seconds)
+                if kind == "failure_review"
+                else now
+            ),
+            "created_at": now,
+            "updated_at": now,
+        }
+        if kind == "failure_review":
+            inserted["expires_at"] = now + timedelta(
+                hours=get_settings().failure_review_payload_ttl_hours
+            )
+        result = await jobs.update_one(
+            {"idempotency_key": idempotency_key},
+            {"$setOnInsert": inserted},
+            upsert=True,
+        )
+        return result.upserted_id is not None
+
+    async def record_skipped_failure_review(
+        self,
+        *,
+        scope: str,
+        idempotency_key: str,
+        thread_digest: str,
+        snapshot_bytes: int,
+    ) -> bool:
+        """Persist an oversize skip without retaining the raw model context."""
+
         jobs, _leases, _memories = await self._collections()
         now = datetime.now(UTC)
         result = await jobs.update_one(
             {"idempotency_key": idempotency_key},
             {
                 "$setOnInsert": {
-                    "kind": kind,
+                    "kind": "failure_review",
                     "scope": scope,
                     "idempotency_key": idempotency_key,
                     "thread_digest": thread_digest,
-                    "payload": payload,
-                    "status": "pending",
+                    "status": "skipped",
+                    "skip_reason": "snapshot_too_large",
+                    "snapshot_bytes": snapshot_bytes,
                     "attempts": 0,
-                    "available_at": now,
                     "created_at": now,
                     "updated_at": now,
+                    "finished_at": now,
+                    "expires_at": now + timedelta(days=7),
                 }
             },
             upsert=True,
@@ -1141,6 +1498,102 @@ class MemoryQueue:
             },
             upsert=True,
         )
+
+    async def _put_user_memory_file(
+        self,
+        namespace: tuple[str, ...],
+        value: dict[str, Any],
+        *,
+        expected_generation: int,
+    ) -> bool:
+        """Write only while no concurrent clear has advanced the generation."""
+
+        _jobs, _leases, memories = await self._collections()
+        now = datetime.now(UTC)
+        generation_filter: dict[str, Any]
+        if expected_generation == 0:
+            generation_filter = {
+                "$or": [
+                    {"generation": 0},
+                    {"generation": {"$exists": False}},
+                ]
+            }
+        else:
+            generation_filter = {"generation": expected_generation}
+        try:
+            result = await memories.update_one(
+                {
+                    "namespace_str": _namespace_string(namespace),
+                    "key": USER_MEMORY_KEY,
+                    **generation_filter,
+                },
+                {
+                    "$set": {
+                        "namespace_str": _namespace_string(namespace),
+                        "value": value,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {
+                        "namespace": list(namespace),
+                        "generation": expected_generation,
+                        "created_at": now,
+                    },
+                },
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            # A clear won the race and kept the unique namespace/key document.
+            return False
+        return result.matched_count > 0 or result.upserted_id is not None
+
+    async def clear_user_memory(self, identity_hash: str) -> int:
+        """Reset one user's learned preferences and invalidate stale jobs."""
+
+        jobs, _leases, memories = await self._collections()
+        namespace = user_memory_namespace_from_hash(identity_hash)
+        now = datetime.now(UTC)
+        empty_memory = UserMemory()
+        await memories.update_one(
+            {
+                "namespace_str": _namespace_string(namespace),
+                "key": USER_MEMORY_KEY,
+            },
+            {
+                "$set": {
+                    "namespace_str": _namespace_string(namespace),
+                    "value": {
+                        "content": _render_user_memory(empty_memory),
+                        "encoding": "utf-8",
+                        "memory_kind": "user_memory",
+                        "memory": empty_memory.model_dump(mode="json"),
+                    },
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "namespace": list(namespace),
+                    "created_at": now,
+                },
+                "$inc": {"generation": 1},
+            },
+            upsert=True,
+        )
+        cancelled = await jobs.update_many(
+            {
+                "kind": "user_memory",
+                "scope": identity_hash,
+                "status": {"$in": ["pending", "retry", "processing"]},
+            },
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "finished_at": now,
+                    "updated_at": now,
+                    "expires_at": now + timedelta(days=7),
+                },
+                "$unset": {"payload": "", "lease_until": ""},
+            },
+        )
+        return int(cancelled.modified_count)
 
     async def _delete_memory_file(
         self,
@@ -1221,6 +1674,9 @@ class MemoryQueue:
         document = await self._memory_document(namespace, USER_MEMORY_KEY)
         current = _parse_user_memory(_store_content(document))
         payload = dict(job.get("payload") or {})
+        expected_generation = int(payload.get("memory_generation", 0))
+        if _user_memory_generation(document) != expected_generation:
+            return
         patch = await _extract_user_memory_patch(
             current=current,
             user_message=str(payload.get("user_message") or ""),
@@ -1229,16 +1685,134 @@ class MemoryQueue:
         updated = _apply_user_patch(current, patch)
         if updated == current:
             return
-        await self._put_memory_file(
+        await self._put_user_memory_file(
             namespace,
-            USER_MEMORY_KEY,
             {
                 "content": _render_user_memory(updated),
                 "encoding": "utf-8",
                 "memory_kind": "user_memory",
                 "memory": updated.model_dump(mode="json"),
             },
+            expected_generation=expected_generation,
         )
+
+    async def _apply_failure_decision(
+        self,
+        *,
+        agent_name: AgentName,
+        decision: FailureDecision,
+        fingerprint: str,
+        records: list[StoredFailure],
+    ) -> None:
+        if decision.action == "discard":
+            return
+        safe_lesson = (
+            _safe_public_failure_lesson(decision.lesson)
+            if decision.lesson is not None
+            else None
+        )
+        if safe_lesson is None:
+            return
+
+        exact = next(
+            (item for item in records if fingerprint in item.source_fingerprints),
+            None,
+        )
+        if exact is not None:
+            await self._put_failure(
+                exact.model_copy(
+                    update={"count": exact.count + 1, "last_seen": _utc_now()}
+                )
+            )
+        elif decision.action == "merge":
+            target = next(
+                (
+                    item
+                    for item in records
+                    if item.lesson_id == decision.merge_target_id
+                ),
+                None,
+            )
+            if target is None:
+                raise ValueError("记忆模型返回了不存在的合并目标")
+            await self._put_failure(
+                target.model_copy(
+                    update={
+                        "lesson": safe_lesson,
+                        "count": target.count + 1,
+                        "last_seen": _utc_now(),
+                        "source_fingerprints": _bounded_unique(
+                            [fingerprint, *target.source_fingerprints],
+                            limit=20,
+                            item_limit=20,
+                        ),
+                    }
+                )
+            )
+        else:
+            now = _utc_now()
+            record = StoredFailure(
+                lesson_id=_failure_id(safe_lesson),
+                agent=agent_name,
+                lesson=safe_lesson,
+                created_at=now,
+                last_seen=now,
+                source_fingerprints=[fingerprint],
+            )
+            existing_id = next(
+                (item for item in records if item.lesson_id == record.lesson_id),
+                None,
+            )
+            if existing_id is not None:
+                record = existing_id.model_copy(
+                    update={
+                        "lesson": safe_lesson,
+                        "count": existing_id.count + 1,
+                        "last_seen": now,
+                        "source_fingerprints": _bounded_unique(
+                            [fingerprint, *existing_id.source_fingerprints],
+                            limit=20,
+                            item_limit=20,
+                        ),
+                    }
+                )
+            await self._put_failure(record)
+
+        await self._enforce_failure_capacity(agent_name)
+        await self._rebuild_failure_index(agent_name)
+
+    async def _process_failure_review(self, job: dict[str, Any]) -> dict[str, Any]:
+        agent_name = _safe_agent_name(str(job.get("scope") or ""))
+        payload = dict(job.get("payload") or {})
+        raw_snapshot = payload.get("snapshot")
+        if not isinstance(raw_snapshot, dict):
+            raise TypeError("失败回顾缺少模型请求快照")
+        snapshot = FailureReviewSnapshot.model_validate(raw_snapshot)
+        records = await self._active_failures(agent_name)
+        decision, stats = await _extract_failure_review_decision(
+            agent_name=agent_name,
+            snapshot=snapshot,
+            existing=records,
+        )
+        fingerprint = _failure_fingerprint(
+            json.dumps(
+                {
+                    "turn": snapshot.turn_id,
+                    "tools": snapshot.executed_tools,
+                    "final": snapshot.final_response,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        )
+        await self._apply_failure_decision(
+            agent_name=agent_name,
+            decision=decision,
+            fingerprint=fingerprint,
+            records=records,
+        )
+        return stats
 
     async def _process_failure_lesson(self, job: dict[str, Any]) -> None:
         agent_name = _safe_agent_name(str(job.get("scope") or ""))
@@ -1394,19 +1968,30 @@ class MemoryQueue:
             return_document=ReturnDocument.AFTER,
         )
 
-    async def _mark_succeeded(self, job_id: Any) -> None:
+    async def _mark_succeeded(
+        self,
+        job: dict[str, Any],
+        *,
+        stats: dict[str, Any] | None = None,
+    ) -> None:
         jobs, _leases, _memories = await self._collections()
         now = datetime.now(UTC)
+        set_values: dict[str, Any] = {
+            "status": "succeeded",
+            "finished_at": now,
+            "updated_at": now,
+            "expires_at": now + timedelta(days=7),
+        }
+        if stats:
+            set_values["review_stats"] = _json_safe(stats)
+        unset_values = {"lease_until": ""}
+        if job.get("kind") == "failure_review":
+            unset_values["payload"] = ""
         await jobs.update_one(
-            {"_id": job_id, "status": "processing"},
+            {"_id": job["_id"], "status": "processing"},
             {
-                "$set": {
-                    "status": "succeeded",
-                    "finished_at": now,
-                    "updated_at": now,
-                    "expires_at": now + timedelta(days=7),
-                },
-                "$unset": {"lease_until": ""},
+                "$set": set_values,
+                "$unset": unset_values,
             },
         )
 
@@ -1422,6 +2007,9 @@ class MemoryQueue:
         attempts = int(job.get("attempts", 1))
         error_text = _memory_error_text(error)
         if not retryable or attempts >= _MAX_QUEUE_ATTEMPTS:
+            unset_values = {"lease_until": ""}
+            if job.get("kind") == "failure_review":
+                unset_values["payload"] = ""
             update = {
                 "$set": {
                     "status": "failed",
@@ -1430,7 +2018,7 @@ class MemoryQueue:
                     "expires_at": now + timedelta(days=30),
                     "last_error": error_text,
                 },
-                "$unset": {"lease_until": ""},
+                "$unset": unset_values,
             }
         else:
             delay = _RETRY_DELAYS[min(attempts - 1, len(_RETRY_DELAYS) - 1)]
@@ -1446,6 +2034,7 @@ class MemoryQueue:
         await jobs.update_one({"_id": job["_id"], "status": "processing"}, update)
 
     async def _process_job(self, job: dict[str, Any]) -> None:
+        stats: dict[str, Any] | None = None
         try:
             timeout = get_settings().memory_consolidation_timeout_seconds
             async with asyncio.timeout(timeout):
@@ -1454,6 +2043,8 @@ class MemoryQueue:
                     await self._process_user_memory(job)
                 elif kind == "failure_lesson":
                     await self._process_failure_lesson(job)
+                elif kind == "failure_review":
+                    stats = await self._process_failure_review(job)
                 else:
                     raise ValueError(f"未知记忆任务类型：{kind}")
         except Exception as exc:
@@ -1464,7 +2055,7 @@ class MemoryQueue:
                 retryable=_is_retryable_memory_error(exc),
             )
         else:
-            await self._mark_succeeded(job["_id"])
+            await self._mark_succeeded(job, stats=stats)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Consume sequentially while a lease makes multi-process startup safe."""
@@ -1565,7 +2156,4 @@ async def start_memory_worker() -> MemoryWorkerHandle | None:
 
 
 MEMORY_QUEUE = MemoryQueue()
-SUPERVISOR_FAILURE_TOOL = create_failure_lesson_tool("supervisor")
-DATA_ANALYST_FAILURE_TOOL = create_failure_lesson_tool("data-analyst")
-CRAWL_WORKER_FAILURE_TOOL = create_failure_lesson_tool("crawl-worker")
-SUPERVISOR_MEMORY_TOOLS = [capture_user_memory, SUPERVISOR_FAILURE_TOOL]
+SUPERVISOR_MEMORY_TOOLS = [capture_user_memory]
