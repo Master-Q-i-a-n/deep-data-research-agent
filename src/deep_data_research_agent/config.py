@@ -34,7 +34,6 @@ class Settings(BaseSettings):
     openai_model: str = "qwen-plus"
     openai_streaming: bool = False
     openai_timeout_seconds: float = 120.0
-
     tavily_api_key: str = ""
     tavily_project: str | None = None
 
@@ -100,12 +99,11 @@ class Settings(BaseSettings):
     # lifespan-managed background consolidator.
     memory_model: str | None = None
     memory_consolidation_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
-    failure_review_snapshot_max_bytes: int = Field(
-        default=4 * 1024 * 1024,
+    failure_review_bundle_max_bytes: int = Field(
+        default=256 * 1024,
         ge=1024,
-        le=8 * 1024 * 1024,
+        le=2 * 1024 * 1024,
     )
-    failure_review_delay_seconds: float = Field(default=1.0, ge=0, le=300)
     failure_review_payload_ttl_hours: int = Field(default=24, ge=1, le=168)
 
     artifact_root: Path = Path("data/users")
@@ -169,34 +167,4 @@ def create_memory_model() -> ChatOpenAI:
         # Consolidation jobs have their own durable retry policy.
         max_retries=0,
         streaming=False,
-    )
-
-
-@lru_cache(maxsize=8)
-def create_failure_review_model(
-    model_name: str | None = None,
-    *,
-    worker: bool = False,
-) -> ChatOpenAI:
-    """Reuse the corresponding business model client for failure review.
-
-    Sharing the model object also shares its AsyncOpenAI connection pool, which
-    lets this diagnostic path test whether DeepSeek cache locality is tied to
-    the original client. ``ainvoke`` still aggregates one private AIMessage.
-    """
-
-    settings = get_settings()
-    selected_model = model_name or settings.openai_model
-    if selected_model == settings.openai_model:
-        # Preserve the exact cache key used when each graph is constructed.
-        return create_chat_model(worker=True) if worker else create_chat_model()
-    return ChatOpenAI(
-        model=selected_model,
-        api_key=settings.openai_api_key or "not-configured",
-        base_url=settings.openai_base_url,
-        temperature=0,
-        timeout=settings.memory_consolidation_timeout_seconds,
-        # The durable MongoDB queue owns retry and backoff behavior.
-        max_retries=0,
-        streaming=False if worker else settings.openai_streaming,
     )

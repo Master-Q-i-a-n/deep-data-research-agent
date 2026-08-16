@@ -2,13 +2,12 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 from pydantic import ValidationError
 
-from deep_data_research_agent import config, memory
+from deep_data_research_agent import memory
 
 
 def _runtime(messages=None, *, tool_call_id="call-memory"):
@@ -258,138 +257,139 @@ async def test_capture_user_memory_enqueues_without_model_wait(monkeypatch) -> N
     assert len(calls[0]["idempotency_key"]) == 64
 
 
-def _review_request(messages, *, system="完整动态系统提示词") -> ModelRequest:
-    return ModelRequest(
-        model=SimpleNamespace(model_name="deepseek-v4-flash"),
-        messages=messages,
-        system_message=SystemMessage(content=system),
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "database_query_preview",
-                    "description": "只读预览",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ],
-        model_settings={"parallel_tool_calls": False},
-    )
-
-
-def test_failure_review_snapshot_requires_completed_reviewable_tool() -> None:
+def _review_messages(*, result="No matches found", final="没有查到结果"):
     user = HumanMessage(content="分析数据库", id="user-turn")
     tool_call = AIMessage(
-        content="",
+        content="这段中间解释不应进入后台回顾",
         tool_calls=[
             {
                 "name": "database_query_preview",
-                "args": {},
+                "args": {"query": "select * from orders where email='a@example.com'"},
                 "id": "query-a",
             }
         ],
     )
-    result = ToolMessage(
-        content="No matches found",
+    tool_result = ToolMessage(
+        content=result,
         tool_call_id="query-a",
         name="database_query_preview",
     )
     final_message = AIMessage(
-        content="没有查到结果",
+        content=final,
         id="final-a",
         name="data-analyst",
     )
-    response = ModelResponse(result=[final_message])
+    return [user, tool_call, tool_result, final_message]
 
-    snapshot = memory._failure_review_snapshot(
-        _review_request([user, tool_call, result]),
-        response,
+
+def test_failure_review_bundle_contains_only_completed_tool_evidence() -> None:
+    bundle = memory._failure_review_bundle(
+        _review_messages(),
         reviewable_tools=frozenset({"database_query_preview"}),
     )
 
-    assert snapshot is not None
-    assert snapshot.turn_id == "user-turn"
-    assert snapshot.final_message_id == "final-a"
-    assert snapshot.executed_tools == ["database_query_preview"]
-    assert snapshot.model_name == "deepseek-v4-flash"
-    assert snapshot.model_settings == {"parallel_tool_calls": False}
-    assert snapshot.system_message is not None
-    assert len(snapshot.messages) == 3
-    assert snapshot.final_response["data"]["name"] is None
-    assert final_message.name == "data-analyst"
+    assert bundle is not None
+    assert bundle.schema_version == 2
+    assert bundle.turn_id == "user-turn"
+    assert bundle.final_message_id == "final-a"
+    assert bundle.task_goal == "分析数据库"
+    assert bundle.final_response == "没有查到结果"
+    assert bundle.final_status == "unknown"
+    assert len(bundle.tool_events) == 1
+    event = bundle.tool_events[0]
+    assert event.tool_name == "database_query_preview"
+    assert event.status == "empty"
+    assert "a@example.com" not in event.arguments
+    serialized = bundle.model_dump_json()
+    assert "这段中间解释不应进入后台回顾" not in serialized
+    assert "system_message" not in serialized
+    assert "tool_schemas" not in serialized
 
-    no_tool = memory._failure_review_snapshot(
-        _review_request([HumanMessage(content="你好")]),
-        response,
+    structured = memory._failure_review_bundle(
+        _review_messages(final='{"status":"failed","summary":"查询失败"}'),
+        reviewable_tools=frozenset({"database_query_preview"}),
+    )
+    assert structured is not None
+    assert structured.final_status == "failed"
+
+    no_tool = memory._failure_review_bundle(
+        [HumanMessage(content="你好"), AIMessage(content="你好", id="final")],
         reviewable_tools=frozenset({"database_query_preview"}),
     )
     assert no_tool is None
 
 
 def test_failure_review_uses_latest_visible_user_as_turn_boundary() -> None:
-    messages = [
+    messages: list = [
         HumanMessage(content="旧任务", id="old"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "execute", "args": {}, "id": "old-tool"}],
+        ),
         ToolMessage(content="旧结果", tool_call_id="old-tool", name="execute"),
         HumanMessage(content="内部续跑", name="async-task-monitor"),
         HumanMessage(content="你好", id="new"),
+        AIMessage(content="你好", id="final-new"),
     ]
-    snapshot = memory._failure_review_snapshot(
-        _review_request(messages),
-        ModelResponse(result=[AIMessage(content="你好", id="final-new")]),
+    bundle = memory._failure_review_bundle(
+        messages,
         reviewable_tools=frozenset({"execute"}),
     )
 
-    assert snapshot is None
+    assert bundle is None
 
 
 @pytest.mark.asyncio
-async def test_failure_review_middleware_enqueues_terminal_snapshot_once(monkeypatch) -> None:
+async def test_failure_review_middleware_enqueues_compact_bundle_once(monkeypatch) -> None:
     calls: list[dict] = []
 
     class Queue:
+        async def get_memory_settings(self, _identity_hash):
+            return memory.MemorySettings()
+
         async def enqueue(self, **kwargs):
             calls.append(kwargs)
             return True
 
         async def record_skipped_failure_review(self, **_kwargs):
-            raise AssertionError("快照不应超限")
+            raise AssertionError("工具轨迹不应超限")
 
     monkeypatch.setattr(memory, "MEMORY_QUEUE", Queue())
     middleware = memory.FailureReviewMiddleware(
         agent_name="data-analyst",
         reviewable_tools={"database_query_preview"},
     )
-    request = _review_request(
-        [
-            HumanMessage(content="分析数据库", id="user-turn"),
-            ToolMessage(
-                content="空结果",
-                tool_call_id="query-a",
-                name="database_query_preview",
-            ),
-        ]
+    result = await middleware.aafter_agent(
+        {"messages": _review_messages(result="空结果", final="分析完成")},
+        _runtime(),
     )
 
-    async def handler(_request):
-        return ModelResponse(result=[AIMessage(content="分析完成", id="final-a")])
-
-    wrapped = await middleware.awrap_model_call(request, handler)
-    update = wrapped.command.update
-    cleared = await middleware.aafter_agent(
-        update,
-        SimpleNamespace(
-            config={"configurable": {"thread_id": "thread-a"}},
-        ),
-    )
-
-    assert cleared == {"failure_review_snapshot": None}
+    assert result is None
     assert len(calls) == 1
     assert calls[0]["kind"] == "failure_review"
     assert calls[0]["scope"] == "data-analyst"
-    assert calls[0]["payload"]["snapshot"]["executed_tools"] == [
-        "database_query_preview"
-    ]
+    assert calls[0]["payload"]["bundle"]["tool_events"][0]["tool_name"] == "database_query_preview"
+    assert calls[0]["source_user_hash"] == memory.user_hash(_runtime())
+    assert calls[0]["settings_generation"] == 0
     assert len(calls[0]["idempotency_key"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_failure_review_middleware_respects_disabled_setting(monkeypatch) -> None:
+    class Queue:
+        async def get_memory_settings(self, _identity_hash):
+            return memory.MemorySettings(failure_lesson_saving_enabled=False, generation=2)
+
+        async def enqueue(self, **_kwargs):
+            raise AssertionError("关闭后不应入队")
+
+    monkeypatch.setattr(memory, "MEMORY_QUEUE", Queue())
+    middleware = memory.FailureReviewMiddleware(
+        agent_name="data-analyst",
+        reviewable_tools={"database_query_preview"},
+    )
+
+    assert await middleware.aafter_agent({"messages": _review_messages()}, _runtime()) is None
 
 
 @pytest.mark.asyncio
@@ -397,8 +397,11 @@ async def test_failure_review_middleware_records_oversize_skip(monkeypatch) -> N
     skipped: list[dict] = []
 
     class Queue:
+        async def get_memory_settings(self, _identity_hash):
+            return memory.MemorySettings()
+
         async def enqueue(self, **_kwargs):
-            raise AssertionError("超限快照不应进入待处理队列")
+            raise AssertionError("超限工具轨迹不应进入待处理队列")
 
         async def record_skipped_failure_review(self, **kwargs):
             skipped.append(kwargs)
@@ -408,31 +411,26 @@ async def test_failure_review_middleware_records_oversize_skip(monkeypatch) -> N
     monkeypatch.setattr(
         memory,
         "get_settings",
-        lambda: SimpleNamespace(failure_review_snapshot_max_bytes=1),
+        lambda: SimpleNamespace(failure_review_bundle_max_bytes=1),
     )
     middleware = memory.FailureReviewMiddleware(
         agent_name="supervisor",
         reviewable_tools={"execute"},
     )
-    request = _review_request(
-        [
-            HumanMessage(content="执行", id="turn-a"),
-            ToolMessage(content="done", tool_call_id="exec-a", name="execute"),
-        ]
+    messages = [
+        HumanMessage(content="执行", id="turn-a"),
+        AIMessage(content="", tool_calls=[{"name": "execute", "args": {}, "id": "exec-a"}]),
+        ToolMessage(content="done", tool_call_id="exec-a", name="execute"),
+        AIMessage(content="完成", id="final-a"),
+    ]
+    result = await middleware.aafter_agent(
+        {"messages": messages},
+        _runtime(),
     )
 
-    async def handler(_request):
-        return ModelResponse(result=[AIMessage(content="完成", id="final-a")])
-
-    wrapped = await middleware.awrap_model_call(request, handler)
-    cleared = await middleware.aafter_agent(
-        wrapped.command.update,
-        SimpleNamespace(config={"configurable": {"thread_id": "thread-a"}}),
-    )
-
-    assert cleared == {"failure_review_snapshot": None}
+    assert result is None
     assert skipped[0]["scope"] == "supervisor"
-    assert skipped[0]["snapshot_bytes"] > 1
+    assert skipped[0]["bundle_bytes"] > 1
 
 
 @pytest.mark.asyncio
@@ -457,17 +455,32 @@ async def test_failure_consolidator_uses_execution_evidence_scope(monkeypatch) -
     assert "只有工具证据" not in captured["prompt"]
 
 
+def test_failure_review_accepts_at_most_three_decisions() -> None:
+    decisions = [
+        memory.FailureDecision(action="add", lesson=_lesson(f"可复用失败经验 {index}"))
+        for index in range(1, 4)
+    ]
+    result = memory.FailureReviewDecisions(decisions=decisions)
+    assert len(result.decisions) == 3
+
+    with pytest.raises(ValidationError):
+        memory.FailureReviewDecisions(
+            decisions=[
+                *decisions,
+                memory.FailureDecision(action="add", lesson=_lesson("第四条失败经验")),
+            ]
+        )
+
+
 @pytest.mark.asyncio
-async def test_failure_reviewer_replays_prefix_and_collects_cache_usage(monkeypatch) -> None:
+async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
     calls: list[dict] = []
-    decision = memory.FailureDecision(action="add", lesson=_lesson())
+    decisions = memory.FailureReviewDecisions(
+        decisions=[memory.FailureDecision(action="add", lesson=_lesson())]
+    )
     invocation_count = 0
 
     class Model:
-        def bind_tools(self, tools):
-            calls.append({"tools": tools})
-            return self
-
         async def ainvoke(self, messages, config=None):
             nonlocal invocation_count
             invocation_count += 1
@@ -476,185 +489,92 @@ async def test_failure_reviewer_replays_prefix_and_collects_cache_usage(monkeypa
                 content=(
                     "{}"
                     if invocation_count == 1
-                    else json.dumps(decision.model_dump(mode="json"), ensure_ascii=False)
+                    else json.dumps(decisions.model_dump(mode="json"), ensure_ascii=False)
                 ),
-                response_metadata={
-                    "token_usage": {
-                        "prompt_cache_hit_tokens": 60,
-                        "prompt_cache_miss_tokens": 4,
-                    }
-                },
+                usage_metadata={"input_tokens": 60, "output_tokens": 4, "total_tokens": 64},
             )
 
+    monkeypatch.setattr(memory, "create_memory_model", lambda: Model())
     monkeypatch.setattr(
         memory,
-        "create_failure_review_model",
-        lambda model_name, **_kwargs: (
-            Model() if model_name == "deepseek-v4-flash" else None
-        ),
+        "get_settings",
+        lambda: SimpleNamespace(memory_model="deepseek-memory", openai_model="deepseek-chat"),
     )
-    request = _review_request(
-        [
-            HumanMessage(content="分析数据库", id="user-turn"),
-            ToolMessage(
-                content="字段类型不匹配，读取结构后修复并验证成功",
-                tool_call_id="query-a",
-                name="database_query_preview",
-            ),
-        ]
-    )
-    snapshot = memory._failure_review_snapshot(
-        request,
-        ModelResponse(
-            result=[
-                AIMessage(
-                    content="分析完成",
-                    id="final-a",
-                    name="data-analyst",
-                )
-            ]
+    bundle = memory._failure_review_bundle(
+        _review_messages(
+            result="字段类型不匹配，读取结构后修复并验证成功",
+            final="分析完成",
         ),
         reviewable_tools=frozenset({"database_query_preview"}),
     )
-    assert snapshot is not None
+    assert bundle is not None
 
-    result, stats = await memory._extract_failure_review_decision(
+    result, stats = await memory._extract_failure_review_decisions(
         agent_name="data-analyst",
-        snapshot=snapshot,
+        bundle=bundle,
         existing=[],
     )
 
-    assert result.action == "add"
-    assert "tool_choice" not in calls[0]
-    replayed = calls[1]["messages"]
-    assert isinstance(replayed[0], SystemMessage)
-    assert replayed[0].content == "完整动态系统提示词"
-    assert str(replayed[-2].content) == "分析完成"
-    assert replayed[-2].name is None
-    assert "只回顾刚刚结束的 data-analyst 执行" in str(replayed[-1].content)
-    assert "严禁调用任何工具" in str(replayed[-1].content)
-    assert calls[1]["config"]["callbacks"] == []
-    assert stats["cache_hit_tokens"] == 120
-    assert stats["cache_miss_tokens"] == 8
-    assert "上一输出未通过 FailureDecision" in str(calls[2]["messages"][-1].content)
-
-
-def test_streaming_cache_usage_derives_missing_tokens_from_input_total() -> None:
-    message = AIMessage(
-        content="完成",
-        usage_metadata={
-            "input_tokens": 12_466,
-            "output_tokens": 123,
-            "total_tokens": 12_589,
-            "input_token_details": {"cache_read": 7_936},
-        },
+    assert [item.action for item in result.decisions] == ["add"]
+    assert len(calls) == 2
+    first_prompt = str(calls[0]["messages"][0].content)
+    assert "本轮精简执行证据" in first_prompt
+    assert "完整动态系统提示词" not in first_prompt
+    assert "这段中间解释不应进入后台回顾" not in first_prompt
+    assert calls[0]["config"]["callbacks"] == []
+    assert stats["input_tokens"] == 60
+    assert stats["output_tokens"] == 4
+    assert stats["model"] == "deepseek-memory"
+    assert "上一输出未通过 FailureReviewDecisions" in str(
+        calls[1]["messages"][-1].content
     )
-
-    assert memory._cache_token_usage(message) == (7_936, 4_530)
-
-
-def test_cache_usage_prefers_explicit_provider_miss_counter() -> None:
-    message = AIMessage(
-        content="完成",
-        usage_metadata={
-            "input_tokens": 100,
-            "output_tokens": 1,
-            "total_tokens": 101,
-        },
-        response_metadata={
-            "token_usage": {
-                "prompt_tokens": 100,
-                "prompt_cache_hit_tokens": 60,
-                "prompt_cache_miss_tokens": 4,
-            }
-        },
-    )
-
-    assert memory._cache_token_usage(message) == (60, 4)
-
-
-def test_failure_review_model_uses_streaming_request(monkeypatch) -> None:
-    monkeypatch.setattr(
-        config,
-        "get_settings",
-        lambda: SimpleNamespace(
-            openai_model="deepseek-v4-flash",
-            openai_api_key="test-key",
-            openai_base_url="https://api.deepseek.com",
-            openai_timeout_seconds=30,
-            openai_streaming=True,
-            memory_consolidation_timeout_seconds=30,
-        ),
-    )
-    config.create_chat_model.cache_clear()
-    config.create_failure_review_model.cache_clear()
-    try:
-        business_model = config.create_chat_model()
-        review_model = config.create_failure_review_model("deepseek-v4-flash")
-        worker_model = config.create_chat_model(worker=True)
-        worker_review_model = config.create_failure_review_model(
-            "deepseek-v4-flash",
-            worker=True,
-        )
-
-        assert review_model is business_model
-        assert review_model.async_client is business_model.async_client
-        assert review_model.streaming is True
-        assert worker_review_model is worker_model
-        assert worker_model is not business_model
-        assert worker_model.streaming is False
-        assert config.create_chat_model.cache_info().maxsize == 2
-    finally:
-        config.create_failure_review_model.cache_clear()
-        config.create_chat_model.cache_clear()
 
 
 @pytest.mark.asyncio
 async def test_failure_reviewer_rejects_tool_calls_and_never_executes_them(
     monkeypatch,
 ) -> None:
-    decision = memory.FailureDecision(action="discard")
+    decisions = memory.FailureReviewDecisions(
+        decisions=[memory.FailureDecision(action="discard")]
+    )
     responses = [
         AIMessage(
             content="",
             tool_calls=[{"name": "read_file", "args": {"path": "/tmp/a"}, "id": "call-a"}],
         ),
-        AIMessage(content=json.dumps(decision.model_dump(mode="json"))),
+        AIMessage(content=json.dumps(decisions.model_dump(mode="json"))),
     ]
     calls: list[list] = []
 
     class Model:
-        def bind_tools(self, _tools):
-            return self
-
         async def ainvoke(self, messages, config=None):
             calls.append(list(messages))
             return responses.pop(0)
 
+    monkeypatch.setattr(memory, "create_memory_model", lambda: Model())
     monkeypatch.setattr(
         memory,
-        "create_failure_review_model",
-        lambda _name, **_kwargs: Model(),
+        "get_settings",
+        lambda: SimpleNamespace(memory_model=None, openai_model="deepseek-chat"),
     )
-    snapshot = memory._failure_review_snapshot(
-        _review_request(
-            [
-                HumanMessage(content="读取文件", id="user-turn"),
-                ToolMessage(content="已读取", tool_call_id="query-a", name="read_file"),
-            ]
-        ),
-        ModelResponse(result=[AIMessage(content="完成", id="final-a")]),
+    bundle = memory._failure_review_bundle(
+        [
+            HumanMessage(content="读取文件", id="user-turn"),
+            AIMessage(content="", tool_calls=[{"name": "read_file", "args": {}, "id": "query-a"}]),
+            ToolMessage(content="已读取", tool_call_id="query-a", name="read_file"),
+            AIMessage(content="完成", id="final-a"),
+        ],
         reviewable_tools=frozenset({"read_file"}),
     )
-    assert snapshot is not None
+    assert bundle is not None
 
-    result, _stats = await memory._extract_failure_review_decision(
+    result, _stats = await memory._extract_failure_review_decisions(
         agent_name="supervisor",
-        snapshot=snapshot,
+        bundle=bundle,
         existing=[],
     )
 
-    assert result.action == "discard"
+    assert [item.action for item in result.decisions] == ["discard"]
     assert len(calls) == 2
     assert "严禁调用任何工具或返回 tool_calls" in str(calls[1][-1].content)
 
@@ -848,43 +768,53 @@ async def test_failure_job_adds_then_exactly_deduplicates(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_failure_review_job_adds_validated_public_lesson(monkeypatch) -> None:
+async def test_failure_review_job_adds_up_to_three_validated_public_lessons(monkeypatch) -> None:
     queue = InMemoryMemoryQueue()
-    request = _review_request(
-        [
-            HumanMessage(content="分析数据库", id="user-turn"),
-            ToolMessage(
-                content="字段类型错误，读取结构后修复并验证成功",
-                tool_call_id="query-a",
-                name="database_query_preview",
-            ),
-        ]
-    )
-    snapshot = memory._failure_review_snapshot(
-        request,
-        ModelResponse(result=[AIMessage(content="分析完成", id="final-a")]),
+    bundle = memory._failure_review_bundle(
+        _review_messages(result="字段类型错误，读取结构后修复并验证成功", final="分析完成"),
         reviewable_tools=frozenset({"database_query_preview"}),
     )
-    assert snapshot is not None
+    assert bundle is not None
 
     async def review(**_kwargs):
+        lessons = [
+            _lesson("查询前未确认字段类型"),
+            _lesson("写入前未核验目标目录"),
+            _lesson("生成后未检查产物完整性"),
+        ]
         return (
-            memory.FailureDecision(action="add", lesson=_lesson()),
-            {"action": "add", "cache_hit_tokens": 100},
+            memory.FailureReviewDecisions(
+                decisions=[
+                    memory.FailureDecision(action="add", lesson=lesson)
+                    for lesson in lessons
+                ]
+            ),
+            {"actions": ["add", "add", "add"], "lesson_count": 3, "input_tokens": 100},
         )
 
-    monkeypatch.setattr(memory, "_extract_failure_review_decision", review)
+    async def allowed(_job):
+        return True
+
+    monkeypatch.setattr(memory, "_extract_failure_review_decisions", review)
+    monkeypatch.setattr(queue, "_failure_review_is_allowed", allowed)
     stats = await queue._process_failure_review(
         {
+            "_id": "review-a",
             "scope": "data-analyst",
-            "payload": {"snapshot": snapshot.model_dump(mode="json")},
+            "source_user_hash": "a" * 64,
+            "settings_generation": 0,
+            "payload": {"bundle": bundle.model_dump(mode="json")},
         }
     )
 
     records = await queue._active_failures("data-analyst")
-    assert stats["action"] == "add"
-    assert len(records) == 1
-    assert records[0].lesson.title == "查询前未确认字段类型"
+    assert stats["actions"] == ["add", "add", "add"]
+    assert len(records) == 3
+    assert {record.lesson.title for record in records} == {
+        "查询前未确认字段类型",
+        "写入前未核验目标目录",
+        "生成后未检查产物完整性",
+    }
 
 
 @pytest.mark.asyncio
@@ -964,7 +894,6 @@ async def test_failure_review_enqueue_sets_temporary_payload_expiry(monkeypatch)
         memory,
         "get_settings",
         lambda: SimpleNamespace(
-            failure_review_delay_seconds=1,
             failure_review_payload_ttl_hours=24,
         ),
     )
@@ -974,15 +903,124 @@ async def test_failure_review_enqueue_sets_temporary_payload_expiry(monkeypatch)
         scope="supervisor",
         idempotency_key="review-a",
         thread_digest="thread-a",
-        payload={"snapshot": {}},
+        payload={"bundle": {}},
+        source_user_hash="a" * 64,
+        settings_generation=3,
     )
 
     document = updates[0]["$setOnInsert"]
     assert inserted is True
     assert document["kind"] == "failure_review"
-    assert document["payload"] == {"snapshot": {}}
-    assert (document["available_at"] - document["created_at"]).total_seconds() == 1
+    assert document["payload"] == {"bundle": {}}
+    assert document["available_at"] == document["created_at"]
+    assert document["source_user_hash"] == "a" * 64
+    assert document["settings_generation"] == 3
     assert "expires_at" in document
+
+
+@pytest.mark.asyncio
+async def test_memory_settings_default_enabled_and_disable_cancels_reviews(monkeypatch) -> None:
+    memory_updates: list[tuple[dict, list]] = []
+    job_updates: list[tuple[dict, dict]] = []
+
+    class Memories:
+        async def find_one(self, _query):
+            return None
+
+        async def find_one_and_update(
+            self,
+            query,
+            update,
+            *,
+            upsert,
+            return_document,
+        ):
+            assert upsert is True
+            assert return_document is not None
+            memory_updates.append((query, update))
+            return {
+                "failure_lesson_saving_enabled": False,
+                "generation": 1,
+            }
+
+    class Jobs:
+        async def update_many(self, query, update):
+            job_updates.append((query, update))
+            return SimpleNamespace(modified_count=2)
+
+    queue = memory.MemoryQueue()
+
+    async def collections():
+        return Jobs(), SimpleNamespace(), Memories()
+
+    monkeypatch.setattr(queue, "_collections", collections)
+    identity_hash = "d" * 64
+
+    assert await queue.get_memory_settings(identity_hash) == memory.MemorySettings()
+    settings, cancelled = await queue.set_failure_lesson_saving(
+        identity_hash,
+        enabled=False,
+    )
+
+    assert settings.failure_lesson_saving_enabled is False
+    assert settings.generation == 1
+    assert cancelled == 2
+    assert memory_updates[0][0]["namespace_str"] == f"{identity_hash}/memories/settings"
+    assert memory_updates[0][0]["key"] == memory.MEMORY_SETTINGS_KEY
+    job_query, job_update = job_updates[0]
+    assert job_query["source_user_hash"] == identity_hash
+    assert job_query["status"] == {"$in": ["pending", "retry", "processing"]}
+    assert "payload" in job_update["$unset"]
+    assert "source_user_hash" in job_update["$unset"]
+
+
+@pytest.mark.asyncio
+async def test_index_setup_cancels_legacy_full_context_reviews(monkeypatch) -> None:
+    cleanup_updates: list[tuple[dict, dict]] = []
+
+    class Collection:
+        async def create_index(self, *_args, **_kwargs):
+            return "index"
+
+    class Jobs(Collection):
+        async def update_many(self, query, update):
+            cleanup_updates.append((query, update))
+            return SimpleNamespace(modified_count=1)
+
+    queue = memory.MemoryQueue()
+
+    async def collections():
+        return Jobs(), Collection(), Collection()
+
+    monkeypatch.setattr(queue, "_collections", collections)
+    await queue.ensure_indexes()
+
+    query, update = cleanup_updates[0]
+    assert query["payload.snapshot"] == {"$exists": True}
+    assert query["status"] == {"$in": ["pending", "retry", "processing"]}
+    assert update["$set"]["status"] == "cancelled"
+    assert "payload" in update["$unset"]
+
+
+@pytest.mark.asyncio
+async def test_failure_review_permission_rejects_changed_generation(monkeypatch) -> None:
+    queue = memory.MemoryQueue()
+
+    async def settings(_identity_hash):
+        return memory.MemorySettings(
+            failure_lesson_saving_enabled=True,
+            generation=4,
+        )
+
+    monkeypatch.setattr(queue, "get_memory_settings", settings)
+
+    assert await queue._failure_review_is_allowed(
+        {
+            "_id": "job-a",
+            "source_user_hash": "e" * 64,
+            "settings_generation": 3,
+        }
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -1133,13 +1171,14 @@ async def test_successful_review_job_drops_payload_and_keeps_stats(monkeypatch) 
     monkeypatch.setattr(queue, "_collections", collections)
     await queue._mark_succeeded(
         {"_id": "job-a", "kind": "failure_review"},
-        stats={"action": "discard", "cache_hit_tokens": 100},
+        stats={"action": "discard", "input_tokens": 100},
     )
 
     update = updates[0][1]
     assert update["$set"]["status"] == "succeeded"
-    assert update["$set"]["review_stats"]["cache_hit_tokens"] == 100
+    assert update["$set"]["review_stats"]["input_tokens"] == 100
     assert "payload" in update["$unset"]
+    assert "source_user_hash" in update["$unset"]
 
 
 def test_legacy_automatic_middlewares_are_removed() -> None:

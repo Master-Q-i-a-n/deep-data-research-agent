@@ -58,8 +58,7 @@ MONGODB_MEMORY_COLLECTION=memories
 MONGODB_MEMORY_JOB_COLLECTION=memory_update_jobs
 MEMORY_MODEL=
 MEMORY_CONSOLIDATION_TIMEOUT_SECONDS=30
-FAILURE_REVIEW_SNAPSHOT_MAX_BYTES=4194304
-FAILURE_REVIEW_DELAY_SECONDS=1
+FAILURE_REVIEW_BUNDLE_MAX_BYTES=262144
 FAILURE_REVIEW_PAYLOAD_TTL_HOURS=24
 POSTGRES_URI=postgresql://deep_data_research_agent_app:your-password@127.0.0.1:5432/deep_data_research_agent
 POSTGRES_APP_POOL_SIZE=5
@@ -121,9 +120,10 @@ Token 时 LangGraph Auth 注入共享身份 `local-user`；生产环境无 Token
 写入 PostgreSQL。注册、登录失败和外部 Agent run 使用 PostgreSQL 固定窗口限流；应用只读取
 ASGI peer 地址，不直接信任 `X-Forwarded-For`。
 
-自动失败回顾在业务 Agent 结束后延迟 10 秒领取，以尽量复用 DeepSeek 上下文缓存；该延迟
-不阻塞 Agent 回复。登录用户也可以在前端设置中仅清除自己的偏好与行为反馈，不影响会话、
-Skill、产物和公共失败经验。
+自动失败回顾只把当前任务目标、已配对的工具调用/结果和最终结果加入 MongoDB 队列，每个
+Agent 每轮最多整理三条独立教训；不保存完整提示词、历史消息或 Agent 中间思考，也不依赖模型上下文缓存。登录用户可以在前端设置中
+关闭自己的失败经验贡献或清除偏好与行为反馈；关闭贡献不影响已有公共经验的读取，会话、Skill
+和产物也不受影响。
 
 如需清空所有用户记忆和失败经验并重新开始，应先停止应用，再执行：
 

@@ -109,12 +109,20 @@ type FetchHandler = (
 
 function withDevelopmentAuth(handler: FetchHandler) {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input).endsWith("/auth/me")) {
+    const url = String(input);
+    if (url.endsWith("/auth/me")) {
       return {
         ok: true,
         json: async () => ({
           user: { id: "local-user", username: "默认账户", is_default: true },
         }),
+      };
+    }
+    if (url.endsWith("/memories/settings") && !init?.method) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ failure_lesson_saving_enabled: true }),
       };
     }
     return handler(input, init);
@@ -139,6 +147,9 @@ beforeEach(() => {
     const url = String(input);
     if (url.endsWith("/auth/me")) {
       return { ok: true, json: async () => ({ user: { id: "local-user", username: "默认账户", is_default: true } }) };
+    }
+    if (url.endsWith("/memories/settings")) {
+      return { ok: true, status: 200, json: async () => ({ failure_lesson_saving_enabled: true }) };
     }
     return {
       ok: true,
@@ -249,6 +260,13 @@ describe("研究工作台", () => {
           ok: false,
           status: 401,
           json: async () => ({ detail: "请先登录" }),
+        };
+      }
+      if (String(input).endsWith("/memories/settings")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ failure_lesson_saving_enabled: true }),
         };
       }
       return { ok: true, status: 200, json: async () => [] };
@@ -520,6 +538,13 @@ describe("研究工作台", () => {
           json: async () => ({ status: "cleared", cancelled_jobs: 1 }),
         };
       }
+      if (url.endsWith("/memories/settings")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ failure_lesson_saving_enabled: true }),
+        };
+      }
       return { ok: true, status: 200, json: async () => [] };
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -543,6 +568,58 @@ describe("研究工作台", () => {
         method: "DELETE",
         headers: { Authorization: "Bearer token-a" },
       },
+    );
+  });
+
+  it("失败经验整理开关按服务端状态显示并允许运行中关闭", async () => {
+    streamState.isLoading = true;
+    let enabled = true;
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ user: { id: "local-user", username: "默认账户", is_default: true } }),
+        };
+      }
+      if (url.endsWith("/memories/settings") && init?.method === "PATCH") {
+        enabled = (JSON.parse(String(init.body)) as { failure_lesson_saving_enabled: boolean }).failure_lesson_saving_enabled;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ failure_lesson_saving_enabled: enabled, cancelled_jobs: 1 }),
+        };
+      }
+      if (url.endsWith("/memories/settings")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ failure_lesson_saving_enabled: enabled }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    await screen.findByText("默认账户");
+    fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    const toggle = await screen.findByRole("switch", { name: "失败经验整理" });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+    expect((toggle as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    expect(screen.getByText(/仍会使用已有公共经验/)).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/memories/settings",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ failure_lesson_saving_enabled: false }),
+      }),
     );
   });
 

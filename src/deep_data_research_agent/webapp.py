@@ -72,6 +72,10 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class MemorySettingsRequest(BaseModel):
+    failure_lesson_saving_enabled: bool
+
+
 class AsyncTaskStatusRequest(BaseModel):
     """Identify the owning Supervisor thread; task IDs come from its state."""
 
@@ -509,6 +513,55 @@ async def clear_current_user_memory(
             detail="记忆服务暂不可用，请稍后重试",
         ) from exc
     return {"status": "cleared", "cancelled_jobs": cancelled_jobs}
+
+
+@app.get("/memories/settings")
+async def get_current_memory_settings(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Return optional memory-contribution settings for the authenticated user."""
+
+    user_id = await _authenticated_user_id(authorization)
+    identity_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    try:
+        async with asyncio.timeout(5):
+            settings = await MEMORY_QUEUE.get_memory_settings(identity_hash)
+    except Exception as exc:
+        logger.exception("读取用户记忆设置失败")
+        raise HTTPException(
+            status_code=503,
+            detail="记忆设置服务暂不可用，请稍后重试",
+        ) from exc
+    return {
+        "failure_lesson_saving_enabled": settings.failure_lesson_saving_enabled,
+    }
+
+
+@app.patch("/memories/settings")
+async def update_current_memory_settings(
+    request: MemorySettingsRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Persist the failure-lesson switch and cancel disabled pending reviews."""
+
+    user_id = await _authenticated_user_id(authorization)
+    identity_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    try:
+        async with asyncio.timeout(5):
+            settings, cancelled_jobs = await MEMORY_QUEUE.set_failure_lesson_saving(
+                identity_hash,
+                enabled=request.failure_lesson_saving_enabled,
+            )
+    except Exception as exc:
+        logger.exception("更新用户记忆设置失败")
+        raise HTTPException(
+            status_code=503,
+            detail="记忆设置服务暂不可用，请稍后重试",
+        ) from exc
+    return {
+        "failure_lesson_saving_enabled": settings.failure_lesson_saving_enabled,
+        "cancelled_jobs": cancelled_jobs,
+    }
 
 
 @app.get("/artifacts/{thread_id}")

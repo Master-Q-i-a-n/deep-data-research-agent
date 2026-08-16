@@ -88,6 +88,40 @@ async def test_clear_memory_returns_service_unavailable_without_leaking_error(
 
 
 @pytest.mark.asyncio
+async def test_memory_settings_are_scoped_to_authenticated_user(monkeypatch) -> None:
+    captured: list[tuple[str, bool | None]] = []
+
+    async def resolve(_token: str) -> database.UserRecord:
+        return database.UserRecord("user-a", "Alice", False)
+
+    class Queue:
+        async def get_memory_settings(self, identity_hash: str):
+            captured.append((identity_hash, None))
+            return SimpleNamespace(failure_lesson_saving_enabled=True)
+
+        async def set_failure_lesson_saving(self, identity_hash: str, *, enabled: bool):
+            captured.append((identity_hash, enabled))
+            return SimpleNamespace(failure_lesson_saving_enabled=enabled), 3
+
+    monkeypatch.setattr(database, "resolve_login_session", resolve)
+    monkeypatch.setattr(webapp, "MEMORY_QUEUE", Queue())
+
+    current = await webapp.get_current_memory_settings("Bearer valid")
+    updated = await webapp.update_current_memory_settings(
+        webapp.MemorySettingsRequest(failure_lesson_saving_enabled=False),
+        "Bearer valid",
+    )
+
+    identity_hash = hashlib.sha256(b"user-a").hexdigest()
+    assert current == {"failure_lesson_saving_enabled": True}
+    assert updated == {
+        "failure_lesson_saving_enabled": False,
+        "cancelled_jobs": 3,
+    }
+    assert captured == [(identity_hash, None), (identity_hash, False)]
+
+
+@pytest.mark.asyncio
 async def test_thread_create_stamps_and_claims_owner(monkeypatch) -> None:
     claims: list[tuple[str, str]] = []
 

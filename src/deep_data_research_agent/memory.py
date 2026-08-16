@@ -15,19 +15,12 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Literal, NotRequired
+from typing import Any, Literal
 
 import yaml
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.memory import MemoryMiddleware, MemoryState
-from langchain.agents.middleware import (
-    AgentMiddleware,
-    AgentState,
-    ExtendedModelResponse,
-    ModelRequest,
-    ModelResponse,
-)
-from langchain.agents.middleware.types import PrivateStateAttr
+from langchain.agents.middleware import AgentMiddleware
 from langchain.tools import ToolRuntime, tool
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import (
@@ -35,9 +28,7 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
     message_to_dict,
-    messages_from_dict,
 )
-from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import Command
 from langsmith import traceable
 from openai import APIConnectionError, APIStatusError, RateLimitError
@@ -53,11 +44,7 @@ from pydantic import (
 from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from deep_data_research_agent.config import (
-    create_failure_review_model,
-    create_memory_model,
-    get_settings,
-)
+from deep_data_research_agent.config import create_memory_model, get_settings
 from deep_data_research_agent.identity import user_hash
 from deep_data_research_agent.sandbox_manager import thread_id_from_runtime
 
@@ -73,6 +60,7 @@ AGENT_NAMES: tuple[AgentName, ...] = (
 )
 USER_MEMORY_PATH = "/memories/user/MEMORY.md"
 USER_MEMORY_KEY = "/MEMORY.md"
+MEMORY_SETTINGS_KEY = "/SETTINGS.json"
 MAX_BEHAVIOR_ITEMS = 20
 MAX_ACTIVE_FAILURES = 50
 MAX_FAILURE_INDEX_BYTES = 12 * 1024
@@ -95,6 +83,12 @@ _SENSITIVE_TEXT_PATTERNS = (
     re.compile(r"https?://[^\s)]+", re.IGNORECASE),
     re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
     re.compile(r"(?:[A-Za-z]:\\|/workspace/)[^\s,;)]*", re.IGNORECASE),
+)
+# Temporary review evidence may need paths and URLs to explain an execution
+# failure. Secrets and user addresses are still removed before MongoDB enqueue.
+_REVIEW_PRIVATE_PATTERNS = (
+    *_SENSITIVE_TEXT_PATTERNS[:3],
+    _SENSITIVE_TEXT_PATTERNS[4],
 )
 _READ_ONLY_MEMORY_PROMPT = """<agent_memory>
 {agent_memory}
@@ -317,29 +311,58 @@ class FailureDecision(BaseModel):
         return self
 
 
-class FailureReviewSnapshot(BaseModel):
-    """Serializable copy of the terminal model request used by the reviewer."""
+class FailureReviewDecisions(BaseModel):
+    """Up to three distinct lessons extracted from one completed Agent turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[FailureDecision] = Field(max_length=3)
+
+    @model_validator(mode="after")
+    def _validate_discard_shape(self) -> FailureReviewDecisions:
+        # An empty list is the canonical no-op. A lone discard remains accepted
+        # so the reviewer can express the legacy FailureDecision convention.
+        if any(item.action == "discard" for item in self.decisions) and len(self.decisions) != 1:
+            raise ValueError("discard 不能与其他失败经验同时返回")
+        return self
+
+
+class FailureToolEvent(BaseModel):
+    """One bounded tool call paired with its completed result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int = Field(ge=1)
+    tool_call_id: str = Field(min_length=1, max_length=200)
+    tool_name: str = Field(min_length=1, max_length=100)
+    arguments: str = Field(max_length=12_000)
+    status: Literal["success", "error", "empty"]
+    result: str = Field(max_length=12_000)
+
+
+class FailureReviewBundle(BaseModel):
+    """Minimal execution evidence sent to the background reviewer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2] = 2
+    turn_id: str
+    final_message_id: str
+    task_goal: str = Field(max_length=4_000)
+    tool_events: list[FailureToolEvent] = Field(min_length=1, max_length=50)
+    final_status: Literal["success", "needs_input", "failed", "unknown"]
+    final_response: str = Field(max_length=4_000)
+
+
+class MemorySettings(BaseModel):
+    """User-level controls for optional background memory contribution."""
 
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal[1] = 1
-    turn_id: str
-    final_message_id: str
-    model_name: str
-    system_message: dict[str, Any] | None = None
-    messages: list[dict[str, Any]]
-    final_response: dict[str, Any]
-    tool_schemas: list[dict[str, Any]]
-    model_settings: dict[str, Any]
-    executed_tools: list[str]
-
-
-class FailureReviewState(AgentState):
-    """Private per-invocation state contributed by failure review middleware."""
-
-    failure_review_snapshot: NotRequired[
-        Annotated[dict[str, Any] | None, PrivateStateAttr]
-    ]
+    failure_lesson_saving_enabled: bool = True
+    generation: int = Field(default=0, ge=0)
+    updated_at: str | None = None
 
 
 class StoredFailure(BaseModel):
@@ -368,6 +391,12 @@ def user_memory_namespace_from_hash(identity_hash: str) -> tuple[str, ...]:
     if not re.fullmatch(r"[0-9a-f]{64}", identity_hash):
         raise ValueError("用户记忆 namespace 无效")
     return (identity_hash, "memories", "user")
+
+
+def memory_settings_namespace_from_hash(identity_hash: str) -> tuple[str, ...]:
+    if not re.fullmatch(r"[0-9a-f]{64}", identity_hash):
+        raise ValueError("用户记忆设置 namespace 无效")
+    return (identity_hash, "memories", "settings")
 
 
 def failure_memory_namespace(agent_name: str) -> tuple[str, ...]:
@@ -462,7 +491,23 @@ def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
-def _current_turn(messages: list[Any]) -> tuple[str, list[Any]]:
+def _bounded_review_text(value: Any, *, limit: int) -> str:
+    """Serialize temporary evidence while keeping secrets and size bounded."""
+
+    if isinstance(value, str):
+        result = value
+    else:
+        result = json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True)
+    for pattern in _REVIEW_PRIVATE_PATTERNS:
+        result = pattern.sub("[已脱敏]", result)
+    if len(result) <= limit:
+        return result
+    marker = "\n...[内容已截断]...\n"
+    side = max(1, (limit - len(marker)) // 2)
+    return f"{result[:side]}{marker}{result[-side:]}"[:limit]
+
+
+def _current_turn(messages: list[Any]) -> tuple[str, str, list[Any]]:
     human_index = next(
         (
             index
@@ -474,98 +519,128 @@ def _current_turn(messages: list[Any]) -> tuple[str, list[Any]]:
     turn_messages = messages[human_index:] if human_index >= 0 else messages
     if human_index >= 0:
         human = messages[human_index]
+        task_goal = _bounded_review_text(_message_text(human), limit=4_000)
         human_id = str(getattr(human, "id", "") or "")
         if human_id:
-            return human_id, turn_messages
+            return human_id, task_goal, turn_messages
         serialized = json.dumps(message_to_dict(human), ensure_ascii=False, sort_keys=True)
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:20], turn_messages
-    return "no-visible-user", turn_messages
+        return (
+            hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:20],
+            task_goal,
+            turn_messages,
+        )
+    return "no-visible-user", "", turn_messages
 
 
-def _completed_tool_names(messages: list[Any]) -> set[str]:
-    """Resolve completed ToolMessages to names, including messages without name."""
-
-    call_names: dict[str, str] = {}
-    completed: set[str] = set()
-    for message in messages:
-        if isinstance(message, AIMessage):
-            for call in message.tool_calls:
-                call_id = str(call.get("id") or "")
-                name = str(call.get("name") or "")
-                if call_id and name:
-                    call_names[call_id] = name
-        elif isinstance(message, ToolMessage):
-            name = str(getattr(message, "name", "") or "")
-            if not name:
-                name = call_names.get(str(message.tool_call_id), "")
-            if name:
-                completed.add(name)
-    return completed
+def _tool_result_status(message: ToolMessage, result: str) -> Literal["success", "error", "empty"]:
+    if str(getattr(message, "status", "") or "").lower() == "error":
+        return "error"
+    normalized = result.strip().lower()
+    if normalized in {"", "[]", "{}", "null", "none", "no matches found", "no results found"}:
+        return "empty"
+    if re.fullmatch(r"0\s+(?:rows?|records?)(?:\s+returned)?[.!]?", normalized):
+        return "empty"
+    if (
+        normalized.startswith(("error:", "exception:", "traceback "))
+        or '"status": "failed"' in normalized
+        or '"status":"failed"' in normalized
+        or '"status": "error"' in normalized
+        or '"status":"error"' in normalized
+    ):
+        return "error"
+    return "success"
 
 
-def _model_response_message(response: ModelResponse[Any]) -> AIMessage | None:
-    return next(
-        (message for message in reversed(response.result) if isinstance(message, AIMessage)),
-        None,
-    )
+def _final_response_status(text: str) -> Literal["success", "needs_input", "failed", "unknown"]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"\A```(?:json)?\s*", "", stripped, count=1, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```\Z", "", stripped, count=1)
+    try:
+        payload = json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        return "unknown"
+    if isinstance(payload, dict) and payload.get("status") in {
+        "success",
+        "needs_input",
+        "failed",
+    }:
+        return payload["status"]
+    return "unknown"
 
 
-def _failure_review_snapshot(
-    request: ModelRequest[Any],
-    response: ModelResponse[Any],
+def _failure_review_bundle(
+    messages: list[Any],
     *,
     reviewable_tools: frozenset[str],
-) -> FailureReviewSnapshot | None:
-    final_message = _model_response_message(response)
+) -> FailureReviewBundle | None:
+    turn_id, task_goal, turn_messages = _current_turn(messages)
+    final_message = next(
+        (message for message in reversed(turn_messages) if isinstance(message, AIMessage)),
+        None,
+    )
     if final_message is None or final_message.tool_calls:
         return None
 
-    turn_id, turn_messages = _current_turn(list(request.messages))
-    executed_tools = sorted(
-        _completed_tool_names(turn_messages).intersection(reviewable_tools)
-    )
-    if not executed_tools:
+    calls: dict[str, tuple[int, str, Any]] = {}
+    sequence = 0
+    for message in turn_messages:
+        if not isinstance(message, AIMessage):
+            continue
+        for call in message.tool_calls:
+            call_id = str(call.get("id") or "")
+            name = str(call.get("name") or "")
+            if not call_id or name not in reviewable_tools:
+                continue
+            sequence += 1
+            calls[call_id] = (sequence, name, call.get("args") or {})
+
+    events: list[FailureToolEvent] = []
+    for message in turn_messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        call_id = str(message.tool_call_id or "")
+        call = calls.get(call_id)
+        if call is None:
+            continue
+        event_sequence, name, arguments = call
+        result = _bounded_review_text(_message_text(message), limit=12_000)
+        events.append(
+            FailureToolEvent(
+                sequence=event_sequence,
+                tool_call_id=call_id,
+                tool_name=name,
+                arguments=_bounded_review_text(arguments, limit=12_000),
+                status=_tool_result_status(message, result),
+                result=result,
+            )
+        )
+    events.sort(key=lambda event: event.sequence)
+    if not events:
         return None
 
-    tool_schemas: list[dict[str, Any]] = []
-    for candidate in request.tools:
-        try:
-            tool_schemas.append(_json_safe(convert_to_openai_tool(candidate)))
-        except (TypeError, ValueError):
-            logger.warning("跳过无法序列化的回顾工具 Schema：%s", type(candidate).__name__)
-
     final_message_id = str(final_message.id or "")
+    final_text = _bounded_review_text(_message_text(final_message), limit=4_000)
     if not final_message_id:
         serialized = json.dumps(
-            message_to_dict(final_message),
+            {
+                "turn_id": turn_id,
+                "events": [event.model_dump(mode="json") for event in events],
+                "final": final_text,
+            },
             ensure_ascii=False,
             sort_keys=True,
             default=str,
         )
         final_message_id = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:20]
 
-    model_name = str(
-        getattr(request.model, "model_name", "")
-        or getattr(request.model, "model", "")
-        or get_settings().openai_model
-    )
-    # Agent naming is added after the provider response. Do not replay it to
-    # DeepSeek because the original cached assistant output had no ``name``.
-    replay_final_message = final_message.model_copy(update={"name": None})
-    return FailureReviewSnapshot(
+    return FailureReviewBundle(
         turn_id=turn_id,
         final_message_id=final_message_id,
-        model_name=model_name,
-        system_message=(
-            _json_safe(message_to_dict(request.system_message))
-            if request.system_message is not None
-            else None
-        ),
-        messages=[_json_safe(message_to_dict(message)) for message in request.messages],
-        final_response=_json_safe(message_to_dict(replay_final_message)),
-        tool_schemas=tool_schemas,
-        model_settings=_json_safe(request.model_settings),
-        executed_tools=executed_tools,
+        task_goal=task_goal,
+        tool_events=events[:50],
+        final_status=_final_response_status(final_text),
+        final_response=final_text,
     )
 
 
@@ -952,7 +1027,7 @@ Agent 提交的候选教训：{content}
     return FailureDecision.model_validate(result)
 
 
-def _parse_failure_decision(message: AIMessage) -> FailureDecision:
+def _parse_failure_review_decisions(message: AIMessage) -> FailureReviewDecisions:
     # The reviewer is invoked directly, so no tool could execute. Still reject
     # every attempted call to keep the review contract explicit and auditable.
     if message.tool_calls or message.invalid_tool_calls:
@@ -961,48 +1036,23 @@ def _parse_failure_decision(message: AIMessage) -> FailureDecision:
     if text.startswith("```"):
         text = re.sub(r"\A```(?:json)?\s*", "", text, count=1, flags=re.IGNORECASE)
         text = re.sub(r"\s*```\Z", "", text, count=1)
-    return FailureDecision.model_validate(json.loads(text))
-
-
-def _cache_token_usage(message: AIMessage) -> tuple[int, int]:
-    """Normalize DeepSeek cache counters across OpenAI response adapters."""
-
-    usage = message.usage_metadata or {}
-    details = usage.get("input_token_details") or {}
-    metadata_usage = message.response_metadata.get("token_usage") or {}
-    hit_value = details.get("cache_read")
-    if hit_value is None:
-        hit_value = metadata_usage.get("prompt_cache_hit_tokens")
-    hit = int(hit_value or 0)
-
-    miss_value = details.get("cache_miss")
-    if miss_value is None:
-        miss_value = metadata_usage.get("prompt_cache_miss_tokens")
-    if miss_value is not None:
-        return hit, int(miss_value)
-
-    # ChatOpenAI's aggregated streaming response currently retains cache_read
-    # but may omit cache_miss. DeepSeek defines prompt_tokens as hit + miss,
-    # so derive the missing counter without treating it as a full cache hit.
-    input_tokens = usage.get("input_tokens")
-    if input_tokens is None:
-        input_tokens = metadata_usage.get("prompt_tokens")
-    miss = max(int(input_tokens or 0) - hit, 0)
-    return hit, miss
+    return FailureReviewDecisions.model_validate(json.loads(text))
 
 
 @traceable(
     name="memory.failure.review",
     run_type="chain",
     process_inputs=lambda inputs: {"agent": inputs.get("agent_name")},
-    process_outputs=lambda output: {"action": output[0].action},
+    process_outputs=lambda output: {
+        "actions": [item.action for item in output[0].decisions],
+    },
 )
-async def _extract_failure_review_decision(
+async def _extract_failure_review_decisions(
     *,
     agent_name: AgentName,
-    snapshot: FailureReviewSnapshot,
+    bundle: FailureReviewBundle,
     existing: list[StoredFailure],
-) -> tuple[FailureDecision, dict[str, Any]]:
+) -> tuple[FailureReviewDecisions, dict[str, Any]]:
     compact_index = [
         {
             "id": item.lesson_id,
@@ -1014,46 +1064,32 @@ async def _extract_failure_review_decision(
         }
         for item in sorted(existing, key=_failure_sort_key, reverse=True)
     ]
-    review_prompt = f"""现在只回顾刚刚结束的 {agent_name} 执行，不继续完成用户任务。
+    review_prompt = f"""你是公共 Agent 失败经验整理器，现在只回顾刚刚结束的 {agent_name} 执行。
 
-严禁调用任何工具。请求中保留的工具定义仅用于复用原始请求前缀，不是可执行能力。
-不得返回 tool_calls，不得继续原任务，只能直接输出符合 FailureDecision Schema 的单个 JSON 对象。
+严禁调用任何工具，不得继续原任务，只能返回符合 FailureReviewDecisions Schema 的单个 JSON 对象。
 
-本轮边界：{snapshot.turn_id}
-本轮已完成的执行工具：{json.dumps(snapshot.executed_tools, ensure_ascii=False)}
+本轮精简执行证据：
+{json.dumps(bundle.model_dump(mode="json"), ensure_ascii=False)}
+
 当前公共失败索引：{json.dumps(compact_index, ensure_ascii=False)}
 
 只返回符合以下 JSON Schema 的一个 JSON 对象：
-{json.dumps(FailureDecision.model_json_schema(), ensure_ascii=False)}
+{json.dumps(FailureReviewDecisions.model_json_schema(), ensure_ascii=False)}
 
 判断规则：
-1. 只分析本轮边界之后的工具调用、工具结果、修复动作、验证结果和最终回复。
-2. 只有失败表现、确定原因、可执行处理方法和验证方式均有执行证据时才能 add 或 merge。
+1. 只分析 tool_events 中的调用参数、工具结果、修复动作及验证结果；task_goal 和 final_response 只用于理解目标与结局。
+2. 只有失败表现、确定原因、处理方法和验证结果均能由工具轨迹证明时才能 add 或 merge。
 3. 纯成功过程、临时网络/限流/偶发超时、未知原因、只出现错误原文时必须 discard。
 4. 内容必须跨用户、跨任务复用，不得包含身份、业务数据、URL、路径、账号、密钥或原始日志。
 5. 与索引中条目语义相同或高度重叠时使用 merge，并返回真实 merge_target_id。
-6. 一轮存在多个问题时，只保留证据最完整、复用价值最高的一条；没有则 discard。
-7. add/merge 必须返回完整 lesson；discard 时 lesson 和 merge_target_id 均为 null。"""
+6. 一轮存在多个相互独立且证据完整的问题时，最多返回三条，按复用价值从高到低排列；不得为凑数量拆分或重复同一问题。
+7. Agent 中间解释已被有意删除；不得猜测没有工具证据支持的原因或解决方法。
+8. 每条 add/merge 必须返回完整 lesson；没有值得保存的经验时返回 {{"decisions": []}}，也兼容仅含一个 discard 决策。"""
 
-    request_messages = messages_from_dict(snapshot.messages)
-    final_response = messages_from_dict([snapshot.final_response])[0]
-    messages: list[Any] = []
-    if snapshot.system_message is not None:
-        messages.extend(messages_from_dict([snapshot.system_message]))
-    messages.extend([*request_messages, final_response, HumanMessage(content=review_prompt)])
-
-    model: Any = create_failure_review_model(
-        snapshot.model_name,
-        worker=agent_name == "crawl-worker",
-    )
-    if snapshot.tool_schemas:
-        # Keep the original binding shape for DeepSeek prefix-cache reuse. This
-        # direct model call is never routed through a tool execution node.
-        model = model.bind_tools(snapshot.tool_schemas)
+    messages: list[Any] = [HumanMessage(content=review_prompt)]
+    model = create_memory_model()
 
     started = time.perf_counter()
-    cache_hit_tokens = 0
-    cache_miss_tokens = 0
     last_error: Exception | None = None
     for attempt in range(2):
         response = await model.ainvoke(
@@ -1065,16 +1101,16 @@ async def _extract_failure_review_decision(
         )
         if not isinstance(response, AIMessage):
             raise TypeError("失败回顾模型未返回 AIMessage")
-        hit, miss = _cache_token_usage(response)
-        cache_hit_tokens += hit
-        cache_miss_tokens += miss
         try:
-            decision = _parse_failure_decision(response)
-            return decision, {
-                "action": decision.action,
-                "model": snapshot.model_name,
-                "cache_hit_tokens": cache_hit_tokens,
-                "cache_miss_tokens": cache_miss_tokens,
+            decisions = _parse_failure_review_decisions(response)
+            usage = response.usage_metadata or {}
+            actions = [item.action for item in decisions.decisions]
+            return decisions, {
+                "actions": actions,
+                "lesson_count": sum(action != "discard" for action in actions),
+                "model": get_settings().memory_model or get_settings().openai_model,
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
                 "duration_ms": round((time.perf_counter() - started) * 1000),
             }
         except (json.JSONDecodeError, ValidationError, TypeError) as exc:
@@ -1085,9 +1121,9 @@ async def _extract_failure_review_decision(
                         response,
                         HumanMessage(
                             content=(
-                                "上一输出未通过 FailureDecision Schema 校验。"
+                                "上一输出未通过 FailureReviewDecisions Schema 校验。"
                                 "严禁调用任何工具或返回 tool_calls。"
-                                "请只返回字段完整、枚举正确的 JSON 对象。"
+                                "请只返回包含 decisions 数组且最多三条的合法 JSON 对象。"
                             )
                         ),
                     ]
@@ -1097,10 +1133,8 @@ async def _extract_failure_review_decision(
     raise OutputParserException("失败回顾模型未返回有效结果") from last_error
 
 
-class FailureReviewMiddleware(AgentMiddleware[FailureReviewState, Any, Any]):
-    """Capture one terminal request and enqueue one automatic review per turn."""
-
-    state_schema = FailureReviewState
+class FailureReviewMiddleware(AgentMiddleware):
+    """Enqueue one compact tool-evidence review after a completed Agent turn."""
 
     def __init__(
         self,
@@ -1111,56 +1145,49 @@ class FailureReviewMiddleware(AgentMiddleware[FailureReviewState, Any, Any]):
         self.agent_name = _safe_agent_name(agent_name)
         self.reviewable_tools = frozenset(reviewable_tools) | _COMMON_REVIEWABLE_TOOLS
 
-    async def awrap_model_call(self, request, handler):
-        response = await handler(request)
-        snapshot = _failure_review_snapshot(
-            request,
-            response,
+    async def aafter_agent(self, state, runtime):
+        bundle = _failure_review_bundle(
+            list((state or {}).get("messages", [])),
             reviewable_tools=self.reviewable_tools,
         )
-        if snapshot is None:
-            return response
-        return ExtendedModelResponse(
-            model_response=response,
-            command=Command(
-                update={"failure_review_snapshot": snapshot.model_dump(mode="json")}
-            ),
-        )
-
-    async def aafter_agent(self, state, runtime):
-        raw_snapshot = (state or {}).get("failure_review_snapshot")
-        if not isinstance(raw_snapshot, dict):
-            return None
+        if bundle is None:
+            return
         try:
-            snapshot = FailureReviewSnapshot.model_validate(raw_snapshot)
-            payload = {"snapshot": snapshot.model_dump(mode="json")}
-            serialized = json.dumps(
-                payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            try:
-                thread_id = thread_id_from_runtime(runtime)
-            except (RuntimeError, ValueError, KeyError, AttributeError):
-                configurable = (runtime.config or {}).get("configurable", {})
-                thread_id = str(configurable.get("thread_id") or "unknown-thread")
-            thread_digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
-            fingerprint = hashlib.sha256(serialized).hexdigest()
-            idempotency_key = hashlib.sha256(
-                (
-                    f"failure_review|{self.agent_name}|{thread_digest}|"
-                    f"{snapshot.final_message_id}|{fingerprint}"
-                ).encode()
-            ).hexdigest()
-            settings = get_settings()
             async with asyncio.timeout(2):
-                if len(serialized) > settings.failure_review_snapshot_max_bytes:
+                # Both the account setting read and queue write are bounded so
+                # optional background learning cannot delay the Agent response.
+                identity_hash = user_hash(runtime)
+                memory_settings = await MEMORY_QUEUE.get_memory_settings(identity_hash)
+                if not memory_settings.failure_lesson_saving_enabled:
+                    return
+
+                payload = {"bundle": bundle.model_dump(mode="json")}
+                serialized = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                try:
+                    thread_id = thread_id_from_runtime(runtime)
+                except (RuntimeError, ValueError, KeyError, AttributeError):
+                    configurable = (runtime.config or {}).get("configurable", {})
+                    thread_id = str(configurable.get("thread_id") or "unknown-thread")
+                thread_digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
+                fingerprint = hashlib.sha256(serialized).hexdigest()
+                idempotency_key = hashlib.sha256(
+                    (
+                        f"failure_review|{self.agent_name}|{thread_digest}|"
+                        f"{bundle.final_message_id}|{fingerprint}"
+                    ).encode()
+                ).hexdigest()
+                settings = get_settings()
+                if len(serialized) > settings.failure_review_bundle_max_bytes:
                     await MEMORY_QUEUE.record_skipped_failure_review(
                         scope=self.agent_name,
                         idempotency_key=idempotency_key,
                         thread_digest=thread_digest,
-                        snapshot_bytes=len(serialized),
+                        bundle_bytes=len(serialized),
                     )
                 else:
                     await MEMORY_QUEUE.enqueue(
@@ -1169,12 +1196,14 @@ class FailureReviewMiddleware(AgentMiddleware[FailureReviewState, Any, Any]):
                         idempotency_key=idempotency_key,
                         thread_digest=thread_digest,
                         payload=payload,
+                        source_user_hash=identity_hash,
+                        settings_generation=memory_settings.generation,
                     )
         except Exception:
             # Background learning must never turn a successful business run
             # into a failed Agent response.
             logger.exception("自动失败回顾入队失败：%s", self.agent_name)
-        return {"failure_review_snapshot": None}
+        return
 
 
 class MemoryRefreshMiddleware(MemoryMiddleware):
@@ -1336,6 +1365,10 @@ async def capture_user_memory(runtime: ToolRuntime) -> ToolMessage:
     )
 
 
+class MemoryJobCancelled(RuntimeError):
+    """Signal that a claimed review lost permission before persistence."""
+
+
 class MemoryQueue:
     """MongoDB-backed durable queue and single leased memory writer."""
 
@@ -1366,10 +1399,135 @@ class MemoryQueue:
         # the reset command removes those jobs before normal operation.
         await jobs.create_index("idempotency_key", unique=True, sparse=True)
         await jobs.create_index("expires_at", expireAfterSeconds=0)
+        await jobs.create_index([("source_user_hash", ASCENDING), ("status", ASCENDING)])
         await memories.create_index(
             [("namespace_str", ASCENDING), ("key", ASCENDING)],
             unique=True,
         )
+        now = datetime.now(UTC)
+        # Full-context v1 snapshots are intentionally not replayed after the
+        # compact evidence rollout. Existing public lessons remain untouched.
+        await jobs.update_many(
+            {
+                "kind": "failure_review",
+                "status": {"$in": ["pending", "retry", "processing"]},
+                "payload.snapshot": {"$exists": True},
+            },
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "skip_reason": "legacy_full_context_snapshot",
+                    "finished_at": now,
+                    "updated_at": now,
+                    "expires_at": now + timedelta(days=7),
+                },
+                "$unset": {
+                    "payload": "",
+                    "lease_until": "",
+                    "source_user_hash": "",
+                    "settings_generation": "",
+                },
+            },
+        )
+
+    async def get_memory_settings(self, identity_hash: str) -> MemorySettings:
+        """Return one user's persisted review setting, defaulting to enabled."""
+
+        _jobs, _leases, memories = await self._collections()
+        namespace = memory_settings_namespace_from_hash(identity_hash)
+        document = await memories.find_one(
+            {
+                "namespace_str": _namespace_string(namespace),
+                "key": MEMORY_SETTINGS_KEY,
+            }
+        )
+        if document is None:
+            return MemorySettings()
+        updated_at = document.get("updated_at")
+        return MemorySettings(
+            failure_lesson_saving_enabled=bool(
+                document.get("failure_lesson_saving_enabled", True)
+            ),
+            generation=max(int(document.get("generation", 0)), 0),
+            updated_at=(
+                updated_at.isoformat()
+                if isinstance(updated_at, datetime)
+                else str(updated_at or "") or None
+            ),
+        )
+
+    async def set_failure_lesson_saving(
+        self,
+        identity_hash: str,
+        *,
+        enabled: bool,
+    ) -> tuple[MemorySettings, int]:
+        """Persist the account switch and cancel active reviews when disabled."""
+
+        jobs, _leases, memories = await self._collections()
+        namespace = memory_settings_namespace_from_hash(identity_hash)
+        now = datetime.now(UTC)
+        previous_enabled = {"$ifNull": ["$failure_lesson_saving_enabled", True]}
+        previous_generation = {"$ifNull": ["$generation", 0]}
+        generation = {
+            "$cond": [
+                {"$eq": [previous_enabled, enabled]},
+                previous_generation,
+                {"$add": [previous_generation, 1]},
+            ]
+        }
+        document = await memories.find_one_and_update(
+            {
+                "namespace_str": _namespace_string(namespace),
+                "key": MEMORY_SETTINGS_KEY,
+            },
+            [
+                {
+                    "$set": {
+                        "namespace": list(namespace),
+                        "namespace_str": _namespace_string(namespace),
+                        "key": MEMORY_SETTINGS_KEY,
+                        "schema_version": 1,
+                        "failure_lesson_saving_enabled": enabled,
+                        "generation": generation,
+                        "updated_at": now,
+                        "created_at": {"$ifNull": ["$created_at", now]},
+                    }
+                }
+            ],
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        settings = MemorySettings(
+            failure_lesson_saving_enabled=enabled,
+            generation=max(int((document or {}).get("generation", 0)), 0),
+            updated_at=now.isoformat(),
+        )
+        cancelled_count = 0
+        if not enabled:
+            cancelled = await jobs.update_many(
+                {
+                    "kind": "failure_review",
+                    "source_user_hash": identity_hash,
+                    "status": {"$in": ["pending", "retry", "processing"]},
+                },
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "finished_at": now,
+                        "updated_at": now,
+                        "expires_at": now + timedelta(days=7),
+                    },
+                    "$unset": {
+                        "payload": "",
+                        "lease_until": "",
+                        "source_user_hash": "",
+                        "settings_generation": "",
+                    },
+                },
+            )
+            cancelled_count = int(cancelled.modified_count)
+        return settings, cancelled_count
 
     async def enqueue(
         self,
@@ -1379,6 +1537,8 @@ class MemoryQueue:
         idempotency_key: str,
         thread_digest: str,
         payload: dict[str, Any],
+        source_user_hash: str | None = None,
+        settings_generation: int | None = None,
     ) -> bool:
         jobs, _leases, memories = await self._collections()
         now = datetime.now(UTC)
@@ -1400,15 +1560,16 @@ class MemoryQueue:
             "payload": queued_payload,
             "status": "pending",
             "attempts": 0,
-            "available_at": (
-                now + timedelta(seconds=get_settings().failure_review_delay_seconds)
-                if kind == "failure_review"
-                else now
-            ),
+            "available_at": now,
             "created_at": now,
             "updated_at": now,
         }
         if kind == "failure_review":
+            if source_user_hash is None or settings_generation is None:
+                raise ValueError("失败回顾缺少用户设置版本")
+            user_memory_namespace_from_hash(source_user_hash)
+            inserted["source_user_hash"] = source_user_hash
+            inserted["settings_generation"] = settings_generation
             inserted["expires_at"] = now + timedelta(
                 hours=get_settings().failure_review_payload_ttl_hours
             )
@@ -1425,7 +1586,7 @@ class MemoryQueue:
         scope: str,
         idempotency_key: str,
         thread_digest: str,
-        snapshot_bytes: int,
+        bundle_bytes: int,
     ) -> bool:
         """Persist an oversize skip without retaining the raw model context."""
 
@@ -1440,8 +1601,8 @@ class MemoryQueue:
                     "idempotency_key": idempotency_key,
                     "thread_digest": thread_digest,
                     "status": "skipped",
-                    "skip_reason": "snapshot_too_large",
-                    "snapshot_bytes": snapshot_bytes,
+                    "skip_reason": "bundle_too_large",
+                    "bundle_bytes": bundle_bytes,
                     "attempts": 0,
                     "created_at": now,
                     "updated_at": now,
@@ -1781,37 +1942,83 @@ class MemoryQueue:
         await self._enforce_failure_capacity(agent_name)
         await self._rebuild_failure_index(agent_name)
 
+    async def _failure_review_is_allowed(self, job: dict[str, Any]) -> bool:
+        """Check both the account generation and the live queue status."""
+
+        identity_hash = str(job.get("source_user_hash") or "")
+        expected_generation = int(job.get("settings_generation", -1))
+        if not identity_hash or expected_generation < 0:
+            return False
+        settings = await self.get_memory_settings(identity_hash)
+        if (
+            not settings.failure_lesson_saving_enabled
+            or settings.generation != expected_generation
+        ):
+            return False
+        jobs, _leases, _memories = await self._collections()
+        current = await jobs.find_one({"_id": job["_id"]}, {"status": 1})
+        return current is not None and current.get("status") == "processing"
+
     async def _process_failure_review(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not await self._failure_review_is_allowed(job):
+            raise MemoryJobCancelled("用户已关闭失败经验整理或设置版本已变化")
         agent_name = _safe_agent_name(str(job.get("scope") or ""))
         payload = dict(job.get("payload") or {})
-        raw_snapshot = payload.get("snapshot")
-        if not isinstance(raw_snapshot, dict):
-            raise TypeError("失败回顾缺少模型请求快照")
-        snapshot = FailureReviewSnapshot.model_validate(raw_snapshot)
+        raw_bundle = payload.get("bundle")
+        if not isinstance(raw_bundle, dict):
+            raise TypeError("失败回顾缺少精简工具轨迹")
+        bundle = FailureReviewBundle.model_validate(raw_bundle)
         records = await self._active_failures(agent_name)
-        decision, stats = await _extract_failure_review_decision(
+        decisions, stats = await _extract_failure_review_decisions(
             agent_name=agent_name,
-            snapshot=snapshot,
+            bundle=bundle,
             existing=records,
         )
-        fingerprint = _failure_fingerprint(
+        # The user may disable contribution while the review model is running.
+        if not await self._failure_review_is_allowed(job):
+            raise MemoryJobCancelled("失败经验写入前用户设置已变化")
+        source_fingerprint = _failure_fingerprint(
             json.dumps(
                 {
-                    "turn": snapshot.turn_id,
-                    "tools": snapshot.executed_tools,
-                    "final": snapshot.final_response,
+                    "turn": bundle.turn_id,
+                    "tools": [
+                        event.model_dump(mode="json") for event in bundle.tool_events
+                    ],
+                    "final": bundle.final_response,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
             )
         )
-        await self._apply_failure_decision(
-            agent_name=agent_name,
-            decision=decision,
-            fingerprint=fingerprint,
-            records=records,
-        )
+        seen_decisions: set[str] = set()
+        for decision in decisions.decisions:
+            if decision.action == "discard" or decision.lesson is None:
+                continue
+            decision_key = json.dumps(
+                {
+                    "action": decision.action,
+                    "merge_target_id": decision.merge_target_id,
+                    "lesson": decision.lesson.model_dump(mode="json"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if decision_key in seen_decisions:
+                continue
+            seen_decisions.add(decision_key)
+            # One review can now produce several lessons. Include the lesson
+            # identity so separate issues do not share an exact-source marker.
+            fingerprint = _failure_fingerprint(
+                f"{source_fingerprint}|{decision.lesson.title}|{decision.lesson.cause}"
+            )
+            await self._apply_failure_decision(
+                agent_name=agent_name,
+                decision=decision,
+                fingerprint=fingerprint,
+                records=records,
+            )
+            records = await self._active_failures(agent_name)
         return stats
 
     async def _process_failure_lesson(self, job: dict[str, Any]) -> None:
@@ -1987,6 +2194,8 @@ class MemoryQueue:
         unset_values = {"lease_until": ""}
         if job.get("kind") == "failure_review":
             unset_values["payload"] = ""
+            unset_values["source_user_hash"] = ""
+            unset_values["settings_generation"] = ""
         await jobs.update_one(
             {"_id": job["_id"], "status": "processing"},
             {
@@ -2010,6 +2219,8 @@ class MemoryQueue:
             unset_values = {"lease_until": ""}
             if job.get("kind") == "failure_review":
                 unset_values["payload"] = ""
+                unset_values["source_user_hash"] = ""
+                unset_values["settings_generation"] = ""
             update = {
                 "$set": {
                     "status": "failed",
@@ -2033,6 +2244,28 @@ class MemoryQueue:
             }
         await jobs.update_one({"_id": job["_id"], "status": "processing"}, update)
 
+    async def _mark_cancelled(self, job: dict[str, Any], reason: str) -> None:
+        jobs, _leases, _memories = await self._collections()
+        now = datetime.now(UTC)
+        await jobs.update_one(
+            {"_id": job["_id"], "status": "processing"},
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "skip_reason": reason,
+                    "finished_at": now,
+                    "updated_at": now,
+                    "expires_at": now + timedelta(days=7),
+                },
+                "$unset": {
+                    "payload": "",
+                    "lease_until": "",
+                    "source_user_hash": "",
+                    "settings_generation": "",
+                },
+            },
+        )
+
     async def _process_job(self, job: dict[str, Any]) -> None:
         stats: dict[str, Any] | None = None
         try:
@@ -2047,6 +2280,8 @@ class MemoryQueue:
                     stats = await self._process_failure_review(job)
                 else:
                     raise ValueError(f"未知记忆任务类型：{kind}")
+        except MemoryJobCancelled as exc:
+            await self._mark_cancelled(job, str(exc))
         except Exception as exc:
             logger.exception("整理长期记忆失败：%s", job.get("_id"))
             await self._mark_failed(

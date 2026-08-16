@@ -107,6 +107,11 @@ type MemoryClearResponse = {
   cancelled_jobs?: number;
   detail?: string;
 };
+type MemorySettingsResponse = {
+  failure_lesson_saving_enabled?: boolean;
+  cancelled_jobs?: number;
+  detail?: string;
+};
 
 const AUTH_TOKEN_KEY = "deep-data-auth-token";
 const TASK_POLL_INTERVAL_MS = 4_000;
@@ -847,6 +852,10 @@ export default function App() {
     tone: "success" | "error";
     message: string;
   } | null>(null);
+  const [failureLessonSavingEnabled, setFailureLessonSavingEnabled] = useState<boolean | null>(null);
+  const [memorySettingsLoading, setMemorySettingsLoading] = useState(false);
+  const [memorySettingsUpdating, setMemorySettingsUpdating] = useState(false);
+  const [memorySettingsError, setMemorySettingsError] = useState("");
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const conversationRef = useRef<HTMLElement>(null);
@@ -1392,6 +1401,42 @@ export default function App() {
   }, [apiUrl, authHeaders, authToken]);
 
   useEffect(() => {
+    if (!authReady) {
+      setFailureLessonSavingEnabled(null);
+      setMemorySettingsLoading(false);
+      setMemorySettingsError("");
+      return undefined;
+    }
+    const controller = new AbortController();
+    setMemorySettingsLoading(true);
+    setMemorySettingsError("");
+    void (async () => {
+      try {
+        const response = await fetch(`${apiUrl}/memories/settings`, {
+          headers: authHeaders,
+          signal: controller.signal,
+        });
+        const body = await response.json() as MemorySettingsResponse;
+        if (response.status === 401) {
+          expireAuthentication();
+          return;
+        }
+        if (!response.ok || typeof body.failure_lesson_saving_enabled !== "boolean") {
+          throw new Error(body.detail || "无法读取失败经验设置");
+        }
+        setFailureLessonSavingEnabled(body.failure_lesson_saving_enabled);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setFailureLessonSavingEnabled(null);
+        setMemorySettingsError(error instanceof Error ? error.message : "无法读取失败经验设置");
+      } finally {
+        if (!controller.signal.aborted) setMemorySettingsLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [apiUrl, authHeaders, authReady, authUser.id, expireAuthentication]);
+
+  useEffect(() => {
     if (!accountMenuOpen) return undefined;
     const closeOnOutsideClick = (event: MouseEvent) => {
       if (!accountMenuRef.current?.contains(event.target as Node)) {
@@ -1416,14 +1461,14 @@ export default function App() {
     if (!settingsOpen) return undefined;
     settingsCloseButtonRef.current?.focus();
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key !== "Escape" || memoryClearing) return;
+      if (event.key !== "Escape" || memoryClearing || memorySettingsUpdating) return;
       setSettingsOpen(false);
       setMemoryClearConfirm(false);
       accountMenuButtonRef.current?.focus();
     };
     document.addEventListener("keydown", closeOnEscape);
     return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [memoryClearing, settingsOpen]);
+  }, [memoryClearing, memorySettingsUpdating, settingsOpen]);
 
   useEffect(() => {
     setPolledTasks({});
@@ -1962,7 +2007,7 @@ export default function App() {
   }
 
   function closeSettings() {
-    if (memoryClearing) return;
+    if (memoryClearing || memorySettingsUpdating) return;
     setSettingsOpen(false);
     setMemoryClearConfirm(false);
     accountMenuButtonRef.current?.focus();
@@ -1998,6 +2043,34 @@ export default function App() {
       });
     } finally {
       setMemoryClearing(false);
+    }
+  }
+
+  async function updateFailureLessonSaving() {
+    if (!authReady || failureLessonSavingEnabled === null || memorySettingsUpdating) return;
+    const nextEnabled = !failureLessonSavingEnabled;
+    setMemorySettingsUpdating(true);
+    setMemorySettingsError("");
+    try {
+      const response = await fetch(`${apiUrl}/memories/settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify({ failure_lesson_saving_enabled: nextEnabled }),
+      });
+      const body = await response.json() as MemorySettingsResponse;
+      if (response.status === 401) {
+        expireAuthentication();
+        setSettingsOpen(false);
+        return;
+      }
+      if (!response.ok || typeof body.failure_lesson_saving_enabled !== "boolean") {
+        throw new Error(body.detail || "更新失败经验设置失败");
+      }
+      setFailureLessonSavingEnabled(body.failure_lesson_saving_enabled);
+    } catch (error) {
+      setMemorySettingsError(error instanceof Error ? error.message : "更新失败经验设置失败");
+    } finally {
+      setMemorySettingsUpdating(false);
     }
   }
 
@@ -2467,7 +2540,7 @@ export default function App() {
               <button
                 ref={settingsCloseButtonRef}
                 type="button"
-                disabled={memoryClearing}
+                disabled={memoryClearing || memorySettingsUpdating}
                 onClick={closeSettings}
                 aria-label="关闭设置"
               >×</button>
@@ -2488,6 +2561,33 @@ export default function App() {
               >
                 <i aria-hidden="true"><b /></i>
               </button>
+            </div>
+
+            <div className="settings-section">
+              <div className="settings-section__copy">
+                <strong>失败经验整理</strong>
+                <span>
+                  {failureLessonSavingEnabled === false
+                    ? "仍会使用已有公共经验，但不会根据你的任务新增经验。"
+                    : "允许系统根据工具执行结果后台整理可复用的失败教训。"}
+                </span>
+              </div>
+              <button
+                className="settings-toggle"
+                type="button"
+                role="switch"
+                aria-label="失败经验整理"
+                aria-checked={failureLessonSavingEnabled === true}
+                disabled={!authReady || memorySettingsLoading || memorySettingsUpdating || failureLessonSavingEnabled === null}
+                onClick={() => void updateFailureLessonSaving()}
+              >
+                <i aria-hidden="true"><b /></i>
+              </button>
+              {!authReady ? <p className="settings-hint">登录后才能修改失败经验设置。</p> : null}
+              {authReady && memorySettingsLoading ? <p className="settings-hint">正在读取设置…</p> : null}
+              {memorySettingsError ? (
+                <p className="settings-status settings-status--error" role="status">{memorySettingsError}</p>
+              ) : null}
             </div>
 
             <div className="settings-section settings-section--danger">

@@ -977,6 +977,8 @@ code, pre {
 .settings-confirm button { padding: 7px 10px; cursor: pointer; border: 1px solid var(--line); border-radius: 7px; background: #fff; font-size: 0.68rem; }
 .settings-confirm button:last-child { color: #fff; border-color: #a94343; background: #a94343; }
 .settings-hint, .settings-status { margin: 0; font-size: 0.67rem; line-height: 1.5; }
+.settings-section > .settings-hint,
+.settings-section > .settings-status { grid-column: 1 / -1; }
 .settings-hint { color: var(--muted); }
 .settings-status--success { color: #14776d; }
 .settings-status--error { color: var(--danger); }
