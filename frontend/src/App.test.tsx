@@ -803,7 +803,7 @@ describe("研究工作台", () => {
       toolCall: {
         id: "call-subagent-2",
         name: "task",
-        args: { subagent_type: "data-analyst", description: "复核数据库分析结果" },
+        args: { subagent_type: "analysis-reviewer", description: "复核数据库分析结果" },
       },
       values: {},
       messages: [],
@@ -837,9 +837,11 @@ describe("研究工作台", () => {
       .toBeLessThan(Array.from(operationsRail.children).indexOf(planPanel));
     expect(planPanel.textContent).toContain("计算统计指标");
     expect(planPanel.textContent).toContain("核对关键查询");
-    expect(planPanel.textContent).toContain("复核数据库分析结果");
+    expect(planPanel.textContent).not.toContain("分析上传的表格");
+    expect(planPanel.textContent).not.toContain("复核数据库分析结果");
     const planCards = screen.getAllByLabelText(/data-analyst 子智能体计划 · 调用/);
-    expect(planCards).toHaveLength(2);
+    expect(planCards).toHaveLength(1);
+    expect(screen.getByLabelText(/analysis-reviewer 子智能体计划 · 调用/)).toBeTruthy();
     expect((planCards[0] as HTMLDetailsElement).open).toBe(true);
     fireEvent.click(planCards[0].querySelector("summary") as HTMLElement);
     expect((planCards[0] as HTMLDetailsElement).open).toBe(false);

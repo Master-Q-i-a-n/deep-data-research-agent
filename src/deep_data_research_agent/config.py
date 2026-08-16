@@ -98,7 +98,9 @@ class Settings(BaseSettings):
     # User-memory capture and automatic failure review enqueue work for the
     # lifespan-managed background consolidator.
     memory_model: str | None = None
-    memory_consolidation_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
+    memory_model_timeout_seconds: float = Field(default=60.0, ge=5, le=300)
+    memory_job_timeout_seconds: float = Field(default=75.0, ge=10, le=600)
+    failure_review_max_output_tokens: int = Field(default=4096, ge=512, le=8192)
     failure_review_bundle_max_bytes: int = Field(
         default=256 * 1024,
         ge=1024,
@@ -115,6 +117,8 @@ class Settings(BaseSettings):
         secret = self.rate_limit_key_secret.get_secret_value()
         if self.app_env == "production" and len(secret) < 32:
             raise ValueError("生产环境 RATE_LIMIT_KEY_SECRET 至少需要 32 个字符")
+        if self.memory_job_timeout_seconds <= self.memory_model_timeout_seconds:
+            raise ValueError("MEMORY_JOB_TIMEOUT_SECONDS 必须大于 MEMORY_MODEL_TIMEOUT_SECONDS")
         return self
 
 
@@ -163,7 +167,7 @@ def create_memory_model() -> ChatOpenAI:
         api_key=settings.openai_api_key or "not-configured",
         base_url=settings.openai_base_url,
         temperature=0,
-        timeout=settings.memory_consolidation_timeout_seconds,
+        timeout=settings.memory_model_timeout_seconds,
         # Consolidation jobs have their own durable retry policy.
         max_retries=0,
         streaming=False,

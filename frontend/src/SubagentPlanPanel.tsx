@@ -51,7 +51,6 @@ function SubagentPlanCard({
   const [open, setOpen] = useState(true);
   const cachedTodos = useRef<TodoItem[]>([]);
   const agentName = subagent.toolCall.args.subagent_type ?? "subagent";
-  const description = subagent.toolCall.args.description;
   const observedTodos = latestTodos(subagent);
   if (observedTodos.length > 0) cachedTodos.current = observedTodos;
   const todos = observedTodos.length > 0 ? observedTodos : cachedTodos.current;
@@ -76,10 +75,6 @@ function SubagentPlanCard({
       </summary>
 
       <div className="subagent-plan-panel__body">
-        {typeof description === "string" && description.trim() ? (
-          <p className="subagent-plan-panel__description">{description}</p>
-        ) : null}
-
         <div className="subagent-plan-panel__title">
           <span>执行计划</span>
           {todos.length > 0 ? <b>{completed}/{todos.length}</b> : null}

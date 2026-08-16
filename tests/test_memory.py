@@ -8,6 +8,15 @@ from langgraph.types import Command
 from pydantic import ValidationError
 
 from deep_data_research_agent import memory
+from deep_data_research_agent.config import Settings
+
+
+def test_memory_timeout_and_review_output_defaults_are_independent() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.memory_model_timeout_seconds == 60
+    assert settings.memory_job_timeout_seconds == 75
+    assert settings.failure_review_max_output_tokens == 4096
 
 
 def _runtime(messages=None, *, tool_call_id="call-memory"):
@@ -481,10 +490,12 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
     invocation_count = 0
 
     class Model:
-        async def ainvoke(self, messages, config=None):
+        async def ainvoke(self, messages, config=None, **kwargs):
             nonlocal invocation_count
             invocation_count += 1
-            calls.append({"messages": list(messages), "config": config})
+            calls.append(
+                {"messages": list(messages), "config": config, "kwargs": kwargs}
+            )
             return AIMessage(
                 content=(
                     "{}"
@@ -498,7 +509,11 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
     monkeypatch.setattr(
         memory,
         "get_settings",
-        lambda: SimpleNamespace(memory_model="deepseek-memory", openai_model="deepseek-chat"),
+        lambda: SimpleNamespace(
+            memory_model="deepseek-memory",
+            openai_model="deepseek-chat",
+            failure_review_max_output_tokens=4096,
+        ),
     )
     bundle = memory._failure_review_bundle(
         _review_messages(
@@ -522,6 +537,7 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
     assert "完整动态系统提示词" not in first_prompt
     assert "这段中间解释不应进入后台回顾" not in first_prompt
     assert calls[0]["config"]["callbacks"] == []
+    assert calls[0]["kwargs"]["extra_body"] == {"max_tokens": 4096}
     assert stats["input_tokens"] == 60
     assert stats["output_tokens"] == 4
     assert stats["model"] == "deepseek-memory"
@@ -547,7 +563,7 @@ async def test_failure_reviewer_rejects_tool_calls_and_never_executes_them(
     calls: list[list] = []
 
     class Model:
-        async def ainvoke(self, messages, config=None):
+        async def ainvoke(self, messages, config=None, **_kwargs):
             calls.append(list(messages))
             return responses.pop(0)
 
@@ -555,7 +571,11 @@ async def test_failure_reviewer_rejects_tool_calls_and_never_executes_them(
     monkeypatch.setattr(
         memory,
         "get_settings",
-        lambda: SimpleNamespace(memory_model=None, openai_model="deepseek-chat"),
+        lambda: SimpleNamespace(
+            memory_model=None,
+            openai_model="deepseek-chat",
+            failure_review_max_output_tokens=4096,
+        ),
     )
     bundle = memory._failure_review_bundle(
         [
@@ -1127,6 +1147,43 @@ def test_memory_error_retry_classification() -> None:
     assert memory._is_retryable_memory_error(TimeoutError()) is True
     assert memory._is_retryable_memory_error(OutputParserException("bad")) is False
     assert memory._is_retryable_memory_error(ValueError("bad")) is False
+
+
+@pytest.mark.asyncio
+async def test_memory_job_uses_the_independent_total_timeout(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    class TimeoutContext:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return False
+
+    def timeout(seconds):
+        observed["timeout"] = seconds
+        return TimeoutContext()
+
+    queue = memory.MemoryQueue()
+
+    async def process(_job):
+        return {"actions": []}
+
+    async def succeeded(_job, *, stats=None):
+        observed["stats"] = stats
+
+    monkeypatch.setattr(memory.asyncio, "timeout", timeout)
+    monkeypatch.setattr(
+        memory,
+        "get_settings",
+        lambda: SimpleNamespace(memory_job_timeout_seconds=75),
+    )
+    monkeypatch.setattr(queue, "_process_failure_review", process)
+    monkeypatch.setattr(queue, "_mark_succeeded", succeeded)
+
+    await queue._process_job({"kind": "failure_review"})
+
+    assert observed == {"timeout": 75, "stats": {"actions": []}}
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,11 @@
 """Supervisor DeepAgent graph exposed through the LangGraph Agent Server."""
 
-from deepagents import AsyncSubAgent, SubAgent, create_deep_agent
+from deepagents import (
+    AsyncSubAgent,
+    FilesystemPermission,
+    SubAgent,
+    create_deep_agent,
+)
 from deepagents.middleware.async_subagents import AsyncSubAgentMiddleware
 
 from deep_data_research_agent.backends import (
@@ -20,6 +25,7 @@ from deep_data_research_agent.memory import (
 )
 from deep_data_research_agent.model_profile import register_mvp_profile
 from deep_data_research_agent.prompts import (
+    ANALYSIS_REVIEWER_PROMPT,
     ASYNC_SUBAGENT_PROMPT,
     DATA_ANALYST_PROMPT,
     SUPERVISOR_PROMPT,
@@ -44,10 +50,11 @@ graph = create_deep_agent(
         SubAgent(
             name="data-analyst",
             description=(
-                "对本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据执行端到端分析；"
-                "一次委派内完成结构探查、指标计算、验证、制图和 Markdown 主报告，"
-                "主报告以相对路径嵌入全部生成图表，并生成可核验的 Markdown、CSV、JSON、"
-                "PNG 产物；信息不足时返回 needs_input。"
+                "分析本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据。委派时必须标注模式："
+                "quick_answer 用于直接查值、计数或简单统计，只返回经校验的简洁结论且不生成"
+                "文件；formal_report 用于复杂分析或用户明确要求报告、图表、导出时，在一次"
+                "委派内完成探查、计算、验证、制图和 Markdown 主报告，并生成可核验产物；"
+                "信息不足时返回 needs_input。"
             ),
             system_prompt=DATA_ANALYST_PROMPT,
             tools=[*DATABASE_TOOLS],
@@ -69,7 +76,37 @@ graph = create_deep_agent(
                     reviewable_tools={tool.name for tool in DATABASE_TOOLS},
                 ),
             ],
-        )
+        ),
+        SubAgent(
+            name="analysis-reviewer",
+            description=(
+                "对 data-analyst 已生成的 Markdown 主报告和声明产物进行只读质量复核；"
+                "检查文件完整性、相对图表引用、数字一致性、结论证据和限制说明，"
+                "返回 passed、revision_required 或 failed 的结构化 JSON，不修改产物。"
+            ),
+            system_prompt=ANALYSIS_REVIEWER_PROMPT,
+            # Explicitly avoid inheriting the Supervisor's business tools.
+            tools=[],
+            # A reviewer may inspect the shared workspace but cannot change it.
+            # These rules replace, rather than merge with, parent permissions.
+            permissions=[
+                FilesystemPermission(
+                    operations=["write"],
+                    paths=["/**"],
+                    mode="deny",
+                ),
+                FilesystemPermission(
+                    operations=["read"],
+                    paths=["/workspace/**"],
+                    mode="allow",
+                ),
+                FilesystemPermission(
+                    operations=["read"],
+                    paths=["/**"],
+                    mode="deny",
+                ),
+            ],
+        ),
     ],
     middleware=[
         SandboxLifecycleMiddleware(

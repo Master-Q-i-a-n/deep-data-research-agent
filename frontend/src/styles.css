@@ -139,20 +139,7 @@ code, pre {
   overflow-y: auto;
   scrollbar-color: rgba(114, 211, 200, 0.28) transparent;
 }
-.subagent-plan-panel__description {
-  margin: 0;
-  padding: 9px 0;
-  display: -webkit-box;
-  overflow: hidden;
-  color: rgba(238, 246, 247, 0.58);
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  font-size: 0.59rem;
-  line-height: 1.5;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
 .subagent-plan-panel__title { margin: 0 0 9px; padding-top: 9px; display: flex; justify-content: space-between; gap: 10px; color: rgba(238, 246, 247, 0.64); border-top: 1px solid rgba(255, 255, 255, 0.08); font-size: 0.6rem; letter-spacing: 0.08em; }
-.subagent-plan-panel__description + .subagent-plan-panel__title { padding-top: 0; border-top: 0; }
 .subagent-plan-panel__title b { color: #72d3c8; font: 600 0.6rem "Cascadia Code", monospace; }
 .subagent-plan-panel__empty { margin: 0; color: rgba(238, 246, 247, 0.46); font-size: 0.63rem; line-height: 1.55; }
 .subagent-plan-panel ol { margin: 0; padding: 0; display: grid; gap: 8px; list-style: none; }

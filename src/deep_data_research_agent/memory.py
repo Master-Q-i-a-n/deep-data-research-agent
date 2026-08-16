@@ -1088,6 +1088,7 @@ async def _extract_failure_review_decisions(
 
     messages: list[Any] = [HumanMessage(content=review_prompt)]
     model = create_memory_model()
+    settings = get_settings()
 
     started = time.perf_counter()
     last_error: Exception | None = None
@@ -1098,6 +1099,9 @@ async def _extract_failure_review_decisions(
                 "callbacks": [],
                 "tags": ["memory-internal", "failure-review", agent_name],
             },
+            # DeepSeek's OpenAI-compatible API names this parameter
+            # ``max_tokens``; extra_body preserves that provider spelling.
+            extra_body={"max_tokens": settings.failure_review_max_output_tokens},
         )
         if not isinstance(response, AIMessage):
             raise TypeError("失败回顾模型未返回 AIMessage")
@@ -1108,7 +1112,7 @@ async def _extract_failure_review_decisions(
             return decisions, {
                 "actions": actions,
                 "lesson_count": sum(action != "discard" for action in actions),
-                "model": get_settings().memory_model or get_settings().openai_model,
+                "model": settings.memory_model or settings.openai_model,
                 "input_tokens": int(usage.get("input_tokens") or 0),
                 "output_tokens": int(usage.get("output_tokens") or 0),
                 "duration_ms": round((time.perf_counter() - started) * 1000),
@@ -2269,7 +2273,7 @@ class MemoryQueue:
     async def _process_job(self, job: dict[str, Any]) -> None:
         stats: dict[str, Any] | None = None
         try:
-            timeout = get_settings().memory_consolidation_timeout_seconds
+            timeout = get_settings().memory_job_timeout_seconds
             async with asyncio.timeout(timeout):
                 kind = str(job.get("kind") or "")
                 if kind == "user_memory":
