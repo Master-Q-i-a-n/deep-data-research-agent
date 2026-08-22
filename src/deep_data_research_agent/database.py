@@ -362,6 +362,59 @@ async def get_user_by_username(username: str) -> UserRecord | None:
     return _record(user) if user is not None else None
 
 
+async def get_user_by_id(user_id: str) -> UserRecord | None:
+    """Return one user without exposing its stored password hash."""
+
+    await ensure_schema()
+    async with session_factory()() as session:
+        user = await session.get(User, str(user_id))
+    if user is None:
+        return None
+    record = _record(user)
+    return UserRecord(
+        id=record.id,
+        username=record.username,
+        is_system=record.is_system,
+    )
+
+
+async def list_user_thread_ids(user_id: str) -> list[str]:
+    """List every Agent Protocol thread claimed by one authenticated user."""
+
+    await ensure_schema()
+    async with session_factory()() as session:
+        result = await session.execute(
+            select(AgentThread.thread_id)
+            .where(AgentThread.user_id == str(user_id))
+            .order_by(AgentThread.created_at, AgentThread.thread_id)
+        )
+        return [str(thread_id) for thread_id in result.scalars().all()]
+
+
+async def delete_user(user_id: str) -> bool:
+    """Delete one non-system account after its external resources are purged.
+
+    The evaluator deletes LangGraph checkpoints, sandboxes, and MongoDB state
+    before calling this function. Explicit dependent-row deletes keep SQLite
+    unit tests representative even when foreign-key cascades are disabled.
+    """
+
+    await ensure_schema()
+    normalized = str(user_id)
+    async with session_factory()() as session:
+        user = await session.get(User, normalized)
+        if user is None:
+            return False
+        if user.is_system or user.id == DEFAULT_USER_ID:
+            raise ValueError("不能删除系统账户")
+        await session.execute(delete(AuthSession).where(AuthSession.user_id == normalized))
+        await session.execute(delete(EmailDelivery).where(EmailDelivery.user_id == normalized))
+        await session.execute(delete(AgentThread).where(AgentThread.user_id == normalized))
+        await session.execute(delete(User).where(User.id == normalized))
+        await session.commit()
+    return True
+
+
 async def create_login_session(user_id: str) -> str:
     """Return the raw bearer token; only its digest is persisted."""
 

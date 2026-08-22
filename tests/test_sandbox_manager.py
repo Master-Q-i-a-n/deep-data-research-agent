@@ -160,8 +160,9 @@ def test_opensandbox_backend_preserves_multiline_json_output() -> None:
 
     assert result.error is None
     assert result.matches == [
-        {"path": "report.md", "is_dir": False},
-        {"path": "raw", "is_dir": True},
+        # DeepAgents 0.7 normalizes sandbox glob results to absolute paths.
+        {"path": "/workspace/report.md", "is_dir": False},
+        {"path": "/workspace/raw", "is_dir": True},
     ]
 
 

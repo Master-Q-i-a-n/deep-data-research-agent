@@ -9,6 +9,7 @@ from typing import Any, Literal, NotRequired
 from urllib.parse import urlsplit
 
 from deepagents import DeepAgentState, create_deep_agent
+from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -16,8 +17,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.backends import (
-    WORKER_FILESYSTEM_PERMISSIONS,
-    create_worker_backend,
+    WORKER_BACKEND,
 )
 from deep_data_research_agent.config import create_chat_model
 from deep_data_research_agent.identity import user_identity_from_config
@@ -34,6 +34,10 @@ from deep_data_research_agent.skill_middleware import (
     ReloadableSkillsMiddleware,
 )
 from deep_data_research_agent.skill_storage import public_skill_root, user_skill_root
+from deep_data_research_agent.subagent_contracts import (
+    SubagentModelCallLimitMiddleware,
+    compact_crawl_summary,
+)
 from deep_data_research_agent.tavily_tools import CRAWL_TOOLS
 
 register_mvp_profile()
@@ -53,7 +57,7 @@ class CrawlArtifact(BaseModel):
     type: Literal["report", "source", "data", "chart", "script", "file"]
     mime_type: str
     size: int = Field(ge=0)
-    description: str
+    description: str = Field(max_length=300)
 
     @field_validator("path")
     @classmethod
@@ -66,8 +70,8 @@ class CrawlArtifact(BaseModel):
 class CrawlSource(BaseModel):
     """A public HTTP(S) source cited by the crawl-worker."""
 
-    title: str
-    url: str
+    title: str = Field(max_length=200)
+    url: str = Field(max_length=2_000)
 
     @field_validator("url")
     @classmethod
@@ -82,10 +86,10 @@ class CrawlTaskResult(BaseModel):
     """Stable result contract returned through ``check_async_task``."""
 
     status: Literal["success", "failed", "needs_input"]
-    summary: str
-    artifacts: list[CrawlArtifact]
-    sources: list[CrawlSource]
-    warnings: list[str]
+    summary: str = Field(max_length=4_000)
+    artifacts: list[CrawlArtifact] = Field(max_length=50)
+    sources: list[CrawlSource] = Field(max_length=20)
+    warnings: list[str] = Field(max_length=10)
 
 
 class CrawlWorkerState(DeepAgentState):
@@ -99,8 +103,14 @@ crawl_agent = create_deep_agent(
     tools=[*CRAWL_TOOLS],
     system_prompt=CRAWL_WORKER_PROMPT,
     middleware=[
+        # Preserve the crawl worker's short planning step after the 0.7 upgrade.
+        TodoListMiddleware(),
+        SubagentModelCallLimitMiddleware(
+            agent_name="crawl-worker",
+            run_limit=30,
+        ),
         MemoryRefreshMiddleware(
-            backend_factory=create_worker_backend,
+            backend=WORKER_BACKEND,
             sources=[USER_MEMORY_PATH, agent_memory_path("crawl-worker")],
         ),
         MongoSkillsRestoreMiddleware(
@@ -108,7 +118,7 @@ crawl_agent = create_deep_agent(
             agent_name="crawl-worker",
         ),
         ReloadableSkillsMiddleware(
-            backend=create_worker_backend,
+            backend=WORKER_BACKEND,
             sources=[
                 (f"{public_skill_root('crawl-worker')}/", "公共"),
                 (f"{user_skill_root('crawl-worker')}/", "用户"),
@@ -119,8 +129,7 @@ crawl_agent = create_deep_agent(
             reviewable_tools={tool.name for tool in CRAWL_TOOLS},
         ),
     ],
-    backend=create_worker_backend,
-    permissions=WORKER_FILESYSTEM_PERMISSIONS,
+    backend=WORKER_BACKEND,
 )
 
 
@@ -199,7 +208,7 @@ def _extract_sources(text: str) -> list[CrawlSource]:
         covered_urls.add(normalized)
 
     sources: list[CrawlSource] = []
-    for title, url in candidates[:100]:
+    for title, url in candidates[:20]:
         try:
             sources.append(CrawlSource(title=title or "来源", url=url))
         except ValueError:
@@ -229,8 +238,9 @@ async def _build_structured_result(
             if summary:
                 break
 
+    exported = list(state.get("exported_artifacts", []))
     artifacts: list[CrawlArtifact] = []
-    for item in state.get("exported_artifacts", []):
+    for item in exported[:50]:
         path = str(item.get("path", ""))
         kind, description = _artifact_kind(path)
         mime_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -245,6 +255,10 @@ async def _build_structured_result(
         )
 
     warnings: list[str] = []
+    if len(exported) > 50:
+        warnings.append(
+            f"工作区共有 {len(exported)} 个文件，结构化结果仅列出前 50 个。"
+        )
     status = _business_status(summary)
     if not artifacts:
         warnings.append("crawl-worker 未导出任何工作区文件。")
@@ -256,11 +270,12 @@ async def _build_structured_result(
         warnings.append("crawl-worker 未返回可供 Supervisor 使用的摘要。")
         summary = "crawl-worker 未返回摘要。"
 
+    sources = _extract_sources(summary)
     result = CrawlTaskResult(
         status=status,
-        summary=summary,
+        summary=compact_crawl_summary(summary),
         artifacts=artifacts,
-        sources=_extract_sources(summary),
+        sources=sources,
         warnings=warnings,
     )
     return {

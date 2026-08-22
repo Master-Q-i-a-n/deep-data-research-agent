@@ -1215,19 +1215,18 @@ class MemoryRefreshMiddleware(MemoryMiddleware):
 
     state_schema = MemoryState
 
-    def __init__(self, *, backend_factory: Any, sources: list[str]) -> None:
+    def __init__(self, *, backend: BackendProtocol, sources: list[str]) -> None:
         super().__init__(
-            backend=backend_factory,
+            backend=backend,
             sources=sources,
             system_prompt=_READ_ONLY_MEMORY_PROMPT,
         )
-        self._backend_factory = backend_factory
+        self._backend = backend
 
     async def abefore_agent(self, state, runtime, config):
-        backend: BackendProtocol = self._backend_factory(runtime)
         contents: dict[str, str] = {}
         try:
-            files = await backend.adownload_files(self.sources)
+            files = await self._backend.adownload_files(self.sources)
         except Exception:
             logger.exception("加载长期记忆失败，本轮将不注入记忆")
             return {"memory_contents": contents}

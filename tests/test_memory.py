@@ -610,7 +610,7 @@ async def test_memory_refresh_replaces_checkpoint_cached_contents() -> None:
 
     sources = [memory.USER_MEMORY_PATH, memory.agent_memory_path("supervisor")]
     middleware = memory.MemoryRefreshMiddleware(
-        backend_factory=lambda _runtime: Backend(),
+        backend=Backend(),
         sources=sources,
     )
 

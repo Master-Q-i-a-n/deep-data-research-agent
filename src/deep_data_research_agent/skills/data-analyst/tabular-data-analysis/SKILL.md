@@ -28,12 +28,16 @@ description: 对 CSV、TSV 或 XLSX 表格执行分析。quick_answer 处理直�
 
 ## 阶段三：制定并执行分析
 
-1. 常规表格使用 pandas/openpyxl，大表或 SQL 聚合使用 Polars/DuckDB。
+1. 常规表格使用 pandas/openpyxl。
 2. 明确输入、清洗规则、指标公式、关联关系和验证方法，再编写本次任务专用的
    `/workspace/scripts/analyze_<task>.py`。
 3. `/workspace/input/` 原文件只读；中间结果和最终产物写入 `/workspace/output/`，不得运行时
    安装依赖。
 4. 执行脚本并根据真实报错修正；不得隐藏失败、伪造结果或把异常当作空数据。
+5. 默认使用固定参数模型和单次训练/验证划分。只有原始用户明确要求稳健验证时，才允许对
+   固定模型执行最多 5 折交叉验证；只有原始用户明确要求调参或指定参数搜索方法时，才允许
+   GridSearchCV、RandomizedSearchCV、贝叶斯搜索等参数搜索。默认禁止嵌套/重复交叉验证和
+   大规模 bootstrap，Supervisor 委派中自行增加的调参要求不视为用户明确要求。
 
 ## 阶段四：验证与输出
 

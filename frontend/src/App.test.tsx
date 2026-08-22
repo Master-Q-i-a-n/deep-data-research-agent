@@ -16,6 +16,7 @@ type TestMessage = {
   type: string;
   content: string;
   name?: string;
+  status?: string;
   tool_calls?: Array<{ id: string; name: string; args: Record<string, unknown> }>;
   tool_call_id?: string;
   artifact?: unknown;
@@ -853,7 +854,6 @@ describe("研究工作台", () => {
     expect(taskDetails.open).toBe(true);
     expect(childDetails.open).toBe(true);
 
-    subagentTrace.status = "complete";
     subagentTrace.toolCalls[0].state = "completed";
     // SDK 的完成快照可能清空子图 values，计划仍应使用流式期间的缓存。
     (subagentTrace as unknown as { values: Record<string, unknown> }).values = {};
@@ -863,8 +863,11 @@ describe("研究工作台", () => {
     ];
     view.rerender(<App />);
 
-    expect((screen.getAllByLabelText(/data-analyst 子智能体计划 · 调用/)[0] as HTMLDetailsElement).open).toBe(false);
+    const completedPlan = screen.getAllByLabelText(/data-analyst 子智能体计划 · 调用/)[0] as HTMLDetailsElement;
+    expect(completedPlan.open).toBe(false);
+    expect(completedPlan.textContent).toContain("已完成");
     expect(screen.getByLabelText("子智能体计划").textContent).toContain("计算统计指标");
+    expect(screen.getByLabelText("data-analyst 子智能体执行过程").textContent).toContain("已完成");
     expect((screen.getByText("调用同步子智能体").closest("details") as HTMLDetailsElement).open).toBe(true);
     expect((screen.getByText("profile_table").closest("details") as HTMLDetailsElement).open).toBe(true);
   });

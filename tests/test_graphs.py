@@ -8,6 +8,10 @@ from langchain_core.messages import AIMessage
 from deep_data_research_agent.agent import graph as supervisor_graph
 from deep_data_research_agent.crawl_worker import crawl_agent
 from deep_data_research_agent.crawl_worker import graph as worker_graph
+from deep_data_research_agent.model_profile import (
+    DEFAULT_EXCLUDED_TOOLS,
+    REVIEWER_EXCLUDED_TOOLS,
+)
 from deep_data_research_agent.prompts import (
     ANALYSIS_REVIEWER_PROMPT,
     DATA_ANALYST_PROMPT,
@@ -22,6 +26,7 @@ def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
 
     assert supervisor_graph.name == "supervisor"
     assert "assign_skill" in tools
+    assert "validate_report_artifacts" not in tools
     assert "ask_user" in tools
     assert "request_report_download" in tools
     assert "send_report_email" in tools
@@ -30,6 +35,10 @@ def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
     assert "start_async_task" in tools
     assert "check_async_task" in tools
     assert "task" in tools
+    assert "write_todos" in tools
+    # DeepAgents 0.7 keeps built-in tools in the graph registry and applies
+    # HarnessProfile.excluded_tools immediately before each model request.
+    assert DEFAULT_EXCLUDED_TOOLS == {"delete"}
     assert "data-analyst" in tools["task"].description
     assert "analysis-reviewer" in tools["task"].description
     assert "quick_answer" in tools["task"].description
@@ -58,6 +67,8 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
     assert {"tavily_search", "tavily_crawl", "tavily_extract"} <= set(tools)
     assert "record_failure_lesson" not in tools
     assert "execute" in tools
+    assert "write_todos" in tools
+    assert DEFAULT_EXCLUDED_TOOLS == {"delete"}
     assert "task" not in tools
 
 
@@ -69,6 +80,10 @@ def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() ->
     data_analyst = child_graphs["data-analyst"]
     tools = data_analyst.nodes["tools"].bound.tools_by_name
 
+    # Data analysis may legitimately require many model/tool turns; only the
+    # Reviewer keeps a hard per-delegation model-call cap.
+    assert "SubagentModelCallLimitMiddleware.before_model" not in data_analyst.nodes
+    assert "SubagentModelCallLimitMiddleware.after_model" not in data_analyst.nodes
     assert {
         "write_todos",
         "ls",
@@ -84,6 +99,7 @@ def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() ->
         "database_query_preview",
         "database_query_to_file",
     } <= set(tools)
+    assert DEFAULT_EXCLUDED_TOOLS == {"delete"}
     assert not {
         "task",
         "assign_skill",
@@ -94,6 +110,9 @@ def test_data_analyst_inherits_deepagent_tools_and_only_adds_database_tools() ->
         "record_failure_lesson",
     } & set(tools)
 
+    model_closure = inspect.getclosurevars(data_analyst.nodes["model"].bound.func).nonlocals
+    assert model_closure["initial_response_format"] is None
+
 
 def test_analysis_reviewer_is_a_read_only_workspace_specialist() -> None:
     task_tool = supervisor_graph.nodes["tools"].bound.tools_by_name["task"]
@@ -103,10 +122,17 @@ def test_analysis_reviewer_is_a_read_only_workspace_specialist() -> None:
     reviewer = child_graphs["analysis-reviewer"]
     tools = reviewer.nodes["tools"].bound.tools_by_name
 
-    # DeepAgents always installs its built-in filesystem and execute tools. The
-    # reviewer receives no business tools, and filesystem writes are denied by
-    # its own permission list.
-    assert {"ls", "read_file", "glob", "grep"} <= set(tools)
+    # DeepAgents 0.7 makes Todo opt-in, so Reviewer never registers it. Execute
+    # stays registered and a role-aware middleware hides it from non-numeric
+    # model requests.
+    assert {"ls", "read_file", "glob", "grep", "execute"} <= set(tools)
+    assert "write_todos" not in tools
+    assert REVIEWER_EXCLUDED_TOOLS == {
+        "delete",
+        "write_file",
+        "edit_file",
+        "write_todos",
+    }
     assert not {
         "task",
         "assign_skill",
@@ -119,20 +145,8 @@ def test_analysis_reviewer_is_a_read_only_workspace_specialist() -> None:
         "capture_user_memory",
     } & set(tools)
 
-    write_tool = tools["write_file"]
-    filesystem_middleware = inspect.getclosurevars(write_tool.coroutine).nonlocals[
-        "self"
-    ]
-    permissions = [vars(permission) for permission in filesystem_middleware._permissions]
-    assert permissions == [
-        {"operations": ["write"], "paths": ["/**"], "mode": "deny"},
-        {
-            "operations": ["read"],
-            "paths": ["/workspace/**"],
-            "mode": "allow",
-        },
-        {"operations": ["read"], "paths": ["/**"], "mode": "deny"},
-    ]
+    model_closure = inspect.getclosurevars(reviewer.nodes["model"].bound.func).nonlocals
+    assert model_closure["initial_response_format"] is None
 
 
 def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() -> None:
@@ -162,6 +176,11 @@ def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() ->
     assert "在报告同目录生成同名 PDF" in SUPERVISOR_PROMPT
     assert "不得仅完成探查、部分指标或某个报告章节" in DATA_ANALYST_PROMPT
     assert "相对于报告文件的路径嵌入" in DATA_ANALYST_PROMPT
+    assert "完整产物自检" in DATA_ANALYST_PROMPT
+    assert "可正常解码" in DATA_ANALYST_PROMPT
+    assert "结构化输出能够读取" in DATA_ANALYST_PROMPT
+    assert "核心结果的脚本必须作为 artifacts" in DATA_ANALYST_PROMPT
+    assert "Reviewer 要求的分析修订完成后" in DATA_ANALYST_PROMPT
     assert "capture_user_memory" in SUPERVISOR_PROMPT
     assert "record_failure_lesson" not in SUPERVISOR_PROMPT
     assert "明确要求通过邮件发送报告" in SUPERVISOR_PROMPT
@@ -185,19 +204,53 @@ def test_analysis_reviewer_prompt_and_supervisor_routing_are_bounded() -> None:
     ):
         assert contract_field in ANALYSIS_REVIEWER_PROMPT
 
-    assert "passed | revision_required | failed" in ANALYSIS_REVIEWER_PROMPT
+    assert "唯一有效的最终输出合约" in ANALYSIS_REVIEWER_PROMPT
     assert "最多返回 10 个" in ANALYSIS_REVIEWER_PROMPT
-    assert "禁止调用 execute" in ANALYSIS_REVIEWER_PROMPT
+    assert "不使用 write_todos" in ANALYSIS_REVIEWER_PROMPT
+    assert "只有 numeric_consistency 额外看到只读 execute" in ANALYSIS_REVIEWER_PROMPT
+    assert "methodology_validity" in ANALYSIS_REVIEWER_PROMPT
+    assert "evidence_and_limitations" in ANALYSIS_REVIEWER_PROMPT
     assert "不得写入、编辑或删除" in ANALYSIS_REVIEWER_PROMPT
     assert "不得连接数据库" in ANALYSIS_REVIEWER_PROMPT
     assert "不得采集网页" in ANALYSIS_REVIEWER_PROMPT
     assert "不得替 data-analyst" in ANALYSIS_REVIEWER_PROMPT
+    assert "最多进行 3 次证据核验" in ANALYSIS_REVIEWER_PROMPT
+    assert "立即停止当前" in ANALYSIS_REVIEWER_PROMPT
+    assert "直接返回 revision_required 和" in ANALYSIS_REVIEWER_PROMPT
+    assert "offset=0, limit=1000" in ANALYSIS_REVIEWER_PROMPT
+    assert "offset + limit" in ANALYSIS_REVIEWER_PROMPT
+    assert "禁止重叠、回退" in ANALYSIS_REVIEWER_PROMPT
+    assert "30 次实际工具调用" in ANALYSIS_REVIEWER_PROMPT
+    assert "只能包含一个 JSON 对象" in ANALYSIS_REVIEWER_PROMPT
+    assert "不检查文件存在性" in ANALYSIS_REVIEWER_PROMPT
+    assert "不得扫描目录" in ANALYSIS_REVIEWER_PROMPT
+    assert "artifact_integrity" not in ANALYSIS_REVIEWER_PROMPT
 
     assert "analysis-reviewer" in SUPERVISOR_PROMPT
-    assert "自主判断是否调用" in SUPERVISOR_PROMPT
-    assert "最多定向修订一次" in SUPERVISOR_PROMPT
-    assert "修订后不得再次调用 analysis-reviewer" in SUPERVISOR_PROMPT
-    assert "不得并行执行分析、审查或修订" in SUPERVISOR_PROMPT
+    assert "validate_report_artifacts" not in SUPERVISOR_PROMPT
+    assert "确定性工具职责与触发条件" not in SUPERVISOR_PROMPT
+    assert "委派 data-analyst 修订一次" in SUPERVISOR_PROMPT
+    assert "修订后不得再次调用 Reviewer" in SUPERVISOR_PROMPT
+    assert "默认不调用 Reviewer" in SUPERVISOR_PROMPT
+    assert "用户在当前请求中明确要求" in SUPERVISOR_PROMPT
+    assert "不得根据任务复杂度" in SUPERVISOR_PROMPT
+    assert "一般质量要求也不视为明确的审查请求" in SUPERVISOR_PROMPT
+    assert "固定并发调用 3 个独立 Reviewer" in SUPERVISOR_PROMPT
+    assert "artifact_integrity" not in SUPERVISOR_PROMPT
+    assert "numeric_consistency" in SUPERVISOR_PROMPT
+    assert "methodology_validity" in SUPERVISOR_PROMPT
+    assert "evidence_and_limitations" in SUPERVISOR_PROMPT
+    assert "模型训练" in SUPERVISOR_PROMPT
+    assert "多表关联" in SUPERVISOR_PROMPT
+    assert "统计推断" in SUPERVISOR_PROMPT
+    assert "任一结果为 analysis_revision" in SUPERVISOR_PROMPT
+    assert "直接编辑主 Markdown" in SUPERVISOR_PROMPT
+    assert "high 优先且合计" in SUPERVISOR_PROMPT
+    assert "同一报告不得并行执行分析或修订" in SUPERVISOR_PROMPT
+    assert "三个分工明确的只读 Reviewer 审查可以并发" in SUPERVISOR_PROMPT
+    assert "不检查文件存在" in SUPERVISOR_PROMPT
+    assert "`【返回格式】`" in SUPERVISOR_PROMPT
+    assert "字段定义或 JSON 示例" in SUPERVISOR_PROMPT
 
 
 @pytest.mark.asyncio

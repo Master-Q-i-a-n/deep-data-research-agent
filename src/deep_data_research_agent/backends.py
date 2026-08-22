@@ -4,13 +4,24 @@ from __future__ import annotations
 
 from typing import Any
 
-from deepagents import FilesystemPermission
 from deepagents.backends import (
     CompositeBackend,
     StateBackend,
     StoreBackend,
 )
-from deepagents.backends.protocol import SandboxBackendProtocol
+from deepagents.backends.protocol import (
+    DeleteResult,
+    EditResult,
+    FileDownloadResponse,
+    FileUploadResponse,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    SandboxBackendProtocol,
+    WriteResult,
+)
+from langgraph.runtime import get_runtime
 
 from deep_data_research_agent import sandbox_manager
 from deep_data_research_agent.identity import assigned_skill_namespace, user_identity
@@ -21,52 +32,178 @@ from deep_data_research_agent.memory import (
 from deep_data_research_agent.skill_storage import public_skill_namespace
 
 
+def _under(path: str, prefix: str) -> bool:
+    """Return whether a virtual absolute path is at or below one prefix."""
+
+    normalized = "/" + path.lstrip("/")
+    root = "/" + prefix.strip("/")
+    return normalized == root or normalized.startswith(f"{root}/")
+
+
+class ReadOnlyStoreBackend(StoreBackend):
+    """Expose persisted Skills and memories without allowing Agent mutation."""
+
+    def __init__(self, *, namespace, hide_archive: bool = False) -> None:
+        super().__init__(namespace=namespace)
+        self._hide_archive = hide_archive
+
+    def _read_denied(self, path: str | None) -> bool:
+        return bool(path and self._hide_archive and _under(path, "/archive"))
+
+    def ls(self, path: str) -> LsResult:
+        if self._read_denied(path):
+            return LsResult(error="Permission denied: archived memory is hidden")
+        return super().ls(path)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        if self._read_denied(file_path):
+            return ReadResult(error="Permission denied: archived memory is hidden")
+        return super().read(file_path, offset, limit)
+
+    async def aread(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> ReadResult:
+        if self._read_denied(file_path):
+            return ReadResult(error="Permission denied: archived memory is hidden")
+        return await super().aread(file_path, offset, limit)
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        if self._read_denied(path):
+            return GrepResult(error="Permission denied: archived memory is hidden")
+        return super().grep(pattern, path, glob, max_count=max_count)
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        if self._read_denied(path):
+            return GlobResult(error="Permission denied: archived memory is hidden")
+        return super().glob(pattern, path)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        return WriteResult(error="Permission denied: route is read-only")
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return self.write(file_path, content)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return EditResult(error="Permission denied: route is read-only")
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return self.edit(file_path, old_string, new_string, replace_all)
+
+    def delete(self, file_path: str) -> DeleteResult:
+        return DeleteResult(error="Permission denied: route is read-only")
+
+    async def adelete(self, file_path: str) -> DeleteResult:
+        return self.delete(file_path)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        return [
+            FileUploadResponse(path=path, error="permission_denied")
+            for path, _content in files
+        ]
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        responses: list[FileDownloadResponse] = []
+        for path in paths:
+            if self._read_denied(path):
+                responses.append(
+                    FileDownloadResponse(path=path, error="permission_denied")
+                )
+            else:
+                responses.extend(super().download_files([path]))
+        return responses
+
+
 class RestartSafeSandboxBackend(SandboxBackendProtocol):
-    """Lazily rebuild a sandbox when a checkpoint resumes after process restart."""
+    """Resolve one request's sandbox lazily from the active LangGraph runtime.
+
+    DeepAgents 0.7 requires a concrete backend instance at graph construction
+    time. The optional bound runtime remains useful for direct unit tests, while
+    production graph calls resolve thread and user identity from context.
+    """
 
     def __init__(
         self,
         *,
-        thread_id: str,
         component: str,
-        user_id: str,
         network_enabled: bool,
+        runtime: Any | None = None,
     ) -> None:
-        self._thread_id = thread_id
         self._component = component
-        self._user_id = user_id
         self._network_enabled = network_enabled
+        self._bound_runtime = runtime
+
+    def _runtime(self) -> Any:
+        if self._bound_runtime is not None:
+            return self._bound_runtime
+        try:
+            return get_runtime()
+        except (RuntimeError, KeyError) as exc:
+            raise RuntimeError(
+                "沙箱 Backend 必须在 LangGraph 执行上下文中使用"
+            ) from exc
+
+    def _scope(self) -> tuple[str, str]:
+        runtime = self._runtime()
+        return _thread_id(runtime), user_identity(runtime)
 
     def _backend(self):
         """Return an existing backend for synchronous callers."""
 
+        thread_id, user_id = self._scope()
         return sandbox_manager.SANDBOX_MANAGER.get_backend(
-            self._thread_id,
+            thread_id,
             component=self._component,
-            user_id=self._user_id,
+            user_id=user_id,
         )
 
     async def _abackend(self):
         """Return the backend, recreating it only when this process has no handle."""
 
+        thread_id, user_id = self._scope()
         try:
-            return self._backend()
+            return sandbox_manager.SANDBOX_MANAGER.get_backend(
+                thread_id,
+                component=self._component,
+                user_id=user_id,
+            )
         except sandbox_manager.SandboxNotInitializedError:
             pass
         return await sandbox_manager.SANDBOX_MANAGER.ensure(
-            self._thread_id,
+            thread_id,
             component=self._component,
             network_enabled=self._network_enabled,
-            user_id=self._user_id,
+            user_id=user_id,
         )
 
     @property
     def id(self) -> str:
         try:
             return self._backend().id
-        except sandbox_manager.SandboxNotInitializedError:
-            # DeepAgents only uses this before execution to detect sandbox support.
-            return f"pending:{self._component}:{self._thread_id}"
+        except (sandbox_manager.SandboxNotInitializedError, RuntimeError):
+            # Graph construction happens before a request runtime exists.
+            return f"pending:{self._component}"
 
     def ls(self, path):
         return self._backend().ls(path)
@@ -80,11 +217,21 @@ class RestartSafeSandboxBackend(SandboxBackendProtocol):
     async def aread(self, file_path, offset=0, limit=2000):
         return await (await self._abackend()).aread(file_path, offset, limit)
 
-    def grep(self, pattern, path=None, glob=None):
-        return self._backend().grep(pattern, path, glob)
+    def grep(self, pattern, path=None, glob=None, *, max_count=None):
+        return self._backend().grep(
+            pattern,
+            path,
+            glob,
+            max_count=max_count,
+        )
 
-    async def agrep(self, pattern, path=None, glob=None):
-        return await (await self._abackend()).agrep(pattern, path, glob)
+    async def agrep(self, pattern, path=None, glob=None, *, max_count=None):
+        return await (await self._abackend()).agrep(
+            pattern,
+            path,
+            glob,
+            max_count=max_count,
+        )
 
     def glob(self, pattern, path=None):
         return self._backend().glob(pattern, path)
@@ -93,12 +240,18 @@ class RestartSafeSandboxBackend(SandboxBackendProtocol):
         return await (await self._abackend()).aglob(pattern, path)
 
     def write(self, file_path, content):
+        if _under(file_path, "/workspace/input"):
+            return WriteResult(error="Permission denied: uploaded inputs are read-only")
         return self._backend().write(file_path, content)
 
     async def awrite(self, file_path, content):
+        if _under(file_path, "/workspace/input"):
+            return WriteResult(error="Permission denied: uploaded inputs are read-only")
         return await (await self._abackend()).awrite(file_path, content)
 
     def edit(self, file_path, old_string, new_string, replace_all=False):
+        if _under(file_path, "/workspace/input"):
+            return EditResult(error="Permission denied: uploaded inputs are read-only")
         return self._backend().edit(
             file_path,
             old_string,
@@ -113,6 +266,8 @@ class RestartSafeSandboxBackend(SandboxBackendProtocol):
         new_string,
         replace_all=False,
     ):
+        if _under(file_path, "/workspace/input"):
+            return EditResult(error="Permission denied: uploaded inputs are read-only")
         return await (await self._abackend()).aedit(
             file_path,
             old_string,
@@ -121,10 +276,28 @@ class RestartSafeSandboxBackend(SandboxBackendProtocol):
         )
 
     def upload_files(self, files):
-        return self._backend().upload_files(files)
+        allowed = [(path, content) for path, content in files if not _under(path, "/workspace/input")]
+        uploaded = iter(self._backend().upload_files(allowed))
+        return [
+            (
+                FileUploadResponse(path=path, error="permission_denied")
+                if _under(path, "/workspace/input")
+                else next(uploaded)
+            )
+            for path, _content in files
+        ]
 
     async def aupload_files(self, files):
-        return await (await self._abackend()).aupload_files(files)
+        allowed = [(path, content) for path, content in files if not _under(path, "/workspace/input")]
+        uploaded = iter(await (await self._abackend()).aupload_files(allowed))
+        return [
+            (
+                FileUploadResponse(path=path, error="permission_denied")
+                if _under(path, "/workspace/input")
+                else next(uploaded)
+            )
+            for path, _content in files
+        ]
 
     def download_files(self, paths):
         return self._backend().download_files(paths)
@@ -146,44 +319,37 @@ def _thread_id(runtime: Any) -> str:
 
 
 def _sandbox_backend(
-    runtime: Any,
     *,
     component: str,
     skill_agents: tuple[str, ...],
     network_enabled: bool,
+    runtime: Any | None = None,
 ) -> CompositeBackend:
-    """Build one request-local sandbox backend with stable routed storage."""
+    """Build a concrete routed backend with runtime-scoped sandbox access."""
 
-    # Backend factories can run while resuming a middle checkpoint, where the
-    # graph-level before_agent hook is intentionally skipped. Capture the
-    # authenticated identity now so lazy sandbox recovery never guesses an owner.
     sandbox = RestartSafeSandboxBackend(
-        thread_id=_thread_id(runtime),
         component=component,
-        user_id=user_identity(runtime),
         network_enabled=network_enabled,
+        runtime=runtime,
     )
     routes: dict[str, Any] = {
         "/state/": StateBackend(),
-        "/memories/user/": StoreBackend(
+        "/memories/user/": ReadOnlyStoreBackend(
             namespace=user_memory_namespace,
-            file_format="v2",
         ),
     }
     for agent_name in skill_agents:
-        routes[f"/memories/agent/{agent_name}/"] = StoreBackend(
+        routes[f"/memories/agent/{agent_name}/"] = ReadOnlyStoreBackend(
             namespace=lambda _rt, name=agent_name: failure_memory_namespace(name),
-            file_format="v2",
+            hide_archive=True,
         )
         # Route at the Agent directory so the remaining StoreBackend key keeps
         # the required /active/... prefix used in MongoDB.
-        routes[f"/skills/public/{agent_name}/"] = StoreBackend(
+        routes[f"/skills/public/{agent_name}/"] = ReadOnlyStoreBackend(
             namespace=lambda _rt, name=agent_name: public_skill_namespace(name),
-            file_format="v2",
         )
-        routes[f"/skills/user/{agent_name}/"] = StoreBackend(
+        routes[f"/skills/user/{agent_name}/"] = ReadOnlyStoreBackend(
             namespace=lambda rt, name=agent_name: assigned_skill_namespace(rt, name),
-            file_format="v2",
         )
 
     return CompositeBackend(
@@ -193,109 +359,29 @@ def _sandbox_backend(
     )
 
 
-def create_backend(runtime: Any) -> CompositeBackend:
-    """Create the Supervisor backend after its sandbox lifecycle hook runs."""
+def create_backend(runtime: Any | None = None) -> CompositeBackend:
+    """Create the concrete Supervisor backend used by DeepAgents 0.7."""
 
     return _sandbox_backend(
-        runtime,
         component="supervisor",
         skill_agents=("supervisor", "data-analyst"),
         network_enabled=True,
+        runtime=runtime,
     )
 
 
-def create_worker_backend(runtime: Any) -> CompositeBackend:
-    """Create the crawl-worker backend after its outer graph initializes it."""
+def create_worker_backend(runtime: Any | None = None) -> CompositeBackend:
+    """Create the concrete crawl-worker backend used by DeepAgents 0.7."""
 
     return _sandbox_backend(
-        runtime,
         component="crawl-worker",
         skill_agents=("crawl-worker",),
         network_enabled=False,
+        runtime=runtime,
     )
 
 
-# DeepAgents evaluates these rules in order. Unmatched paths, such as
-# /workspace/** and /skill-manage/**, are handled by the isolated default sandbox.
-FILESYSTEM_PERMISSIONS = [
-    # HTTP 上传绕过 Agent 文件工具；模型只能读取原始输入，不能用
-    # write_file/edit_file 静默覆盖用户文件。
-    FilesystemPermission(
-        operations=["write"],
-        paths=["/workspace/input/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/workspace/input/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
-        operations=["write"],
-        paths=["/skills/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/skills/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
-        operations=["read", "write"],
-        paths=["/state/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=[
-            "/memories/agent/supervisor/archive/**",
-            "/memories/agent/data-analyst/archive/**",
-            "/memories/agent/crawl-worker/archive/**",
-        ],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["write"],
-        paths=["/memories/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/memories/**"],
-        mode="allow",
-    ),
-]
-
-
-WORKER_FILESYSTEM_PERMISSIONS = [
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/memories/agent/crawl-worker/archive/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["write"],
-        paths=["/skills/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/skills/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
-        operations=["read", "write"],
-        paths=["/state/**"],
-        mode="allow",
-    ),
-    FilesystemPermission(
-        operations=["write"],
-        paths=["/memories/**"],
-        mode="deny",
-    ),
-    FilesystemPermission(
-        operations=["read"],
-        paths=["/memories/**"],
-        mode="allow",
-    ),
-]
+# Graphs share immutable routing objects; request identity is resolved lazily
+# by RestartSafeSandboxBackend and StoreBackend from the current runtime.
+SUPERVISOR_BACKEND = create_backend()
+WORKER_BACKEND = create_worker_backend()

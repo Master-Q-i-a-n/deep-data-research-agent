@@ -16,6 +16,7 @@ type Message = {
   name?: string;
   type: string;
   content: unknown;
+  status?: string;
   tool_calls?: RawToolCall[];
   tool_call_id?: string;
   artifact?: unknown;
@@ -181,6 +182,41 @@ function messageText(content: unknown): string {
       return "";
     })
     .join("");
+}
+
+function reconcileSubagentStatuses(
+  subagents: Map<string, SubagentTraceStream>,
+  messages: Message[],
+): Map<string, SubagentTraceStream> {
+  const completedCalls = new Map<string, { error: boolean; result: string }>();
+  for (const message of messages) {
+    if (message.type !== "tool" || !message.tool_call_id) continue;
+    completedCalls.set(message.tool_call_id, {
+      error: message.status === "error",
+      result: messageText(message.content),
+    });
+  }
+  if (completedCalls.size === 0) return subagents;
+
+  let changed = false;
+  const reconciled = new Map<string, SubagentTraceStream>();
+  for (const [id, subagent] of subagents) {
+    const completion = completedCalls.get(id);
+    if (!completion || subagent.status === "complete" || subagent.status === "error") {
+      reconciled.set(id, subagent);
+      continue;
+    }
+    changed = true;
+    reconciled.set(id, {
+      ...subagent,
+      status: completion.error ? "error" : "complete",
+      isLoading: false,
+      result: completion.error ? null : completion.result,
+      error: completion.error ? completion.result : null,
+      completedAt: subagent.completedAt ?? new Date(),
+    });
+  }
+  return changed ? reconciled : subagents;
 }
 
 function isReport(body: string): boolean {
@@ -1084,6 +1120,13 @@ export default function App() {
       values: liveValues,
     };
   }, [liveMessages, liveValues, threadId]);
+
+  // 并发同步子图结束时，SDK 偶尔不会把父图 task ToolMessage 归并为
+  // subagent complete。主会话中的同 tool_call_id 结果是最终事实来源。
+  const displayedSubagents = useMemo(
+    () => reconcileSubagentStatuses(stream.subagents, displayedMessages),
+    [displayedMessages, stream.subagents],
+  );
 
   // 轻量模式不构造工具卡和完整轨迹，只整理每轮最终回复与当前活动状态。
   const rows = useMemo(
@@ -2215,7 +2258,7 @@ export default function App() {
               <ToolCallCard
                 key={row.key}
                 card={row.card}
-                subagent={row.card.name === "task" ? stream.subagents.get(row.card.callId) : undefined}
+                subagent={row.card.name === "task" ? displayedSubagents.get(row.card.callId) : undefined}
               />
             ) : (
               <MessageCard
@@ -2523,7 +2566,7 @@ export default function App() {
             refreshError={taskRefreshError}
           />
           <TodoPanel todos={todos} />
-          <SubagentPlanPanel subagents={stream.subagents} />
+          <SubagentPlanPanel subagents={displayedSubagents} />
         </aside>
       ) : null}
 

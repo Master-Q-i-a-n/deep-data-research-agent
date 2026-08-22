@@ -155,13 +155,28 @@ async def test_backend_recreates_sandbox_after_process_restart(monkeypatch) -> N
 
 
 def test_supervisor_file_tools_cannot_overwrite_uploaded_inputs() -> None:
-    assert backends.FILESYSTEM_PERMISSIONS[0].__dict__ == {
-        "operations": ["write"],
-        "paths": ["/workspace/input/**"],
-        "mode": "deny",
-    }
-    assert backends.FILESYSTEM_PERMISSIONS[1].__dict__ == {
-        "operations": ["read"],
-        "paths": ["/workspace/input/**"],
-        "mode": "allow",
-    }
+    backend = backends.create_backend(_runtime("thread-input-protection"))
+
+    write_result = backend.default.write("/workspace/input/orders.csv", "changed")
+    edit_result = backend.default.edit(
+        "/workspace/input/orders.csv",
+        "old",
+        "new",
+    )
+
+    assert "read-only" in str(write_result.error)
+    assert "read-only" in str(edit_result.error)
+
+
+def test_persisted_skill_and_memory_routes_are_read_only() -> None:
+    backend = backends.create_backend(_runtime("thread-store-protection"))
+
+    for root in (
+        "/memories/user/",
+        "/memories/agent/supervisor/",
+        "/skills/public/supervisor/",
+        "/skills/user/data-analyst/",
+    ):
+        route = backend.routes[root]
+        assert isinstance(route, backends.ReadOnlyStoreBackend)
+        assert "read-only" in str(route.write("/blocked.md", "content").error)

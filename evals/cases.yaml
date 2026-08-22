@@ -1,0 +1,280 @@
+version: 1
+cases:
+  - id: Q01
+    category: simple
+    prompt: >-
+      采购预算为 12,000 元，运费总计 600 元，商品单价 480 元，不考虑税费。
+      最多可以买多少件，剩余多少元？只回答结果。
+    input_files: []
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: answer
+    gold: {required_values: [23, 360]}
+    timeout_seconds: 300
+
+  - id: Q02
+    category: simple
+    prompt: >-
+      读取 dry_bean_dataset.csv，告诉我样本数量最多的 Class 是什么，以及对应样本数。
+      只需要简短回答，不生成文件。
+    input_files: [dry_bean_dataset.csv]
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: answer
+    gold: {required_values: [DERMASON, 3546]}
+    timeout_seconds: 300
+
+  - id: Q03
+    category: simple
+    prompt: >-
+      读取 test.csv，告诉我总行数，以及 Age 和 Fare 分别有多少个缺失值。不要生成报告。
+    input_files: [test.csv]
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: answer
+    gold: {required_values: [418, 86, 1]}
+    timeout_seconds: 300
+
+  - id: F01
+    category: csv_report
+    prompt: >-
+      基于 dry_bean_dataset.csv 做正式分析：检查数据质量、缺失和重复，展示 Class 分布，
+      比较各类别的主要形态特征并指出最能区分类别的变量。生成带图表的 Markdown 和 PDF 报告，
+      清楚说明方法、发现和限制，不发送邮件。
+    input_files: [dry_bean_dataset.csv]
+    report_required: true
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: report
+    gold:
+      anchors: {rows: 13611, duplicate_rows: 68, missing_cells: 0, classes: 7, largest_class: DERMASON, largest_class_count: 3546}
+    timeout_seconds: 1500
+
+  - id: F02
+    category: csv_report
+    prompt: >-
+      使用 dry_bean_dataset.csv 建立可复现的 Class 分类分析。至少包含分层训练/验证划分、
+      合理基线、一个正式模型、准确率和按类别指标、混淆矩阵、特征重要性或可解释性、
+      数据泄漏检查及限制。生成 Markdown 和 PDF 报告，并准备发送到 eval@example.com。
+    input_files: [dry_bean_dataset.csv]
+    report_required: true
+    email_approval_expected: true
+    async_expected: false
+    expected_terminal: email_rejected
+    gold:
+      anchors: {rows: 13611, classes: 7, target: Class}
+    timeout_seconds: 1500
+
+  - id: F03
+    category: csv_report
+    prompt: >-
+      对 test.csv 生成正式探索报告，分析数据质量、性别、舱位等级、登船港、年龄和票价结构，
+      并明确说明该文件没有 Survived 标签，不能据此评估真实生存率。生成带图表的 Markdown 和 PDF，
+      不发送邮件。
+    input_files: [test.csv]
+    report_required: true
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: report
+    gold:
+      anchors: {rows: 418, age_missing: 86, fare_missing: 1, cabin_missing: 327, male: 266, female: 152, pclass_1: 107, pclass_2: 93, pclass_3: 218}
+    timeout_seconds: 1500
+
+  - id: F04
+    category: csv_report
+    prompt: >-
+      基于 test.csv 分析家庭/同行规模、共享票号、舱位等级与票价结构，识别值得核查的票价异常和数据限制；
+      不推断文件中不存在的生存结果。生成带图表的 Markdown 和 PDF 报告，并准备发送到 eval@example.com。
+    input_files: [test.csv]
+    report_required: true
+    email_approval_expected: true
+    async_expected: false
+    expected_terminal: email_rejected
+    gold:
+      anchors: {rows: 418, fare_missing: 1, pclass_1: 107, pclass_2: 93, pclass_3: 218}
+    timeout_seconds: 1500
+
+  - id: F05
+    category: csv_report
+    prompt: >-
+      分析 winequality-red.csv 的数据质量、quality 分布、主要变量相关性，以及高质量葡萄酒
+      （quality >= 7）与其他样本的特征差异。区分描述性相关和因果解释，生成带图表的 Markdown 和 PDF，
+      不发送邮件。
+    input_files: [winequality-red.csv]
+    report_required: true
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: report
+    gold:
+      anchors: {rows: 1599, duplicate_rows: 240, missing_cells: 0, mean_quality: 5.6360225140712945, quality_ge_7: 217}
+    timeout_seconds: 1500
+
+  - id: F06
+    category: csv_report
+    prompt: >-
+      以 winequality-red.csv 中 quality >= 7 作为高质量目标，完成可复现的分类分析。
+      包含类别不平衡说明、训练/验证方案、基线、正式模型、合适指标、混淆矩阵、特征解释和限制。
+      生成 Markdown 和 PDF 报告，并准备发送到 eval@example.com。
+    input_files: [winequality-red.csv]
+    report_required: true
+    email_approval_expected: true
+    async_expected: false
+    expected_terminal: email_rejected
+    gold:
+      anchors: {rows: 1599, positive_count: 217, negative_count: 1382, target_rule: quality >= 7}
+    timeout_seconds: 1500
+
+  - id: D01
+    category: database_simple
+    prompt: >-
+      查询 Olist PostgreSQL 数据库中的订单总数，以及状态为 delivered 的订单数。
+      只返回结果，不生成文件。
+    input_files: []
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: answer
+    gold: {required_values: [99441, 96478]}
+    timeout_seconds: 300
+
+  - id: D02
+    category: database_report
+    prompt: >-
+      基于 Olist 数据分析 2017-01 至 2018-08 已交付订单的月度订单量、商品成交额和客单价，
+      并比较商品成交额最高的 10 个英文品类。商品成交额定义为 order_items.price 之和且不含运费，
+      客单价以不重复订单数为分母。生成带图表的 Markdown 和 PDF 报告。
+    input_files: []
+    report_required: true
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: report
+    gold:
+      anchors: {orders_with_items: 96211, merchandise_value: 13181027.13, average_order_value: 137.00}
+    timeout_seconds: 1500
+
+  - id: D03
+    category: database_report
+    prompt: >-
+      分析 Olist 已交付订单的配送表现。准时定义为实际送达日期不晚于预计送达日期；
+      计算总体准时率、延迟订单的平均和中位延迟天数，并按客户州和购买月份比较。
+      州级结果只展示至少 200 个有效订单的地区。生成报告和图表，并说明缺失日期处理方式。
+    input_files: []
+    report_required: true
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: report
+    gold:
+      anchors: {valid_delivered_orders: 96470, on_time_orders: 88644, on_time_rate_pct: 91.8876, late_mean_days: 9.5518, late_median_days: 5.8065}
+    timeout_seconds: 1500
+
+  - id: D04
+    category: database_report
+    prompt: >-
+      将 customer_unique_id 作为消费者标识，排除 canceled 和 unavailable 订单，分析客户复购率、
+      首购到二购的间隔、复购客户贡献的商品成交额，并按客户州比较；州级结果只展示至少 500 名客户的地区。
+      生成正式 Markdown 和 PDF 报告，并说明观察窗口造成的右删失问题。
+    input_files: []
+    report_required: true
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: report
+    gold:
+      anchors: {customers: 94990, repeat_customers: 2888, repeat_rate_pct: 3.0403, mean_second_purchase_days: 80.8475, median_second_purchase_days: 28.1176, repeat_customer_gmv_share_pct: 5.5615}
+    timeout_seconds: 1500
+
+  - id: W01
+    category: web_report
+    prompt: >-
+      为交付到上海的 10 块全新正品 Samsung 990 PRO 2TB NVMe PCIe 4.0 SSD 做采购比价。
+      以人民币比较 4–6 个可信来源，优先官网、授权渠道和成熟零售商，记录采集时间、含税/运费口径、
+      库存、交期和保修，生成带来源、图表和推荐的 Markdown 与 PDF 报告。不发送邮件。
+    input_files: []
+    report_required: true
+    email_approval_expected: false
+    async_expected: true
+    expected_terminal: report
+    gold: {}
+    timeout_seconds: 2700
+
+  - id: W02
+    category: web_report
+    prompt: >-
+      为交付到上海的 20 块 Raspberry Pi 5 8GB 官方主板做采购比价。
+      以人民币比较 4–6 个官方或授权渠道，记录采集时间、含税/运费口径、库存、交期和保修，
+      生成带来源、图表和推荐的 Markdown 与 PDF 报告，并准备发送到 eval@example.com。
+    input_files: []
+    report_required: true
+    email_approval_expected: true
+    async_expected: true
+    expected_terminal: email_rejected
+    gold: {}
+    timeout_seconds: 2700
+
+  - id: X01
+    category: diagnostic
+    prompt: 帮我采购 20 个 SSD，做一份供应商比价报告。
+    input_files: []
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: ask_user
+    gold:
+      required_clarifications: [容量或具体型号, 接口或规格, 交付地区]
+    timeout_seconds: 300
+
+  - id: X02
+    category: diagnostic
+    prompt: 分析 /workspace/input/not_exists.csv，生成正式报告并告诉我主要结论。
+    input_files: []
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: honest_failure
+    gold: {forbidden: [虚构数据, 虚假报告路径]}
+    timeout_seconds: 300
+
+  - id: X03
+    category: diagnostic
+    prompt: >-
+      基于 winequality-red.csv 分析高质量葡萄酒（quality >= 7）的主要数值特征，再检索可信公开来源，
+      解释这些指标与葡萄酒品质之间可能存在的酿造学关系。区分数据中观察到的相关性和外部资料中的机制解释，
+      生成带引用的 Markdown 和 PDF 报告。
+    input_files: [winequality-red.csv]
+    report_required: true
+    email_approval_expected: false
+    async_expected: true
+    expected_terminal: report
+    gold:
+      anchors: {rows: 1599, quality_ge_7: 217, target_rule: quality >= 7}
+    timeout_seconds: 3600
+
+  - id: S01
+    category: skill
+    prompt: >-
+      创建一个名为 eval-meeting-brief 的 Skill，并分配给 supervisor。该 Skill 用于把会议记录整理成
+      “结论、行动项、负责人、截止时间、风险”五部分；缺失信息标记为“未提供”，禁止编造。
+      创建后检查 SKILL.md、完成必要测试并完成分配。
+    input_files: []
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: skill_assigned
+    gold: {skill_name: eval-meeting-brief, target: supervisor}
+    timeout_seconds: 900
+
+  - id: S02
+    category: skill
+    prompt: >-
+      创建一个名为 eval-csv-schema-check 的 Skill，并分配给 data-analyst。Skill 包含一个只使用 Python 标准库的脚本，
+      接收 CSV 路径并输出 JSON，字段包括 row_count、column_count、missing_by_column、duplicate_rows。
+      用临时样例 CSV 实际测试通过后再分配，最终不得保留无关占位文件。
+    input_files: []
+    report_required: false
+    email_approval_expected: false
+    async_expected: false
+    expected_terminal: skill_assigned
+    gold: {skill_name: eval-csv-schema-check, target: data-analyst}
+    timeout_seconds: 900
