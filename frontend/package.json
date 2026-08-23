@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@langchain/core": "^1.1.44",
+    "@langchain/langgraph-sdk": "1.8.10",
     "@langchain/react": "~0.3.5",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

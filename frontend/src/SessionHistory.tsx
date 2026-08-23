@@ -1,3 +1,5 @@
+import type { ThreadRuntimeState } from "./useThreadRunManager";
+
 export type ConversationThread = {
   thread_id: string;
   created_at?: string;
@@ -35,6 +37,7 @@ function formatSessionTime(thread: ConversationThread): string {
 
 type SessionHistoryProps = {
   sessions: ConversationThread[];
+  runtimes: Record<string, ThreadRuntimeState>;
   currentThreadId?: string;
   loading: boolean;
   error: string;
@@ -48,6 +51,7 @@ type SessionHistoryProps = {
 
 export default function SessionHistory({
   sessions,
+  runtimes,
   currentThreadId,
   loading,
   error,
@@ -83,6 +87,14 @@ export default function SessionHistory({
           const active = session.thread_id === currentThreadId;
           const title = sessionTitle(session);
           const deleting = session.thread_id === deletingThreadId;
+          const runtime = runtimes[session.thread_id];
+          const runtimeLabel = runtime?.connection === "reconnecting"
+            ? "正在重连"
+            : runtime?.connection === "connected"
+              ? "已连接"
+              : session.status === "busy" && !active
+                ? "后台运行"
+                : "";
           return (
             <li key={session.thread_id}>
               <button
@@ -96,7 +108,7 @@ export default function SessionHistory({
                 <span className={`session-history__status session-history__status--${session.status ?? "idle"}`} aria-hidden="true" />
                 <span className="session-history__content">
                   <strong>{title}</strong>
-                  <small>{formatSessionTime(session)}</small>
+                  <small>{runtimeLabel ? `${runtimeLabel} · ${formatSessionTime(session)}` : formatSessionTime(session)}</small>
                 </span>
               </button>
               <button

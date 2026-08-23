@@ -7,6 +7,9 @@ const stop = vi.fn();
 const switchThread = vi.fn();
 const joinStream = vi.fn();
 const listRuns = vi.fn();
+const createRun = vi.fn();
+const getRun = vi.fn();
+const cancelRun = vi.fn();
 const cancelQueuedRun = vi.fn();
 const clearQueue = vi.fn();
 let capturedOptions: Record<string, unknown> | null = null;
@@ -72,6 +75,9 @@ function createStreamState() {
     client: {
       runs: {
         list: listRuns,
+        create: createRun,
+        get: getRun,
+        cancel: cancelRun,
       },
     },
     queue: {
@@ -137,9 +143,39 @@ vi.mock("@langchain/react", () => ({
   },
 }));
 
+vi.mock("@langchain/langgraph-sdk/client", () => ({
+  Client: class MockClient {
+    get runs() {
+      return streamState.client.runs;
+    }
+  },
+}));
+
 beforeEach(() => {
   streamState = createStreamState();
+  submit.mockResolvedValue(undefined);
   listRuns.mockResolvedValue([]);
+  createRun.mockResolvedValue({
+    run_id: "queued-run",
+    thread_id: "thread-current",
+    assistant_id: "supervisor",
+    status: "pending",
+    created_at: "2026-08-22T09:00:00Z",
+    updated_at: "2026-08-22T09:00:00Z",
+    metadata: {},
+    multitask_strategy: "enqueue",
+  });
+  getRun.mockResolvedValue({
+    run_id: "run-active",
+    thread_id: "thread-current",
+    assistant_id: "supervisor",
+    status: "running",
+    created_at: "2026-08-22T09:00:00Z",
+    updated_at: "2026-08-22T09:00:00Z",
+    metadata: {},
+    multitask_strategy: "enqueue",
+  });
+  cancelRun.mockResolvedValue(undefined);
   window.localStorage.clear();
   window.sessionStorage.clear();
   vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -166,6 +202,9 @@ afterEach(() => {
   switchThread.mockReset();
   joinStream.mockReset();
   listRuns.mockReset();
+  createRun.mockReset();
+  getRun.mockReset();
+  cancelRun.mockReset();
   cancelQueuedRun.mockReset();
   clearQueue.mockReset();
   vi.restoreAllMocks();
@@ -206,7 +245,7 @@ describe("研究工作台", () => {
 
   it("刷新后根据 busy thread 兜底重新加入服务端活动 run", async () => {
     window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-busy");
-    listRuns.mockResolvedValue([{
+    const activeRun = {
       run_id: "run-active",
       thread_id: "thread-busy",
       assistant_id: "supervisor",
@@ -215,7 +254,10 @@ describe("研究工作台", () => {
       updated_at: "2026-08-13T15:25:24Z",
       metadata: {},
       multitask_strategy: null,
-    }]);
+    };
+    listRuns.mockImplementation(async (_threadId, options) => (
+      options?.status === "running" ? [activeRun] : []
+    ));
     joinStream.mockResolvedValue(undefined);
     vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       if (String(input).endsWith("/threads/search")) {
@@ -235,8 +277,12 @@ describe("研究工作台", () => {
 
     await waitFor(() => expect(listRuns).toHaveBeenCalledWith(
       "thread-busy",
-      expect.objectContaining({ limit: 10 }),
+      expect.objectContaining({ limit: 100, status: "running" }),
     ));
+    expect(listRuns).toHaveBeenCalledWith(
+      "thread-busy",
+      expect.objectContaining({ limit: 100, status: "pending" }),
+    );
     await waitFor(() => expect(joinStream).toHaveBeenCalledWith("run-active"));
   });
 
@@ -249,7 +295,7 @@ describe("研究工作台", () => {
     expect(capturedOptions?.defaultHeaders).toEqual({});
     expect(capturedOptions?.filterSubagentMessages).toBe(true);
     expect(capturedOptions?.onFinish).toEqual(expect.any(Function));
-    expect((capturedOptions?.onFinish as ((state: unknown) => void)).length).toBe(1);
+    expect((capturedOptions?.onFinish as ((state: unknown, run: unknown) => void)).length).toBe(2);
   });
 
   it("生产环境未登录时保留首页并锁定任务功能", async () => {
@@ -340,7 +386,18 @@ describe("研究工作台", () => {
     expect(await screen.findByText("登录尝试过于频繁，请稍后再试")).toBeTruthy();
   });
 
-  it("简洁模式显示全部可见轮次且每轮只保留最终 AI 回复", () => {
+  it("简洁模式显示全部可见轮次且每轮只保留最终 AI 回复", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-current");
+    listRuns.mockImplementation(async (_threadId, options) => options?.status === "running" ? [{
+      run_id: "run-active",
+      thread_id: "thread-current",
+      assistant_id: "supervisor",
+      status: "running",
+      created_at: "2026-08-22T09:00:00Z",
+      updated_at: "2026-08-22T09:00:00Z",
+      metadata: {},
+      multitask_strategy: null,
+    }] : []);
     streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
     streamState.isLoading = true;
     streamState.messages = [
@@ -379,7 +436,13 @@ describe("研究工作台", () => {
     expect(screen.getByText(/最终回答继续流式增长。/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "停止回答" }));
-    expect(stop).toHaveBeenCalled();
+    await waitFor(() => expect(cancelRun).toHaveBeenCalledWith(
+      "thread-current",
+      "run-active",
+      true,
+      "interrupt",
+    ));
+    expect(stop).not.toHaveBeenCalled();
 
     enableDetailedMode();
     expectDetailedMode(true);
@@ -440,25 +503,24 @@ describe("研究工作台", () => {
     expect(view.container.querySelectorAll(".compact-turn__output")).toHaveLength(1);
   });
 
-  it("排队消息只进入等待卡且不会替代当前执行轮次", () => {
+  it("排队消息只进入等待卡且不会替代当前执行轮次", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-current");
     streamState.isLoading = true;
     streamState.values.todos = [];
     streamState.messages = [
       { id: "human-active", type: "human", content: "先分析当前数据" },
       { id: "ai-active", type: "ai", content: "正在计算核心指标" },
-      { id: "human-queued", type: "human", content: "再增加区域对比" },
     ];
-    streamState.queue.entries = [{
-      id: "queued-run-1",
-      values: { messages: [{ type: "human", content: "再增加区域对比" }] },
-      createdAt: new Date("2026-07-28T12:00:00Z"),
-    }];
-    streamState.queue.size = 1;
 
     const view = render(<App />);
+    await screen.findByText("默认账户");
+    fireEvent.change(screen.getByLabelText("补充要求或纠正方向"), {
+      target: { value: "再增加区域对比" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "排队发送消息" }));
 
     expect(screen.getByText("正在计算核心指标")).toBeTruthy();
-    expect(screen.getByText("再增加区域对比")).toBeTruthy();
+    expect(await screen.findByText("再增加区域对比")).toBeTruthy();
     expect(view.container.querySelectorAll(".compact-turn")).toHaveLength(1);
   });
 
@@ -516,7 +578,7 @@ describe("研究工作台", () => {
       "http://127.0.0.1:2024/auth/register",
       expect.objectContaining({ method: "POST" }),
     );
-    expect(switchThread).toHaveBeenCalledWith(null);
+    expect(switchThread).not.toHaveBeenCalled();
     await waitFor(() => expect(capturedOptions?.defaultHeaders).toEqual({ Authorization: "Bearer token-a" }));
   });
 
@@ -672,8 +734,67 @@ describe("研究工作台", () => {
     }));
 
     fireEvent.click(screen.getByRole("button", { name: "打开会话：比较三家产品价格" }));
-    expect(switchThread).toHaveBeenCalledWith("thread-new");
+    expect(switchThread).not.toHaveBeenCalled();
+    expect(capturedOptions?.threadId).toBe("thread-new");
     expect(window.location.search).toBe("?thread=thread-new");
+  });
+
+  it("运行中的会话可切到其他 thread，且不会取消原 run 或调用 switchThread", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-a");
+    streamState.isLoading = true;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ([
+        { thread_id: "thread-a", metadata: { title: "后台任务 A" }, status: "busy" },
+        { thread_id: "thread-b", metadata: { title: "会话 B" }, status: "idle" },
+      ]),
+    });
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "打开会话：会话 B" }));
+
+    expect(window.location.search).toBe("?thread=thread-b");
+    expect(capturedOptions?.threadId).toBe("thread-b");
+    expect(await screen.findByText(/后台运行/)).toBeTruthy();
+    expect(cancelRun).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+    expect(switchThread).not.toHaveBeenCalled();
+  });
+
+  it("同一个 run 多次离开并返回时可以再次 joinStream", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-a");
+    const activeRun = {
+      run_id: "run-a",
+      thread_id: "thread-a",
+      assistant_id: "supervisor",
+      status: "running",
+      created_at: "2026-08-22T09:00:00Z",
+      updated_at: "2026-08-22T09:00:00Z",
+      metadata: {},
+      multitask_strategy: null,
+    };
+    listRuns.mockImplementation(async (thread, options) => (
+      thread === "thread-a" && options.status === "running" ? [activeRun] : []
+    ));
+    joinStream.mockResolvedValue(undefined);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ([
+        { thread_id: "thread-a", metadata: { title: "任务 A" }, status: "busy" },
+        { thread_id: "thread-b", metadata: { title: "任务 B" }, status: "idle" },
+      ]),
+    });
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    render(<App />);
+
+    await waitFor(() => expect(joinStream).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "打开会话：任务 B" }));
+    fireEvent.click(screen.getByRole("button", { name: "打开会话：任务 A" }));
+
+    await waitFor(() => expect(joinStream).toHaveBeenCalledTimes(2));
+    expect(joinStream.mock.calls).toEqual([["run-a"], ["run-a"]]);
+    expect(switchThread).not.toHaveBeenCalled();
   });
 
   it("无需确认即可删除会话，删除当前会话后切换到新任务", async () => {
@@ -703,9 +824,49 @@ describe("研究工作台", () => {
       expect.objectContaining({ method: "DELETE" }),
     ));
     expect(window.confirm).not.toHaveBeenCalled();
-    expect(switchThread).toHaveBeenCalledWith(null);
+    expect(switchThread).not.toHaveBeenCalled();
+    expect(capturedOptions?.threadId).toBeUndefined();
     expect(window.location.search).toBe("");
     expect(screen.queryByText("待删除的采购会话")).toBeNull();
+  });
+
+  it("删除 busy thread 时取消失败会保留会话且不发出删除请求", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-busy-delete");
+    streamState.isLoading = true;
+    const running = {
+      run_id: "run-active",
+      thread_id: "thread-busy-delete",
+      assistant_id: "supervisor",
+      status: "running",
+      created_at: "2026-08-22T09:00:00Z",
+      updated_at: "2026-08-22T09:00:00Z",
+      metadata: {},
+      multitask_strategy: null,
+    };
+    const pending = { ...running, run_id: "run-pending", status: "pending" };
+    listRuns.mockImplementation(async (_threadId, options) => (
+      options.status === "running" ? [running] : [pending]
+    ));
+    cancelRun.mockRejectedValue(new Error("cancel failed"));
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ([{
+        thread_id: "thread-busy-delete",
+        metadata: { title: "不可删除的运行会话" },
+        status: "busy",
+      }]),
+    });
+    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "删除会话：不可删除的运行会话" }));
+
+    await waitFor(() => expect(cancelRun).toHaveBeenCalled());
+    expect(window.confirm).toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([input, init]) => (
+      String(input).endsWith("/threads/thread-busy-delete") && init?.method === "DELETE"
+    ))).toBe(false);
+    expect(screen.getByText("不可删除的运行会话")).toBeTruthy();
   });
 
   it("展示 DeepAgents 计划、异步任务和工具调用", async () => {
@@ -1008,7 +1169,8 @@ describe("研究工作台", () => {
     });
 
     await waitFor(() => expect(screen.getByText(/已上传/)).toBeTruthy());
-    expect(switchThread).toHaveBeenCalledWith(threadId);
+    expect(switchThread).not.toHaveBeenCalled();
+    expect(capturedOptions?.threadId).toBe(threadId);
     expect(fetchMock).toHaveBeenCalledWith(
       `http://127.0.0.1:2024/files/${threadId}`,
       expect.objectContaining({ method: "POST", body: expect.any(FormData) }),
@@ -1076,7 +1238,7 @@ describe("研究工作台", () => {
     render(<App />);
 
     await screen.findByText("默认账户");
-    expect(capturedOptions?.reconnectOnMount).toBe(true);
+    expect(capturedOptions?.reconnectOnMount).toBe(false);
     expect(capturedOptions?.throttle).toBe(false);
   });
 
@@ -1165,6 +1327,7 @@ describe("研究工作台", () => {
   });
 
   it("Supervisor 忙碌时保持输入可用并把普通消息排队", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-current");
     streamState.isLoading = true;
     render(<App />);
     await screen.findByText("默认账户");
@@ -1175,15 +1338,23 @@ describe("研究工作台", () => {
     fireEvent.change(input, { target: { value: "报告增加国内市场数据" } });
     fireEvent.click(screen.getByRole("button", { name: "排队发送消息" }));
 
-    expect(submit).toHaveBeenCalledWith({
-      messages: [{ type: "human", content: "报告增加国内市场数据" }],
-    }, {
-      multitaskStrategy: "enqueue",
-      optimisticValues: expect.any(Function),
-      streamSubgraphs: true,
-      streamResumable: true,
-      onDisconnect: "continue",
-    });
+    await waitFor(() => expect(createRun).toHaveBeenCalledWith(
+      "thread-current",
+      "supervisor",
+      expect.objectContaining({
+        input: { messages: [{ type: "human", content: "报告增加国内市场数据" }] },
+        metadata: {
+          deep_data_ui: {
+            submission_id: expect.any(String),
+            preview: "报告增加国内市场数据",
+          },
+        },
+        multitaskStrategy: "enqueue",
+        streamSubgraphs: true,
+        streamResumable: true,
+      }),
+    ));
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it("可以立即纠正正在运行的 Supervisor", async () => {
@@ -1276,25 +1447,58 @@ describe("研究工作台", () => {
     });
   });
 
-  it("展示并管理 Supervisor 服务端等待队列", () => {
-    streamState.queue.entries = [{
-      id: "queued-run-1",
-      values: {
-        messages: [{ type: "human", content: "报告增加一张对比表" }],
+  it("展示并管理 Supervisor 服务端等待队列", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-current");
+    streamState.isLoading = true;
+    const pendingIds = new Set<string>();
+    const makePendingRun = (id: string) => ({
+      run_id: id,
+      thread_id: "thread-current",
+      assistant_id: "supervisor",
+      status: "pending",
+      created_at: id.endsWith("1") ? "2026-07-28T12:00:00Z" : "2026-07-28T12:01:00Z",
+      updated_at: "2026-07-28T12:01:00Z",
+      metadata: {
+        deep_data_ui: { preview: id.endsWith("1") ? "报告增加一张对比表" : "补充风险说明" },
       },
-      createdAt: new Date("2026-07-28T12:00:00Z"),
-    }];
-    streamState.queue.size = 1;
+      multitask_strategy: "enqueue",
+    });
+    listRuns.mockImplementation(async (_threadId, options) => (
+      options?.status === "pending" ? [...pendingIds].map(makePendingRun) : []
+    ));
+    createRun.mockImplementation(async () => {
+      const id = pendingIds.size === 0 ? "queued-run-1" : "queued-run-2";
+      pendingIds.add(id);
+      return makePendingRun(id);
+    });
+    getRun.mockImplementation(async (_threadId, runId) => makePendingRun(runId));
+    cancelRun.mockImplementation(async (_threadId, runId) => {
+      pendingIds.delete(runId);
+    });
     render(<App />);
+    await screen.findByText("默认账户");
 
-    expect(screen.getByText("等待处理 · 1")).toBeTruthy();
+    const input = screen.getByLabelText("补充要求或纠正方向");
+    fireEvent.change(input, { target: { value: "报告增加一张对比表" } });
+    fireEvent.click(screen.getByRole("button", { name: "排队发送消息" }));
+    await waitFor(() => expect(createRun).toHaveBeenCalledTimes(1));
+    fireEvent.change(input, { target: { value: "补充风险说明" } });
+    fireEvent.click(screen.getByRole("button", { name: "排队发送消息" }));
+
+    expect(await screen.findByText("等待处理 · 2")).toBeTruthy();
     expect(screen.getByText("报告增加一张对比表")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "撤销等待消息：报告增加一张对比表" }));
-    expect(cancelQueuedRun).toHaveBeenCalledWith("queued-run-1");
+    await waitFor(() => expect(cancelRun).toHaveBeenCalledWith(
+      "thread-current", "queued-run-1", true, "interrupt",
+    ));
 
     fireEvent.click(screen.getByRole("button", { name: "清空等待消息" }));
-    expect(clearQueue).toHaveBeenCalled();
+    await waitFor(() => expect(cancelRun).toHaveBeenCalledWith(
+      "thread-current", "queued-run-2", true, "interrupt",
+    ));
+    expect(cancelQueuedRun).not.toHaveBeenCalled();
+    expect(clearQueue).not.toHaveBeenCalled();
   });
 
   it("把新 thread id 写入 URL", async () => {
@@ -1561,8 +1765,9 @@ describe("研究工作台", () => {
     fireEvent.change(input, { target: { value: "尚未提交的研究任务" } });
     fireEvent.click(screen.getByRole("button", { name: "开始新任务" }));
 
-    expect(window.confirm).toHaveBeenCalled();
-    expect(switchThread).toHaveBeenCalledWith(null);
+    expect(window.confirm).not.toHaveBeenCalled();
+    expect(switchThread).not.toHaveBeenCalled();
+    expect(capturedOptions?.threadId).toBeUndefined();
     expect(input.value).toBe("");
   });
 });

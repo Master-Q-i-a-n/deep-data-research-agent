@@ -1,5 +1,6 @@
 import { ChangeEvent, FormEvent, ImgHTMLAttributes, KeyboardEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { HumanMessage } from "@langchain/core/messages";
+import { Client } from "@langchain/langgraph-sdk/client";
 import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -9,6 +10,7 @@ import TaskTrace, { type AsyncTask, type AsyncTaskStatus } from "./TaskTrace";
 import TodoPanel, { type TodoItem } from "./TodoPanel";
 import ToolCallCard, { type ToolCard } from "./ToolCallCard";
 import type { SubagentTraceStream } from "./SubagentTrace";
+import { useThreadRunManager } from "./useThreadRunManager";
 
 type RawToolCall = { id?: string; name?: string; args?: unknown };
 type Message = {
@@ -863,6 +865,7 @@ export default function App() {
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState("");
   const [deletingThreadId, setDeletingThreadId] = useState<string>();
+  const [threadAllocating, setThreadAllocating] = useState(false);
   const [polledTasks, setPolledTasks] = useState<Record<string, AsyncTask>>({});
   const [tasksRefreshing, setTasksRefreshing] = useState(false);
   const [taskRefreshError, setTaskRefreshError] = useState("");
@@ -910,7 +913,7 @@ export default function App() {
     messages: Message[];
     values: StreamState;
   }>();
-  const activeRunReconnectRef = useRef<string>();
+  const reconnectsInFlightRef = useRef<Set<string>>(new Set());
   const authHeaders = useMemo<Record<string, string>>(
     () => {
       const headers: Record<string, string> = {};
@@ -919,6 +922,11 @@ export default function App() {
     },
     [authToken],
   );
+  const graphClient = useMemo(
+    () => new Client({ apiUrl, defaultHeaders: authHeaders }),
+    [apiUrl, authHeaders],
+  );
+  const runManager = useThreadRunManager(graphClient, assistantId);
   const authReady = authStatus === "ready";
   const workspaceLocked = !authReady;
   const expireAuthentication = useCallback(() => {
@@ -974,13 +982,14 @@ export default function App() {
         offset += limit;
       }
       setSessions(collected);
+      runManager.syncThreadStatuses(collected);
     } catch (error) {
       if (signal?.aborted) return;
       setSessionsError(error instanceof Error ? error.message : "暂时无法读取会话记录");
     } finally {
       if (!signal?.aborted) setSessionsLoading(false);
     }
-  }, [apiUrl, assistantId, authHeaders, authReady, expireAuthentication]);
+  }, [apiUrl, assistantId, authHeaders, authReady, expireAuthentication, runManager.syncThreadStatuses]);
 
   const loadArtifacts = useCallback(async (signal?: AbortSignal) => {
     if (!authReady || !threadId) {
@@ -1049,24 +1058,32 @@ export default function App() {
   // 当前前端只持有远程图的状态类型，无法把 Python DeepAgent 类型直接传给
   // useStream；使用宽化后的选项仍可启用 SDK 内置的子智能体跟踪能力。
   const streamOptions = {
-    apiUrl,
+    client: graphClient,
     assistantId,
     threadId: authReady ? threadId : undefined,
     // SDK 的数字 throttle 实际采用尾部防抖；连续 token 会不断重置计时器，
     // 导致整段回答结束后才刷新。关闭它以保留逐 token 的流式显示。
     throttle: false,
-    reconnectOnMount: authReady,
+    reconnectOnMount: false,
     // 子智能体消息保留在独立流中，避免混入 Supervisor 主对话。
     filterSubagentMessages: true,
     defaultHeaders: authHeaders,
     // streamSubgraphs 也会传回内部中间件子图状态。声明一个接收 state 的
     // onFinish 会让 SDK 在运行结束后重新读取主图 thread head，防止子图
     // values 成为最后一个本地快照时把主对话清空。
-    onFinish: (state: unknown) => {
+    onCreated: runManager.recordCreated,
+    onError: (error: unknown, run: { run_id: string; thread_id: string } | undefined) => {
+      setThreadAllocating(false);
+      runManager.recordError(error, run);
+    },
+    onFinish: (state: unknown, run: { run_id: string; thread_id: string } | undefined) => {
       void state;
+      setThreadAllocating(false);
+      runManager.recordFinished(run);
     },
     onThreadId: (id: string) => {
       if (!authReady) return;
+      setThreadAllocating(false);
       setThreadId(id);
       const url = new URL(window.location.href);
       url.searchParams.set("thread", id);
@@ -1150,7 +1167,9 @@ export default function App() {
     () => hitlRequest(stream.interrupt?.value),
     [stream.interrupt?.value],
   );
-  const queuedEntries = stream.queue.entries;
+  const currentRuntime = threadId ? runManager.runtimes[threadId] : undefined;
+  const queuedEntries = currentRuntime?.queuedRuns ?? [];
+  const currentQueueSize = queuedEntries.length;
   const compactTurns = useMemo(() => {
     if (showDetails) return [];
     const queuedBodies = queuedEntries.map((entry) => queuedMessageText(entry.values));
@@ -1191,8 +1210,11 @@ export default function App() {
     [dismissedTaskFailures, tasks],
   );
   const stopStream = useCallback(() => {
-    void stream.stop();
-  }, [stream.stop]);
+    if (!threadId) return;
+    void runManager.cancelActive(threadId).then(() => loadSessions()).catch((error: unknown) => {
+      setSessionsError(error instanceof Error ? `停止回答失败：${error.message}` : "停止回答失败");
+    });
+  }, [loadSessions, runManager.cancelActive, threadId]);
   const runningTaskCount = tasks.filter(
     (task) => task.status === "running" || task.status === "pending",
   ).length;
@@ -1211,7 +1233,7 @@ export default function App() {
     return null;
   }, [displayedMessages]);
   const identitySwitchBlocked = stream.isLoading
-    || stream.queue.size > 0
+    || currentQueueSize > 0
     || runningTaskCount > 0
     || pendingInterrupt !== null
     || filesUploading;
@@ -1310,6 +1332,10 @@ export default function App() {
   }, [loadSessions]);
 
   useEffect(() => {
+    if (!authReady) runManager.reset();
+  }, [authReady, runManager.reset]);
+
+  useEffect(() => {
     const controller = new AbortController();
     void loadArtifacts(controller.signal);
     return () => controller.abort();
@@ -1351,37 +1377,35 @@ export default function App() {
     if (!authReady || !threadId || stream.isLoading || currentSession?.status !== "busy") return undefined;
 
     const controller = new AbortController();
-    // 先给 SDK 使用 sessionStorage 中的 run ID 自动重连；如果它没有启动
-    // 流，再以服务端 busy 状态为准查询活动 run。延迟和 isLoading 双重检查
-    // 防止两个 joinStream 同时订阅同一个运行。
+    // 服务端 run 是最终事实来源；只对当前可见 thread 建立一条流连接。
     const timerId = window.setTimeout(() => {
       if (streamLoadingRef.current) return;
-      void stream.client.runs.list(threadId, {
-        limit: 10,
-        signal: controller.signal,
-      }).then(async (runs) => {
+      void runManager.reconcile(threadId, controller.signal).then(async ({ running, pending }) => {
         if (controller.signal.aborted || streamLoadingRef.current) return;
-        const activeRun = runs.find(
-          (run) => run.status === "running" || run.status === "pending",
-        );
+        const activeRun = running ?? pending[0];
         if (!activeRun) return;
 
         const reconnectKey = `${threadId}:${activeRun.run_id}`;
-        if (activeRunReconnectRef.current === reconnectKey) return;
-        activeRunReconnectRef.current = reconnectKey;
+        if (reconnectsInFlightRef.current.has(reconnectKey)) return;
+        reconnectsInFlightRef.current.add(reconnectKey);
+        runManager.markConnecting(threadId, activeRun.run_id);
         try {
+          runManager.markConnected(threadId, activeRun.run_id);
           await joinStreamRef.current(activeRun.run_id);
         } catch (error) {
-          if (activeRunReconnectRef.current === reconnectKey) {
-            activeRunReconnectRef.current = undefined;
-          }
           if (!controller.signal.aborted) {
+            runManager.recordError(error, {
+              thread_id: threadId,
+              run_id: activeRun.run_id,
+            });
             setSessionsError(
               error instanceof Error
                 ? `运行仍在服务端继续，但实时流重连失败：${error.message}`
-                : "运行仍在服务端继续，但实时流重连失败",
+              : "运行仍在服务端继续，但实时流重连失败",
             );
           }
+        } finally {
+          reconnectsInFlightRef.current.delete(reconnectKey);
         }
       }).catch((error: unknown) => {
         if (controller.signal.aborted) return;
@@ -1397,17 +1421,27 @@ export default function App() {
       window.clearTimeout(timerId);
       controller.abort();
     };
-  }, [authReady, currentSession?.status, stream.client, stream.isLoading, threadId]);
+  }, [
+    authReady,
+    currentSession?.status,
+    runManager.markConnected,
+    runManager.markConnecting,
+    runManager.reconcile,
+    runManager.recordError,
+    stream.isLoading,
+    threadId,
+  ]);
 
   useEffect(() => {
-    if (!authReady || !threadId || (!stream.isLoading && currentSession?.status !== "busy")) {
+    const hasBusySession = sessions.some((session) => session.status === "busy");
+    if (!authReady || (!stream.isLoading && !hasBusySession)) {
       return undefined;
     }
-    // 长任务期间保持左栏的服务端状态新鲜；最终完成刷新仍由 isLoading
-    // 的下降沿负责，这里的低频轮询只用于跨刷新/断线场景。
+    // 任意后台会话忙碌时都保持左栏状态新鲜，当前会话的完成刷新仍由
+    // isLoading 下降沿负责。
     const intervalId = window.setInterval(() => void loadSessions(), 5_000);
     return () => window.clearInterval(intervalId);
-  }, [authReady, currentSession?.status, loadSessions, stream.isLoading, threadId]);
+  }, [authReady, currentSession?.status, loadSessions, sessions, stream.isLoading, threadId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1549,7 +1583,7 @@ export default function App() {
   }, [authReady, pollingTaskKey, refreshTaskStatuses, threadId]);
 
   useEffect(() => {
-    if (!authReady || stream.isLoading || stream.queue.size > 0) return;
+    if (!authReady || stream.isLoading || currentQueueSize > 0) return;
     const trackedById = new Map(trackedTasks.map((task) => [task.task_id, task]));
     const completed = tasks.filter((task) => {
       const tracked = trackedById.get(task.task_id);
@@ -1576,7 +1610,7 @@ export default function App() {
       runKeys.forEach((key) => autoCollectedTaskRunsRef.current.delete(key));
       setTaskRefreshError("任务已完成，但自动读取结果失败，请点击“读取结果”重试");
     });
-  }, [authReady, stream.isLoading, stream.queue.size, stream.submit, tasks, trackedTasks]);
+  }, [authReady, currentQueueSize, stream.isLoading, stream.submit, tasks, trackedTasks]);
 
   useEffect(() => {
     const updateAutoFollow = () => {
@@ -1635,7 +1669,6 @@ export default function App() {
       if (response.status === 401) expireAuthentication();
       throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "创建文件分析会话失败");
     }
-    stream.switchThread(nextThreadId);
     setThreadId(nextThreadId);
     const url = new URL(window.location.href);
     url.searchParams.set("thread", nextThreadId);
@@ -1795,7 +1828,7 @@ export default function App() {
 
   function submitText(text: string, mode: SubmitMode = "enqueue") {
     const value = text.trim();
-    if (!authReady || !value || !filesReadyForAnalysis) return;
+    if (!authReady || !value || !filesReadyForAnalysis || threadAllocating) return;
     const uploadedPaths = uploadedFiles
       .filter((file): file is UploadedTableFile & { path: string } => file.status === "ready" && Boolean(file.path))
       .map((file) => `- ${file.path}`);
@@ -1807,9 +1840,23 @@ export default function App() {
       content: message,
     });
     setInput("");
-    const multitaskOptions = stream.isLoading
-      ? { multitaskStrategy: mode }
-      : {};
+    if (stream.isLoading && mode === "enqueue") {
+      if (!threadId) {
+        setInput(value);
+        return;
+      }
+      void runManager.enqueue(
+        threadId,
+        { messages: [{ type: "human", content: message }] },
+        message,
+      ).catch((error: unknown) => {
+        setInput((current) => current || value);
+        setSessionsError(error instanceof Error ? `消息排队失败：${error.message}` : "消息排队失败");
+      });
+      return;
+    }
+    const multitaskOptions = stream.isLoading ? { multitaskStrategy: mode } : {};
+    if (!threadId) setThreadAllocating(true);
 
     void stream.submit(
       { messages: [{ type: "human", content: message }] },
@@ -1830,7 +1877,11 @@ export default function App() {
         streamSubgraphs: true,
         onDisconnect: "continue",
       },
-    );
+    ).catch((error: unknown) => {
+      setThreadAllocating(false);
+      setInput((current) => current || value);
+      setSessionsError(error instanceof Error ? `发送任务失败：${error.message}` : "发送任务失败");
+    });
   }
 
   async function resumeInterrupt(decisions: HITLDecision[]) {
@@ -1895,6 +1946,20 @@ export default function App() {
     void refreshTaskStatuses(undefined, true);
   }
 
+  function clearQueuedMessages() {
+    if (!threadId) return;
+    void runManager.clearPending(threadId).catch((error: unknown) => {
+      setSessionsError(error instanceof Error ? `清空排队消息失败：${error.message}` : "清空排队消息失败");
+    });
+  }
+
+  function cancelQueuedMessage(runId: string) {
+    if (!threadId) return;
+    void runManager.cancelPending(threadId, runId).catch((error: unknown) => {
+      setSessionsError(error instanceof Error ? `取消排队消息失败：${error.message}` : "取消排队消息失败");
+    });
+  }
+
   function jumpToBottom() {
     autoFollowRef.current = true;
     setShowJumpToBottom(false);
@@ -1902,20 +1967,9 @@ export default function App() {
   }
 
   function startNewThread() {
-    if (!authReady) return;
-    const activeWorkCount = runningTaskCount
-      + stream.queue.size
-      + Number(stream.isLoading)
-      + Number(pendingInterrupt !== null);
-    if (
-      activeWorkCount > 0
-      && !window.confirm(
-        "当前还有正在回答、等待处理或后台采集的任务。开始新会话不会取消独立运行的 crawl-worker，且新会话无法直接管理旧任务。仍要继续吗？",
-      )
-    ) {
-      return;
-    }
-    stream.switchThread(null);
+    if (!authReady || threadAllocating || filesUploading || interruptSubmitting) return;
+    if (threadId) runManager.markDetached(threadId);
+    setThreadAllocating(false);
     setThreadId(undefined);
     setInput("");
     setUploadedFiles([]);
@@ -1924,8 +1978,8 @@ export default function App() {
   }
 
   function selectSession(nextThreadId: string) {
-    if (!authReady || nextThreadId === threadId || stream.isLoading || stream.queue.size > 0 || filesUploading) return;
-    stream.switchThread(nextThreadId);
+    if (!authReady || nextThreadId === threadId || threadAllocating || filesUploading || interruptSubmitting) return;
+    if (threadId) runManager.markDetached(threadId);
     setThreadId(nextThreadId);
     setInput("");
     setUploadedFiles([]);
@@ -1935,10 +1989,18 @@ export default function App() {
   }
 
   async function deleteSession(targetThreadId: string) {
-    if (!authReady || deletingThreadId || (targetThreadId === threadId && identitySwitchBlocked)) return;
+    if (!authReady || deletingThreadId || filesUploading || interruptSubmitting) return;
     setDeletingThreadId(targetThreadId);
     setSessionsError("");
     try {
+      const active = await runManager.reconcile(targetThreadId);
+      if (active.running || active.pending.length > 0) {
+        const confirmed = window.confirm(
+          "该会话仍有运行中或排队任务。删除将先取消这些任务，确定继续吗？",
+        );
+        if (!confirmed) return;
+        await runManager.cancelAllAndWait(targetThreadId);
+      }
       const response = await fetch(`${apiUrl}/threads/${encodeURIComponent(targetThreadId)}`, {
         method: "DELETE",
         headers: authHeaders,
@@ -1948,9 +2010,9 @@ export default function App() {
         throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "删除会话失败，请稍后重试");
       }
       setSessions((current) => current.filter((session) => session.thread_id !== targetThreadId));
+      runManager.removeThread(targetThreadId);
       if (targetThreadId === threadId) {
         // 删除当前会话后直接进入空白会话，不保留已经删除的 URL。
-        stream.switchThread(null);
         setThreadId(undefined);
         setInput("");
         setUploadedFiles([]);
@@ -1964,7 +2026,8 @@ export default function App() {
   }
 
   function resetThreadForIdentityChange() {
-    stream.switchThread(null);
+    if (threadId) runManager.markDetached(threadId);
+    runManager.reset();
     setThreadId(undefined);
     setInput("");
     setUploadedFiles([]);
@@ -2134,17 +2197,24 @@ export default function App() {
             <span>{workspaceLocked ? "登录后启用 Supervisor" : stream.isLoading ? "Supervisor 正在回答" : "Supervisor 入口就绪"}</span>
           </div>
           <code title={threadId ?? "等待创建"}>{workspaceLocked ? "会话功能已锁定" : threadId ?? "新会话 · 等待首次消息"}</code>
-          <button type="button" disabled={workspaceLocked} onClick={startNewThread}>开始新任务</button>
+          <button
+            type="button"
+            disabled={workspaceLocked || threadAllocating || filesUploading || interruptSubmitting}
+            onClick={startNewThread}
+          >
+            开始新任务
+          </button>
         </div>
 
         <SessionHistory
           sessions={sessions}
+          runtimes={runManager.runtimes}
           currentThreadId={threadId}
           loading={sessionsLoading}
           error={sessionsError}
-          switchingDisabled={workspaceLocked || stream.isLoading || stream.queue.size > 0 || filesUploading}
+          switchingDisabled={workspaceLocked || threadAllocating || filesUploading || interruptSubmitting}
           deletingThreadId={deletingThreadId}
-          deleteCurrentDisabled={workspaceLocked || identitySwitchBlocked}
+          deleteCurrentDisabled={workspaceLocked || threadAllocating || filesUploading || interruptSubmitting}
           onSelect={selectSession}
           onDelete={(targetThreadId) => void deleteSession(targetThreadId)}
           onRefresh={() => void loadSessions()}
@@ -2218,7 +2288,7 @@ export default function App() {
             <div className="runtime-stats" aria-label="运行状态">
               <span>Supervisor：{stream.isLoading ? "回答中" : "空闲"}</span>
               <span>后台任务：{runningTaskCount}</span>
-              <span>等待处理：{stream.queue.size}</span>
+              <span>等待处理：{currentQueueSize}</span>
             </div>
             <i className={stream.isLoading ? "is-active" : ""} aria-hidden="true" />
           </div>
@@ -2383,24 +2453,24 @@ export default function App() {
             </section>
           ) : null}
 
-          {stream.queue.size > 0 ? (
+          {currentQueueSize > 0 ? (
             <section className="queue-card" aria-labelledby="queue-title">
               <header>
                 <div>
                   <p className="eyebrow">服务端队列</p>
-                  <h2 id="queue-title">等待处理 · {stream.queue.size}</h2>
+                  <h2 id="queue-title">等待处理 · {currentQueueSize}</h2>
                 </div>
-                <button type="button" onClick={() => void stream.queue.clear()}>
+                <button type="button" onClick={clearQueuedMessages}>
                   清空等待消息
                 </button>
               </header>
               <ol>
-                {stream.queue.entries.map((entry) => (
+                {queuedEntries.map((entry) => (
                   <li key={entry.id}>
                     <span>{queuedMessageText(entry.values)}</span>
                     <button
                       type="button"
-                      onClick={() => void stream.queue.cancel(entry.id)}
+                      onClick={() => cancelQueuedMessage(entry.id)}
                       aria-label={`撤销等待消息：${queuedMessageText(entry.values)}`}
                     >
                       撤销
@@ -2449,6 +2519,8 @@ export default function App() {
                 ? "请先处理上方待确认事项"
                 : workspaceLocked
                   ? "登录后可开始研究任务"
+                : threadAllocating
+                  ? "正在创建会话"
                 : stream.isLoading
                   ? "补充要求或纠正方向"
                   : "描述你的网页或文件分析任务"}
@@ -2520,7 +2592,7 @@ export default function App() {
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onComposerKeyDown}
               placeholder={workspaceLocked ? "请先登录或注册" : "例如：分析已上传订单表的月度趋势和异常值，并生成图表……"}
-              disabled={workspaceLocked || pendingInterrupt !== null}
+              disabled={workspaceLocked || pendingInterrupt !== null || threadAllocating}
             />
             <span>
               {pendingInterrupt
@@ -2534,7 +2606,7 @@ export default function App() {
             <button
               className="send-button"
               type="submit"
-              disabled={workspaceLocked || !input.trim() || pendingInterrupt !== null || !filesReadyForAnalysis}
+              disabled={workspaceLocked || !input.trim() || pendingInterrupt !== null || !filesReadyForAnalysis || threadAllocating}
               aria-label={stream.isLoading ? "排队发送消息" : "发送分析任务"}
             >
               <span>{stream.isLoading ? "排队发送" : "发送任务"}</span>
@@ -2544,7 +2616,7 @@ export default function App() {
               <button
                 className="interrupt-button"
                 type="button"
-                disabled={!input.trim()}
+                  disabled={!input.trim() || threadAllocating}
                 onClick={() => submitText(input, "interrupt")}
               >
                 立即纠正
