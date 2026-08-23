@@ -1,0 +1,43 @@
+# 基础数值与表格分析
+numpy>=2,<3
+pandas>=3,<4
+scipy>=1.15,<2
+sympy>=1.13,<2
+
+# 统计分析与机器学习
+scikit-learn>=1.7,<2
+statsmodels>=0.14,<0.15
+
+# 大型数据与列式存储
+polars>=1.40,<2
+duckdb>=1.4,<2
+pyarrow>=20,<30
+
+# Excel 和办公表格
+openpyxl>=3.1,<4
+xlsxwriter>=3.2,<4
+xlrd>=2,<3
+pyxlsb>=1,<2
+python-calamine>=0.4,<1
+
+# 图表
+matplotlib>=3.10,<4
+seaborn>=0.13,<1
+plotly>=6,<7
+pillow>=11,<13
+
+# 数据读取与格式处理
+charset-normalizer>=3.4,<4
+lxml>=5,<7
+html5lib>=1.1,<2
+tabulate>=0.9,<1
+
+# 数据清洗、匹配与关系分析
+rapidfuzz>=3,<4
+networkx>=3,<4
+
+# Markdown 转 HTML 与 PDF。WeasyPrint 使用 Pango 渲染中文，不依赖浏览器。
+markdown>=3.8,<4
+pymdown-extensions>=10,<11
+# PDF 排版结果会随 WeasyPrint 主版本变化，因此固定渲染器版本。
+weasyprint==69.0

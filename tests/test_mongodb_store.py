@@ -1,8 +1,8 @@
 import pytest
 from langgraph.store.memory import InMemoryStore
 
-from deep_data_research_agent import mongodb_store
-from deep_data_research_agent.mongodb_store import (
+from deep_data_research_agent.infrastructure.mongodb import store as mongodb_store
+from deep_data_research_agent.infrastructure.mongodb.store import (
     NamespaceRoutedStore,
     _migrate_legacy_skill_namespaces,
     _sync_public_skills,

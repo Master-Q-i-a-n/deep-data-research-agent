@@ -5,11 +5,12 @@ from typing import Any
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from deep_data_research_agent import database, sandbox_manager
-from deep_data_research_agent.user_checkpointer import (
+from deep_data_research_agent.database import repository as database
+from deep_data_research_agent.infrastructure.postgres.checkpointer import (
     UserOwnedPostgresCheckpointer,
     configured_user_id,
 )
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
 
 
 class FakePostgresSaver:

@@ -5,12 +5,12 @@ from typing import Any
 
 import pytest
 
-from deep_data_research_agent.skill_storage import (
+from deep_data_research_agent.skill_system.storage import (
     SKILL_AGENT_NAMES,
     file_store_value,
     public_skill_namespace,
 )
-from deep_data_research_agent.sync_skills_from_mongodb import (
+from deep_data_research_agent.skill_system.sync import (
     _replace_tree,
     load_public_skill_snapshot,
 )

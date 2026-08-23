@@ -1,7 +1,5 @@
-import io
 import json
 import smtplib
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,8 +7,9 @@ import pytest
 from blockbuster import blockbuster_ctx
 from pydantic import SecretStr
 
-from deep_data_research_agent import interaction_tools, sandbox_manager
-from deep_data_research_agent.config import Settings
+from deep_data_research_agent.core.config import Settings
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.tools import interaction as interaction_tools
 
 
 def _runtime():
@@ -63,7 +62,7 @@ def _delivery_record(**overrides):
         "pdf_filename": "final_report.pdf",
         "zip_filename": "final_report-bundle.zip",
         "message_id": "<message@example.com>",
-        "status": "sending",
+        "status": "queued",
         "error_summary": None,
     }
     values.update(overrides)
@@ -184,36 +183,25 @@ def test_email_input_validation_rejects_lists_headers_and_non_output_paths() -> 
 
 
 @pytest.mark.asyncio
-async def test_send_report_email_builds_pdf_and_complete_zip(monkeypatch, tmp_path: Path) -> None:
+async def test_send_report_email_enqueues_durable_delivery(monkeypatch, tmp_path: Path) -> None:
     _prepare_email_workspace(tmp_path)
     _patch_email_workspace(monkeypatch, tmp_path)
     monkeypatch.setattr(interaction_tools, "get_settings", _smtp_settings)
 
     async def begin_email_delivery(**kwargs):
         assert kwargs["recipient"] == "reader@example.com"
+        assert kwargs["pdf_path"] == "/workspace/output/final_report.pdf"
+        assert kwargs["markdown_path"] == "/workspace/output/final_report.md"
         return _delivery_record(
             idempotency_key=kwargs["idempotency_key"],
             subject=kwargs["subject"],
             message_id=kwargs["message_id"],
         ), True
 
-    finished: list[tuple[str, str]] = []
-
-    async def finish_email_delivery(key: str, *, status: str, error_summary=None):
-        assert error_summary is None
-        finished.append((key, status))
-        return _delivery_record(idempotency_key=key, status=status)
-
-    sent_messages = []
-
-    def send_smtp_message(email, *, settings, recipient):
-        assert settings.smtp_password.get_secret_value() == "authorization-code"
-        assert recipient == "reader@example.com"
-        sent_messages.append(email)
+    published: list[str] = []
 
     monkeypatch.setattr(interaction_tools.database, "begin_email_delivery", begin_email_delivery)
-    monkeypatch.setattr(interaction_tools.database, "finish_email_delivery", finish_email_delivery)
-    monkeypatch.setattr(interaction_tools, "_send_smtp_message", send_smtp_message)
+    monkeypatch.setattr(interaction_tools, "publish_email_delivery", published.append)
 
     result = await interaction_tools.send_report_email.coroutine(
         recipient="reader@example.com",
@@ -225,25 +213,10 @@ async def test_send_report_email_builds_pdf_and_complete_zip(monkeypatch, tmp_pa
 
     payload = json.loads(result.content)
     assert result.status == "success"
-    assert payload["status"] == "sent"
+    assert payload["status"] == "queued"
+    assert payload["delivery_id"]
     assert payload["attachments"] == ["final_report.pdf", "final_report-bundle.zip"]
-    assert len(sent_messages) == 1
-    email = sent_messages[0]
-    assert str(email["From"]) == "深研 <sender@qq.com>"
-    assert str(email["To"]) == "reader@example.com"
-    assert str(email["Subject"]) == "研究报告：final_report"
-    attachments = list(email.iter_attachments())
-    assert [part.get_filename() for part in attachments] == [
-        "final_report.pdf",
-        "final_report-bundle.zip",
-    ]
-    with zipfile.ZipFile(io.BytesIO(attachments[1].get_payload(decode=True))) as archive:
-        assert set(archive.namelist()) == {
-            "charts/trend.png",
-            "final_report.md",
-            "metrics.csv",
-        }
-    assert finished and finished[0][1] == "sent"
+    assert published == [payload["delivery_id"]]
 
 
 @pytest.mark.asyncio
@@ -267,16 +240,8 @@ async def test_send_report_email_does_not_block_langgraph_event_loop(
             message_id=kwargs["message_id"],
         ), True
 
-    async def finish_email_delivery(key: str, *, status: str, error_summary=None):
-        return _delivery_record(
-            idempotency_key=key,
-            status=status,
-            error_summary=error_summary,
-        )
-
     monkeypatch.setattr(interaction_tools.database, "begin_email_delivery", begin_email_delivery)
-    monkeypatch.setattr(interaction_tools.database, "finish_email_delivery", finish_email_delivery)
-    monkeypatch.setattr(interaction_tools, "_send_smtp_message", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(interaction_tools, "publish_email_delivery", lambda _key: None)
 
     with blockbuster_ctx(scanned_modules=["deep_data_research_agent"]):
         result = await interaction_tools.send_report_email.coroutine(
@@ -285,7 +250,7 @@ async def test_send_report_email_does_not_block_langgraph_event_loop(
         )
 
     assert result.status == "success"
-    assert json.loads(result.content)["status"] == "sent"
+    assert json.loads(result.content)["status"] == "queued"
 
 
 @pytest.mark.asyncio
@@ -301,7 +266,7 @@ async def test_send_report_email_replay_does_not_send_again(monkeypatch, tmp_pat
         raise AssertionError("同一工具调用不得重复发送")
 
     monkeypatch.setattr(interaction_tools.database, "begin_email_delivery", begin_email_delivery)
-    monkeypatch.setattr(interaction_tools, "_send_smtp_message", unexpected_send)
+    monkeypatch.setattr(interaction_tools, "publish_email_delivery", unexpected_send)
 
     result = await interaction_tools.send_report_email.coroutine(
         recipient="reader@example.com",
@@ -343,7 +308,7 @@ async def test_send_report_email_internal_error_reports_safe_stage(
 
 
 @pytest.mark.asyncio
-async def test_send_report_email_marks_ambiguous_disconnect_uncertain(
+async def test_send_report_email_keeps_outbox_when_broker_publish_fails(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -354,34 +319,23 @@ async def test_send_report_email_marks_ambiguous_disconnect_uncertain(
     async def begin_email_delivery(**_kwargs):
         return _delivery_record(), True
 
-    finished: list[tuple[str, str, str | None]] = []
-
-    async def finish_email_delivery(key: str, *, status: str, error_summary=None):
-        finished.append((key, status, error_summary))
-        return _delivery_record(status=status, error_summary=error_summary)
-
-    def disconnect(*_args, **_kwargs):
-        raise interaction_tools._SMTPDeliveryError(
-            "SMTP 提交过程中连接中断，邮件投递状态不确定。",
-            uncertain=True,
-        )
+    def unavailable(_delivery_id: str) -> None:
+        raise RuntimeError("broker unavailable")
 
     monkeypatch.setattr(interaction_tools.database, "begin_email_delivery", begin_email_delivery)
-    monkeypatch.setattr(interaction_tools.database, "finish_email_delivery", finish_email_delivery)
-    monkeypatch.setattr(interaction_tools, "_send_smtp_message", disconnect)
+    monkeypatch.setattr(interaction_tools, "publish_email_delivery", unavailable)
 
     result = await interaction_tools.send_report_email.coroutine(
         recipient="reader@example.com",
         runtime=_runtime(),
     )
 
-    assert result.status == "error"
-    assert json.loads(result.content)["status"] == "uncertain"
-    assert finished[0][1] == "uncertain"
+    assert result.status == "success"
+    assert json.loads(result.content)["status"] == "queued"
 
 
 @pytest.mark.asyncio
-async def test_send_report_email_rejects_oversized_attachments_before_db(
+async def test_send_report_email_defers_attachment_limit_to_worker(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -394,18 +348,19 @@ async def test_send_report_email_rejects_oversized_attachments_before_db(
     )
     (tmp_path / "output" / "final_report.pdf").write_bytes(b"x" * 2048)
 
-    async def unexpected_begin(**_kwargs):
-        raise AssertionError("超限附件不应创建投递记录")
+    async def begin_email_delivery(**_kwargs):
+        return _delivery_record(), True
 
-    monkeypatch.setattr(interaction_tools.database, "begin_email_delivery", unexpected_begin)
+    monkeypatch.setattr(interaction_tools.database, "begin_email_delivery", begin_email_delivery)
+    monkeypatch.setattr(interaction_tools, "publish_email_delivery", lambda _key: None)
 
     result = await interaction_tools.send_report_email.coroutine(
         recipient="reader@example.com",
         runtime=_runtime(),
     )
 
-    assert result.status == "error"
-    assert "超过发送上限" in str(result.content)
+    assert result.status == "success"
+    assert json.loads(result.content)["status"] == "queued"
 
 
 @pytest.mark.asyncio

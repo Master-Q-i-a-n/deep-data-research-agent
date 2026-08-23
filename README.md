@@ -32,6 +32,12 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
 
 当前不包含向量记忆、周期记忆整理和 Playwright 网页采集能力。
 
+## 项目结构
+
+后端采用 Python 标准 `src layout`，并按 API、Agent、准入、数据持久化、工具、Worker 和
+外部基础设施分区；React 前端按功能组织。完整目录与依赖方向见
+[项目结构说明](docs/architecture/project-structure.md)。
+
 ## 配置
 
 项目依赖已经写入 `pyproject.toml`。复制环境变量模板并填写模型、Tavily 和 LangSmith Key：
@@ -100,14 +106,14 @@ RUN_ADMISSION_LOCK_SECONDS=5
 接管同名数据卷：
 
 ```powershell
-.\scripts\setup_redis.ps1
+.\scripts\setup\redis.ps1
 ```
 
 Redis 只监听宿主机回环地址，应用使用 `.secrets/redis_password` 认证，不需要把密码写入
-真实 `.env`。详细的验收、备份和恢复步骤见 [Redis 运维说明](docs/redis.md)。
+真实 `.env`。详细的验收、备份和恢复步骤见 [Redis 运维说明](docs/operations/redis.md)。
 
-如需使用 QQ 邮箱发送报告，在本地 `.env` 中启用固定发件邮箱。`SMTP_PASSWORD` 必须填写
-QQ 邮箱生成的授权码，而不是登录密码：
+如需使用 QQ 邮箱发送报告，在本地 `.env` 中启用固定发件邮箱。附件打包和SMTP提交由
+Celery后台执行，`SMTP_PASSWORD` 必须填写QQ邮箱生成的授权码，而不是登录密码：
 
 ```dotenv
 SMTP_ENABLED=true
@@ -122,23 +128,37 @@ SMTP_MAX_ATTACHMENT_BYTES=20971520
 ```
 
 账户、登录令牌、thread 归属、邮件投递与 LangGraph checkpoint 统一使用 PostgreSQL。
-先在被 Git 忽略的 `.env.postgres-admin` 中写入管理员连接；应用角色密码可省略，命令会生成并
-只保存到本地文件：
+先在被 Git 忽略的 `.env.postgres-admin` 中写入管理员连接；迁移角色和应用角色密码均可省略，
+命令会分别生成并只保存到本地文件：
 
 ```dotenv
 POSTGRES_ADMIN_URI=postgresql://postgres:admin-password@127.0.0.1:5432/postgres
+# POSTGRES_MIGRATOR_PASSWORD=optional-fixed-password
 # POSTGRES_APP_PASSWORD=optional-fixed-password
 ```
 
-停止后端后初始化专用角色、数据库、应用表与官方 PostgreSQL checkpoint 表：
+停止后端后创建独立迁移/运行角色，通过 Alembic 接管或升级应用表，并用迁移角色初始化官方
+PostgreSQL checkpoint 表：
 
 ```powershell
 uv run setup-agent-postgres
 ```
 
-该命令不会在终端输出管理员或应用凭证，并会把 `POSTGRES_URI` 与
-`LANGGRAPH_STRICT_MSGPACK=true` 写入本地 `.env`。应用启动后，账户、登录令牌、thread
-归属、邮件投递和 LangGraph checkpoint 均直接使用该 PostgreSQL 数据库。
+存量数据库只有在表、列、主键、外键和索引兼容时才会自动 stamp 基线；不兼容会在转移对象
+所有权前中止。该命令不会在终端输出任何凭证，只把运行角色的 `POSTGRES_URI` 与
+`LANGGRAPH_STRICT_MSGPACK=true` 写入本地 `.env`。运行角色没有建表或改表权限，应用启动也
+不会调用 `create_all()` 或 checkpoint `setup()`。
+
+生成迁移后应先检查模型漂移，再由部署流程升级，不能让 API 或 Celery 自动迁移：
+
+```powershell
+$env:POSTGRES_MIGRATION_URI='postgresql://deep_data_research_agent_migrator:<密码>@127.0.0.1:5432/deep_data_research_agent'
+uv run alembic check
+uv run alembic upgrade head
+```
+
+负载均衡探针使用无需认证的 `GET /health/live` 和 `GET /health/ready`。前者只检查进程，后者
+并行检查 PostgreSQL 迁移/checkpoint、Redis 与 MongoDB；任何核心依赖失败时返回 503。
 
 动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。开发环境无 Bearer
 Token 时 LangGraph Auth 注入共享身份 `local-user`；生产环境无 Token 返回 401。注册用户使用
@@ -148,7 +168,8 @@ Token 时 LangGraph Auth 注入共享身份 `local-user`；生产环境无 Token
 20 个顶层 Supervisor run；内部异步子 Agent 通过服务端签名标记排除。Redis 不可用时保护逻辑
 fail-closed，不回退 PostgreSQL。应用只读取 ASGI peer 地址，不直接信任 `X-Forwarded-For`。
 
-自动失败回顾只把当前任务目标、已配对的工具调用/结果和最终结果加入 MongoDB 队列，每个
+自动失败回顾只把当前任务目标、已配对的工具调用/结果和最终结果加入 MongoDB 队列，再由
+Celery异步处理。每个
 Agent 每轮最多整理三条独立教训；不保存完整提示词、历史消息或 Agent 中间思考，也不依赖模型上下文缓存。登录用户可以在前端设置中
 关闭自己的失败经验贡献或清除偏好与行为反馈；关闭贡献不影响已有公共经验的读取，会话、Skill
 和产物也不受影响。
@@ -161,6 +182,26 @@ uv run reset-agent-memory
 
 该命令只清理旧偏好、`memories`、`memory_update_jobs` 和记忆 worker 租约，不会清理用户、
 Skill、checkpoint、会话或异步任务。
+
+## 启动 Celery
+
+开发环境在两个独立PowerShell终端启动worker和Beat。Windows使用 `solo` 池，任务按
+`memory`、`mail`、`maintenance` 三个逻辑队列路由；业务结果保存在MongoDB/PostgreSQL，
+不使用Celery结果后端：
+
+```powershell
+$env:PYTHONUTF8='1'
+uv run celery -A deep_data_research_agent.workers.app:celery_app worker --pool=solo -Q memory,mail,maintenance --loglevel=INFO
+```
+
+```powershell
+$env:PYTHONUTF8='1'
+uv run celery -A deep_data_research_agent.workers.app:celery_app beat --loglevel=INFO --schedule data/celerybeat-schedule
+```
+
+邮件工具返回 `queued` 和 `delivery_id`；可通过认证接口
+`GET /email-deliveries/{delivery_id}` 查询 `queued/processing/retry/submitting/sent/failed/uncertain`
+状态。生产环境应在Linux上用独立进程管理worker和Beat，并确保同一环境只运行一个Beat。
 
 ## OpenSandbox
 
@@ -186,6 +227,13 @@ Skill 在 `/skill-manage/{name}/` 下创建或下载：下载支持公开 GitHub
 
 应用连接 MongoDB Store 时会先幂等迁移旧的 `(user_hash, "skills", "assigned", agent_name)`
 namespace，再把仓库公共种子精确同步到各 Agent 的公共 namespace；同步失败会阻止启动。
+
+需要从 MongoDB 手动校验或覆盖同步本地公共 Skill 时，使用维护脚本：
+
+```powershell
+uv run python .\scripts\maintenance\sync_skills.py --dry-run
+uv run python .\scripts\maintenance\sync_skills.py --yes
+```
 
 ## 启动后端
 

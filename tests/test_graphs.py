@@ -5,18 +5,18 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage
 
-from deep_data_research_agent.agent import graph as supervisor_graph
-from deep_data_research_agent.crawl_worker import crawl_agent
-from deep_data_research_agent.crawl_worker import graph as worker_graph
-from deep_data_research_agent.model_profile import (
+from deep_data_research_agent.agents.crawl_worker import crawl_agent
+from deep_data_research_agent.agents.crawl_worker import graph as worker_graph
+from deep_data_research_agent.agents.model_profile import (
     DEFAULT_EXCLUDED_TOOLS,
     REVIEWER_EXCLUDED_TOOLS,
 )
-from deep_data_research_agent.prompts import (
+from deep_data_research_agent.agents.prompts import (
     ANALYSIS_REVIEWER_PROMPT,
     DATA_ANALYST_PROMPT,
     SUPERVISOR_PROMPT,
 )
+from deep_data_research_agent.agents.supervisor import graph as supervisor_graph
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

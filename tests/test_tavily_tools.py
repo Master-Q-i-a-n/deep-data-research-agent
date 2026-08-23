@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from deep_data_research_agent import tavily_tools
-from deep_data_research_agent.tavily_tools import _persist_result, _public_url
+from deep_data_research_agent.tools import tavily as tavily_tools
+from deep_data_research_agent.tools.tavily import _persist_result, _public_url
 
 
 def test_public_url_normalizes_fragment_and_rejects_localhost() -> None:

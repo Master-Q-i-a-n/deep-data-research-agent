@@ -21,10 +21,13 @@ from langchain_core.messages import AIMessage
 from langgraph.runtime import ExecutionInfo, Runtime
 from openpyxl import Workbook
 
-from deep_data_research_agent import sandbox_manager
-from deep_data_research_agent.agent import graph as supervisor_graph
-from deep_data_research_agent.mongodb_store import _public_seed_values
-from deep_data_research_agent.prompts import DATA_ANALYST_PROMPT, SUPERVISOR_PROMPT
+from deep_data_research_agent.agents.prompts import (
+    DATA_ANALYST_PROMPT,
+    SUPERVISOR_PROMPT,
+)
+from deep_data_research_agent.agents.supervisor import graph as supervisor_graph
+from deep_data_research_agent.infrastructure.mongodb.store import _public_seed_values
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = (

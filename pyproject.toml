@@ -9,7 +9,9 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "aiofiles>=25.1.0",
+    "alembic>=1.16,<2",
     "argon2-cffi>=25.1.0",
+    "celery[redis]>=5.6,<6",
     "deepagents==0.7.8",
     "deepagents-opensandbox==1.0.2",
     "duckdb>=1.5.5",
@@ -39,7 +41,7 @@ dependencies = [
     "pyyaml>=6,<7",
     "python-dotenv>=1,<2",
     "python-multipart>=0.0.20,<1",
-    "redis>=8,<9",
+    "redis>=6.4,<7",
     "selectolax>=0.4.11",
     "sqlalchemy>=2.0.46,<3",
     "tabulate>=0.10.0",
@@ -53,9 +55,9 @@ dependencies = [
 
 [project.scripts]
 deep-data-research-agent = "deep_data_research_agent:main"
-reset-agent-memory = "deep_data_research_agent.reset_memory:main"
-setup-agent-postgres = "deep_data_research_agent.postgres_setup:main"
-run-agent-eval = "deep_data_research_agent.evaluation:main"
+reset-agent-memory = "deep_data_research_agent.cli.reset_memory:main"
+setup-agent-postgres = "deep_data_research_agent.infrastructure.postgres.setup:main"
+run-agent-eval = "deep_data_research_agent.evaluation.runner:main"
 
 [build-system]
 requires = ["uv_build>=0.11.32,<0.12.0"]

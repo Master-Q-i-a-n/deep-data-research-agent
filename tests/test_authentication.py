@@ -1,11 +1,13 @@
 import hashlib
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from starlette.requests import Request
 
-from deep_data_research_agent import auth as auth_module
-from deep_data_research_agent import database, webapp
+from deep_data_research_agent.api import app as webapp
+from deep_data_research_agent.api import auth as auth_module
+from deep_data_research_agent.database import repository as database
 
 
 def _request(authorization: str | None = None) -> Request:
@@ -119,6 +121,35 @@ async def test_memory_settings_are_scoped_to_authenticated_user(monkeypatch) -> 
         "cancelled_jobs": 3,
     }
     assert captured == [(identity_hash, None), (identity_hash, False)]
+
+
+@pytest.mark.asyncio
+async def test_email_delivery_status_is_scoped_to_authenticated_user(monkeypatch) -> None:
+    async def resolve(_token: str) -> database.UserRecord:
+        return database.UserRecord("user-a", "Alice", False)
+
+    async def get_delivery(delivery_id: str, *, user_id: str):
+        assert user_id == "user-a"
+        return SimpleNamespace(
+            idempotency_key=delivery_id,
+            status="queued",
+            recipient="reader@example.com",
+            pdf_filename="final_report.pdf",
+            zip_filename="final_report-bundle.zip",
+            attempts=0,
+            error_summary=None,
+            updated_at=datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC),
+            finished_at=None,
+        )
+
+    monkeypatch.setattr(database, "resolve_login_session", resolve)
+    monkeypatch.setattr(database, "get_email_delivery", get_delivery)
+
+    result = await webapp.email_delivery_status("a" * 64, "Bearer valid")
+
+    assert result["status"] == "queued"
+    assert result["delivery_id"] == "a" * 64
+    assert result["attempts"] == 0
 
 
 @pytest.mark.asyncio

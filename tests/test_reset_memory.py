@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from deep_data_research_agent import reset_memory
+from deep_data_research_agent.cli import reset_memory
 
 
 class Collection:

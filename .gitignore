@@ -19,10 +19,8 @@ htmlcov/
 coverage/
 build/
 data/
-data/users/
 dist/
 frontend/node_modules/
-frontend/dist/
 frontend/.env.local
 frontend/.eslintcache
 *.tsbuildinfo
@@ -30,6 +28,7 @@ frontend/.eslintcache
 .playwright-cli/
 output/
 *.log
+celerybeat-schedule*
 .secrets/
 .redis-backups/
 
@@ -41,5 +40,3 @@ Thumbs.db
 
 # 本地启动命令备忘，正式命令已记录在 README
 order.txt
-
-docker/

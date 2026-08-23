@@ -2,6 +2,7 @@ import asyncio
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -14,8 +15,9 @@ from deepagents.backends.protocol import (
 from deepagents_opensandbox import OpensandboxBackend
 from opensandbox.exceptions import SandboxError, SandboxException
 
-from deep_data_research_agent import backends, sandbox_manager
-from deep_data_research_agent.config import Settings
+from deep_data_research_agent.agents import backends
+from deep_data_research_agent.core.config import Settings
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
 
 
 class FakeSandbox:
@@ -98,6 +100,43 @@ def _handle(sandbox_id: str, *, healthy: bool = True):
         sandbox=FakeSandbox(sandbox_id, healthy=healthy),
         backend=FakeBackend(sandbox_id),
     )
+
+
+class FakeCoordinationRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
+
+    async def get(self, key: str):
+        return self.values.get(key)
+
+    async def set(self, key: str, value: str, **_kwargs):
+        self.values[key] = value
+        return True
+
+    async def hget(self, key: str, field: str):
+        return self.hashes.get(key, {}).get(field)
+
+    async def hset(self, key: str, field: str, value: str):
+        self.hashes.setdefault(key, {})[field] = value
+        return 1
+
+    async def hgetall(self, key: str):
+        return dict(self.hashes.get(key, {}))
+
+    async def hdel(self, key: str, *fields: str):
+        values = self.hashes.get(key, {})
+        for field in fields:
+            values.pop(field, None)
+        return 1
+
+    async def pexpire(self, _key: str, _ttl: int):
+        return True
+
+    async def delete(self, key: str):
+        self.values.pop(key, None)
+        self.hashes.pop(key, None)
+        return 1
 
 
 def test_first_thread_binding_requires_explicit_user_id(tmp_path) -> None:
@@ -724,3 +763,60 @@ async def test_worker_and_supervisor_components_use_separate_network_profiles(
         ("shared-thread", "crawl-worker", False),
         ("shared-thread", "supervisor", True),
     ]
+
+
+@pytest.mark.asyncio
+async def test_two_managers_share_one_registered_sandbox(tmp_path, monkeypatch) -> None:
+    redis = FakeCoordinationRedis()
+    gate = asyncio.Lock()
+    created: list[str] = []
+
+    class Lease:
+        def ensure_owned(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def fake_lock(*_args, **_kwargs):
+        async with gate:
+            yield Lease()
+
+    async def initialize() -> None:
+        return None
+
+    monkeypatch.setattr(sandbox_manager, "distributed_lock", fake_lock)
+    monkeypatch.setattr(sandbox_manager, "initialize_redis", initialize)
+    monkeypatch.setattr(sandbox_manager, "get_redis", lambda: redis)
+
+    managers = [
+        sandbox_manager.SandboxManager(
+            settings=_settings(tmp_path), coordination_enabled=True
+        ),
+        sandbox_manager.SandboxManager(
+            settings=_settings(tmp_path), coordination_enabled=True
+        ),
+    ]
+
+    async def fake_create(thread_id, component="crawl-worker", network_enabled=False):
+        created.append(thread_id)
+        await asyncio.sleep(0.01)
+        handle = _handle("sandbox-shared")
+        handle.component = component
+        handle.network_enabled = network_enabled
+        return handle
+
+    for manager in managers:
+        monkeypatch.setattr(manager, "_create_handle", fake_create)
+        monkeypatch.setattr(manager, "_list_sandboxes_sync", lambda _metadata: [])
+        monkeypatch.setattr(
+            manager,
+            "_connect_sandbox_sync",
+            lambda sandbox_id: FakeSandbox(sandbox_id),
+        )
+
+    first, second = await asyncio.gather(
+        managers[0].ensure("thread-shared", user_id="user-a"),
+        managers[1].ensure("thread-shared", user_id="user-a"),
+    )
+
+    assert first.id == second.id == "sandbox-shared"
+    assert created == ["thread-shared"]

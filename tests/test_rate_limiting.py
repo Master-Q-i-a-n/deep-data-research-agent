@@ -9,9 +9,16 @@ from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
-from deep_data_research_agent import auth as auth_module
-from deep_data_research_agent import database, redis_limits, token_usage, webapp
-from deep_data_research_agent.config import Settings
+from deep_data_research_agent.admissions import redis_limits, token_usage
+from deep_data_research_agent.api import app as webapp
+from deep_data_research_agent.api import auth as auth_module
+from deep_data_research_agent.core.config import Settings
+from deep_data_research_agent.database import repository as database
+from deep_data_research_agent.database.models import Base
+
+
+async def _noop_schema_check(**_kwargs) -> None:
+    return None
 
 
 def _request(
@@ -44,6 +51,9 @@ async def isolated_database(monkeypatch):
     monkeypatch.setattr(database, "_engine", engine)
     monkeypatch.setattr(database, "_session_factory", factory)
     monkeypatch.setattr(database, "_initialized", False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    monkeypatch.setattr(database, "_validate_deployed_schema", _noop_schema_check)
     await database.ensure_schema()
     try:
         yield factory

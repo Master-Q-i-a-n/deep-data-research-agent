@@ -4,13 +4,14 @@ import pytest
 from deepagents.backends.protocol import FileDownloadResponse, LsResult
 from langgraph.store.memory import InMemoryStore
 
-from deep_data_research_agent import identity, sandbox_manager
-from deep_data_research_agent.skill_middleware import (
+from deep_data_research_agent.agents.middleware.skills import (
     MongoSkillsRestoreMiddleware,
     ReloadableSkillsMiddleware,
     SandboxLifecycleMiddleware,
 )
-from deep_data_research_agent.skill_storage import file_store_value
+from deep_data_research_agent.core import identity
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.skill_system.storage import file_store_value
 
 
 class FakeManager:

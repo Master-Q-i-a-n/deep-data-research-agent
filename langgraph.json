@@ -3,20 +3,20 @@
     "."
   ],
   "graphs": {
-    "supervisor": "./src/deep_data_research_agent/agent.py:graph",
-    "crawl-worker": "./src/deep_data_research_agent/crawl_worker.py:graph"
+    "supervisor": "./src/deep_data_research_agent/agents/supervisor.py:graph",
+    "crawl-worker": "./src/deep_data_research_agent/agents/crawl_worker.py:graph"
   },
   "store": {
-    "path": "./src/deep_data_research_agent/mongodb_store.py:create_mongodb_store"
+    "path": "./src/deep_data_research_agent/infrastructure/mongodb/store.py:create_mongodb_store"
   },
   "checkpointer": {
-    "path": "./src/deep_data_research_agent/user_checkpointer.py:create_user_checkpointer"
+    "path": "./src/deep_data_research_agent/infrastructure/postgres/checkpointer.py:create_user_checkpointer"
   },
   "auth": {
-    "path": "./src/deep_data_research_agent/auth.py:auth"
+    "path": "./src/deep_data_research_agent/api/auth.py:auth"
   },
   "http": {
-    "app": "./src/deep_data_research_agent/webapp.py:app",
+    "app": "./src/deep_data_research_agent/api/app.py:app",
     "enable_custom_route_auth": true,
     "middleware_order": "auth_first",
     "cors": {

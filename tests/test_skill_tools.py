@@ -9,7 +9,9 @@ from types import SimpleNamespace
 import pytest
 from langgraph.store.memory import InMemoryStore
 
-from deep_data_research_agent import identity, sandbox_manager, skill_tools
+from deep_data_research_agent.core import identity
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.tools import skills as skill_tools
 
 
 def _runtime(store=None):

@@ -7,8 +7,8 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 from pydantic import ValidationError
 
-from deep_data_research_agent import memory
-from deep_data_research_agent.config import Settings
+from deep_data_research_agent.core.config import Settings
+from deep_data_research_agent.memory import service as memory
 
 
 def test_memory_timeout_and_review_output_defaults_are_independent() -> None:
@@ -901,6 +901,7 @@ async def test_failure_job_discards_model_output_with_sensitive_text(monkeypatch
 @pytest.mark.asyncio
 async def test_failure_review_enqueue_sets_temporary_payload_expiry(monkeypatch) -> None:
     updates: list[dict] = []
+    published: list[str] = []
 
     class Jobs:
         async def update_one(self, _query, update, *, upsert):
@@ -914,6 +915,7 @@ async def test_failure_review_enqueue_sets_temporary_payload_expiry(monkeypatch)
         return Jobs(), SimpleNamespace(), SimpleNamespace()
 
     monkeypatch.setattr(queue, "_collections", collections)
+    monkeypatch.setattr(memory, "publish_memory_job", published.append)
     monkeypatch.setattr(
         memory,
         "get_settings",
@@ -940,6 +942,7 @@ async def test_failure_review_enqueue_sets_temporary_payload_expiry(monkeypatch)
     assert document["source_user_hash"] == "a" * 64
     assert document["settings_generation"] == 3
     assert "expires_at" in document
+    assert published == ["job-a"]
 
 
 @pytest.mark.asyncio

@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from deep_data_research_agent.mongodb_store import _public_seed_values
-from deep_data_research_agent.prompts import SUPERVISOR_PROMPT
+from deep_data_research_agent.agents.prompts import SUPERVISOR_PROMPT
+from deep_data_research_agent.infrastructure.mongodb.store import _public_seed_values
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = (

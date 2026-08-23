@@ -11,7 +11,13 @@ import pytest_asyncio
 from langchain_core.messages import AIMessage
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from deep_data_research_agent import database, evaluation
+from deep_data_research_agent.database import repository as database
+from deep_data_research_agent.database.models import Base
+from deep_data_research_agent.evaluation import runner as evaluation
+
+
+async def _noop_schema_check(**_kwargs) -> None:
+    return None
 
 
 def test_manifest_has_expected_twenty_cases_in_order() -> None:
@@ -454,6 +460,9 @@ async def isolated_database(monkeypatch):
     monkeypatch.setattr(database, "_engine", engine)
     monkeypatch.setattr(database, "_session_factory", factory)
     monkeypatch.setattr(database, "_initialized", False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    monkeypatch.setattr(database, "_validate_deployed_schema", _noop_schema_check)
     await database.ensure_schema()
     try:
         yield
@@ -482,7 +491,7 @@ def test_live_q01_registers_and_destroys_account(tmp_path: Path) -> None:
         [
             sys.executable,
             "-m",
-            "deep_data_research_agent.evaluation",
+            "deep_data_research_agent.evaluation.runner",
             "--case",
             "Q01",
             "--output-root",

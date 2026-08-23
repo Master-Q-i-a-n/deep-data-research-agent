@@ -4,13 +4,13 @@ import { Client } from "@langchain/langgraph-sdk/client";
 import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import SessionHistory, { type ConversationThread } from "./SessionHistory";
-import SubagentPlanPanel from "./SubagentPlanPanel";
-import TaskTrace, { type AsyncTask, type AsyncTaskStatus } from "./TaskTrace";
-import TodoPanel, { type TodoItem } from "./TodoPanel";
-import ToolCallCard, { type ToolCard } from "./ToolCallCard";
-import type { SubagentTraceStream } from "./SubagentTrace";
-import { useThreadRunManager } from "./useThreadRunManager";
+import { useThreadRunManager } from "./features/chat/useThreadRunManager";
+import SessionHistory, { type ConversationThread } from "./features/threads/SessionHistory";
+import SubagentPlanPanel from "./features/tasks/SubagentPlanPanel";
+import TodoPanel, { type TodoItem } from "./features/tasks/TodoPanel";
+import type { SubagentTraceStream } from "./features/traces/SubagentTrace";
+import TaskTrace, { type AsyncTask, type AsyncTaskStatus } from "./features/traces/TaskTrace";
+import ToolCallCard, { type ToolCard } from "./features/traces/ToolCallCard";
 
 type RawToolCall = { id?: string; name?: string; args?: unknown };
 type Message = {

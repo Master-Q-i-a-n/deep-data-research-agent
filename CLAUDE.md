@@ -54,10 +54,10 @@ Frontend checks: `npm test -- --run` and `npm run build` (build runs `tsc --noEm
 
 `langgraph.json` registers exactly two graphs (no Skill graph, no synchronous `task` subagents):
 
-- **`supervisor`** (`src/deep_data_research_agent/agent.py:graph`) — the user entry point. A
+- **`supervisor`** (`src/deep_data_research_agent/agents/supervisor.py:graph`) — the user entry point. A
   `create_deep_agent` whose middleware chain ordering matters (see below). Registers the single
   `assign_skill` tool and an `AsyncSubAgent` pointing at `crawl-worker` (same-deployment ASGI transport, no URL).
-- **`crawl-worker`** (`src/deep_data_research_agent/crawl_worker.py:graph`) — a `StateGraph` wrapper around
+- **`crawl-worker`** (`src/deep_data_research_agent/agents/crawl_worker.py:graph`) — a `StateGraph` wrapper around
   the crawl agent: `ensure_sandbox → crawl_agent → export_workspace`. Only this graph may call Tavily tools.
 
 `create_chat_model` (config.py) builds an OpenAI-compatible model (default `qwen-plus`, temperature 0) from
@@ -141,6 +141,6 @@ without an authenticated identity.
 - Unit tests monkeypatch `sandbox_manager.SANDBOX_MANAGER` (e.g. `test_backends.py`, `test_tavily_tools.py`)
   and use `blockbuster` to block real network; graph-shape tests inspect
   `graph.nodes["tools"].bound.tools_by_name`.
-- `docs/design.md` documents the (partially future) architecture — some sections describe `analysis-worker`,
+- `docs/architecture/design.md` documents the (partially future) architecture — some sections describe `analysis-worker`,
   `site-profiler`, and interrupt flows that are **not yet implemented**; the README "当前能力" list is the
   source of truth for what exists.

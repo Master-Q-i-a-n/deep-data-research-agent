@@ -10,8 +10,8 @@ services:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
-      - ./deploy/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-      - ./deploy/redis/entrypoint.sh:/usr/local/bin/ddra-redis-entrypoint.sh:ro
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./infra/redis/entrypoint.sh:/usr/local/bin/ddra-redis-entrypoint.sh:ro
     secrets:
       - redis_password
     tmpfs:
@@ -19,7 +19,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - 'REDISCLI_AUTH="$$(cat /run/secrets/redis_password)" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG'
+        - 'password="$$(cat /run/secrets/redis_password)"; REDISCLI_AUTH="$$password" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG && REDISCLI_AUTH="$$password" redis-cli --user ddra-celery --no-auth-warning -n 1 ping | grep -qx PONG'
       interval: 5s
       timeout: 3s
       retries: 12

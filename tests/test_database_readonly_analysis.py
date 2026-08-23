@@ -10,9 +10,12 @@ from types import SimpleNamespace
 import pytest
 from langgraph.runtime import ExecutionInfo, Runtime
 
-from deep_data_research_agent import database_tools
-from deep_data_research_agent.mongodb_store import _public_seed_values
-from deep_data_research_agent.prompts import DATA_ANALYST_PROMPT, SUPERVISOR_PROMPT
+from deep_data_research_agent.agents.prompts import (
+    DATA_ANALYST_PROMPT,
+    SUPERVISOR_PROMPT,
+)
+from deep_data_research_agent.infrastructure.mongodb.store import _public_seed_values
+from deep_data_research_agent.tools import database as database_tools
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = (

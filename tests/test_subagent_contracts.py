@@ -12,21 +12,10 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from pydantic import ValidationError
 
-from deep_data_research_agent.async_subagents import (
+from deep_data_research_agent.agents.async_subagents import (
     MetadataPropagatingAsyncSubAgentMiddleware,
 )
-from deep_data_research_agent.config import (
-    create_data_analyst_model,
-    create_reviewer_model,
-    get_settings,
-)
-from deep_data_research_agent.crawl_worker import CrawlTaskResult
-from deep_data_research_agent.prompts import (
-    ANALYSIS_REVIEWER_PROMPT,
-    DATA_ANALYST_PROMPT,
-    SUPERVISOR_PROMPT,
-)
-from deep_data_research_agent.subagent_contracts import (
+from deep_data_research_agent.agents.contracts import (
     AnalysisReviewerResult,
     DataAnalystResult,
     ReviewerResultValidationMiddleware,
@@ -37,6 +26,17 @@ from deep_data_research_agent.subagent_contracts import (
     reviewer_result_contract_prompt,
     reviewer_roles,
     reviewer_tool_budget,
+)
+from deep_data_research_agent.agents.crawl_worker import CrawlTaskResult
+from deep_data_research_agent.agents.prompts import (
+    ANALYSIS_REVIEWER_PROMPT,
+    DATA_ANALYST_PROMPT,
+    SUPERVISOR_PROMPT,
+)
+from deep_data_research_agent.core.config import (
+    create_data_analyst_model,
+    create_reviewer_model,
+    get_settings,
 )
 
 
@@ -815,7 +815,7 @@ async def test_async_launch_propagates_evaluation_metadata(monkeypatch) -> None:
 
     client = SimpleNamespace(threads=Threads(), runs=Runs())
     monkeypatch.setattr(
-        "deep_data_research_agent.async_subagents._ClientCache.get_async",
+        "deep_data_research_agent.agents.async_subagents._ClientCache.get_async",
         lambda _self, _name: client,
     )
     middleware = MetadataPropagatingAsyncSubAgentMiddleware(

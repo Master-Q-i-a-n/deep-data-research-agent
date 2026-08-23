@@ -7,7 +7,9 @@ import pytest
 from fastapi import HTTPException, UploadFile
 from openpyxl import Workbook
 
-from deep_data_research_agent import database, sandbox_manager, webapp
+from deep_data_research_agent.api import app as webapp
+from deep_data_research_agent.database import repository as database
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
 
 
 class _ThreadClient:

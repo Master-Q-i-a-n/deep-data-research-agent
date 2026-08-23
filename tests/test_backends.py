@@ -5,7 +5,8 @@ from blockbuster import blockbuster_ctx
 from deepagents.backends import StoreBackend
 from deepagents_opensandbox import OpensandboxBackend
 
-from deep_data_research_agent import backends, sandbox_manager
+from deep_data_research_agent.agents import backends
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
 
 
 def _runtime(thread_id: str) -> SimpleNamespace:
