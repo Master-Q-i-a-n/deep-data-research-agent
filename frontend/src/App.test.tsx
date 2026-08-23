@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
@@ -1042,10 +1042,11 @@ describe("研究工作台", () => {
     fireEvent.change(input, { target: { value: "抓取官网并生成报告" } });
     fireEvent.click(screen.getByRole("button", { name: "发送分析任务" }));
 
-    expect(submit).toHaveBeenCalledWith({
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
       messages: [{ type: "human", content: "抓取官网并生成报告" }],
     }, {
       metadata: {
+        deep_data_ui: { submission_id: expect.any(String) },
         kind: "conversation",
         title: "抓取官网并生成报告",
       },
@@ -1053,7 +1054,7 @@ describe("研究工作台", () => {
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
-    });
+    }));
 
     const optimisticValues = submit.mock.calls[0]?.[1]?.optimisticValues as
       | ((current: { messages: Array<{ type: string; content: string }> }) => {
@@ -1066,6 +1067,89 @@ describe("研究工作台", () => {
       type: "human",
       content: "抓取官网并生成报告",
     })]);
+  });
+
+  it.each([
+    [429, "QUESTION_RATE_LIMITED", "每分钟最多发起 20 次任务，请稍后再试", "本分钟提问次数已达上限"],
+    [429, "TOKEN_BUDGET_EXHAUSTED", "Token 额度不足，请等待整点补充", "Token 额度不足"],
+    [503, "RATE_LIMIT_SERVICE_UNAVAILABLE", "请求保护服务暂不可用，请稍后重试", "暂时无法发起任务"],
+  ])("准入返回 %s 时弹窗且保留未发送输入", async (status, code, message, title) => {
+    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/run-admissions")) {
+        return {
+          ok: false,
+          status,
+          json: async () => ({
+            detail: {
+              code,
+              message,
+              limit: status === 429 ? 20 : undefined,
+              retry_after_seconds: status === 429 ? 17 : 0,
+              active_thread_ids: [],
+            },
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    })));
+    streamState.messages = [];
+    render(<App />);
+    await screen.findByText("默认账户");
+
+    const input = screen.getByLabelText("描述你的网页或文件分析任务");
+    fireEvent.change(input, { target: { value: "这条消息不能丢" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送分析任务" }));
+
+    expect(await screen.findByRole("dialog", { name: title })).toBeTruthy();
+    expect((input as HTMLTextAreaElement).value).toBe("这条消息不能丢");
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("3 个运行会话超限时列出并可跳转到自己的活跃会话", async () => {
+    const activeThreadId = "11111111-1111-4111-8111-111111111111";
+    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/run-admissions")) {
+        return {
+          ok: false,
+          status: 409,
+          json: async () => ({
+            detail: {
+              code: "THREAD_CONCURRENCY_LIMIT",
+              message: "最多同时运行 3 个会话，请等待或停止其中一个",
+              limit: 3,
+              retry_after_seconds: 0,
+              active_thread_ids: [activeThreadId],
+            },
+          }),
+        };
+      }
+      if (url.endsWith("/threads/search")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [{
+            thread_id: activeThreadId,
+            status: "busy",
+            metadata: { title: "正在分析订单" },
+          }],
+        };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    })));
+    streamState.messages = [];
+    render(<App />);
+    await screen.findByText("默认账户");
+
+    fireEvent.change(screen.getByLabelText("描述你的网页或文件分析任务"), {
+      target: { value: "第四个会话" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送分析任务" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "运行中的会话已达上限" });
+    fireEvent.click(within(dialog).getByRole("button", { name: new RegExp("正在分析订单") }));
+    expect(new URLSearchParams(window.location.search).get("thread")).toBe(activeThreadId);
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it("运行中的内部子图空状态不会清空主对话", () => {
@@ -1180,17 +1264,18 @@ describe("研究工作台", () => {
     fireEvent.change(input, { target: { value: "分析月度趋势" } });
     fireEvent.click(screen.getByRole("button", { name: "发送分析任务" }));
 
-    expect(submit).toHaveBeenCalledWith({
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
       messages: [{
         type: "human",
         content: "分析月度趋势\n\n已上传文件：\n- /workspace/input/orders.csv",
       }],
     }, {
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       optimisticValues: expect.any(Function),
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
-    });
+    }));
   });
 
   it("刷新会话时恢复附件并可从服务端删除", async () => {
@@ -1283,6 +1368,7 @@ describe("研究工作台", () => {
         content: "后台任务 task-123456789 已完成。请调用 check_async_task 读取结果并继续处理，不要重新启动任务。",
       }],
     }, {
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
@@ -1367,15 +1453,16 @@ describe("研究工作台", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "立即纠正" }));
 
-    expect(submit).toHaveBeenCalledWith({
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
       messages: [{ type: "human", content: "停止国外数据，只分析国内数据" }],
     }, {
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       multitaskStrategy: "interrupt",
       optimisticValues: expect.any(Function),
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
-    });
+    }));
   });
 
   it("任务卡通过 Supervisor 检查完整 task id", async () => {
@@ -1385,17 +1472,18 @@ describe("研究工作台", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "检查进度" }));
 
-    expect(submit).toHaveBeenCalledWith({
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
       messages: [{
         type: "human",
         content: "请调用 check_async_task 检查任务 task-123456789。如果远程运行已经结束，请读取结果第一行的业务 status 并继续处理。",
       }],
     }, {
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       optimisticValues: expect.any(Function),
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
-    });
+    }));
   });
 
   it("任务卡可以立即补充 crawl-worker 要求", async () => {
@@ -1410,18 +1498,19 @@ describe("研究工作台", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "立即更新" }));
 
-    expect(submit).toHaveBeenCalledWith({
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
       messages: [{
         type: "human",
         content: "请调用 update_async_task 更新任务 task-123456789。补充要求：只保留国内产品并增加价格字段",
       }],
     }, {
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       multitaskStrategy: "interrupt",
       optimisticValues: expect.any(Function),
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
-    });
+    }));
   });
 
   it("任务卡可以取消 crawl-worker", async () => {
@@ -1433,18 +1522,19 @@ describe("研究工作台", () => {
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
 
     expect(window.confirm).toHaveBeenCalled();
-    expect(submit).toHaveBeenCalledWith({
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({
       messages: [{
         type: "human",
         content: "请调用 cancel_async_task 取消任务 task-123456789。",
       }],
     }, {
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       multitaskStrategy: "interrupt",
       optimisticValues: expect.any(Function),
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
-    });
+    }));
   });
 
   it("展示并管理 Supervisor 服务端等待队列", async () => {
@@ -1543,6 +1633,7 @@ describe("研究工作台", () => {
           decisions: [{ type: "respond", message: "采购 500 件，交付到上海" }],
         },
       },
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
@@ -1588,6 +1679,7 @@ describe("研究工作台", () => {
 
     await waitFor(() => expect(submit).toHaveBeenCalledWith(null, {
       command: { resume: { decisions: [{ type: "approve" }] } },
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
@@ -1649,6 +1741,7 @@ describe("研究工作台", () => {
 
     await waitFor(() => expect(submit).toHaveBeenCalledWith(null, {
       command: { resume: { decisions: [{ type: "approve" }] } },
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",
@@ -1680,6 +1773,7 @@ describe("研究工作台", () => {
           decisions: [{ type: "reject", message: "用户拒绝执行该操作。" }],
         },
       },
+      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
       streamSubgraphs: true,
       streamResumable: true,
       onDisconnect: "continue",

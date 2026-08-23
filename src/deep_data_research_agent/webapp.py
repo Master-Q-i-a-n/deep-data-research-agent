@@ -13,9 +13,12 @@ import unicodedata
 import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated
+from uuid import UUID, uuid4
 from xml.etree.ElementTree import ParseError
+from zoneinfo import ZoneInfo
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
@@ -27,7 +30,7 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from pydantic import BaseModel, Field
 
-from deep_data_research_agent import database, sandbox_manager
+from deep_data_research_agent import database, redis_limits, sandbox_manager
 from deep_data_research_agent.artifacts import (
     ArtifactError,
     build_markdown_bundle,
@@ -70,6 +73,11 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=1, max_length=128)
+
+
+class RunAdmissionRequest(BaseModel):
+    submission_id: UUID
+    thread_id: UUID | None = None
 
 
 class MemorySettingsRequest(BaseModel):
@@ -146,26 +154,38 @@ async def _enforce_rate_limit(
     limit: int,
     window_seconds: int,
     detail: str,
+    error_code: str,
+    request_id: str,
 ) -> None:
-    """Translate durable limiter decisions into safe HTTP responses."""
+    """Translate Redis sliding-window decisions into safe HTTP responses."""
 
     try:
-        decision = await database.consume_rate_limit(
+        decision = await redis_limits.consume_sliding_window(
             scope,
             raw_key,
             limit=limit,
             window_seconds=window_seconds,
+            request_id=request_id,
         )
     except Exception as exc:
         logger.exception("%s 限流存储不可用", scope)
         raise HTTPException(
             status_code=503,
-            detail="请求保护服务暂不可用，请稍后重试",
+            detail={
+                "code": "RATE_LIMIT_SERVICE_UNAVAILABLE",
+                "message": "请求保护服务暂不可用，请稍后重试",
+            },
         ) from exc
     if not decision.allowed:
         raise HTTPException(
             status_code=429,
-            detail=detail,
+            detail={
+                "code": error_code,
+                "message": detail,
+                "limit": limit,
+                "retry_after_seconds": decision.retry_after_seconds,
+                "active_thread_ids": [],
+            },
             headers={"Retry-After": str(decision.retry_after_seconds)},
         )
 
@@ -382,18 +402,23 @@ async def _issue_token(user: database.UserRecord) -> dict[str, object]:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    await database.ensure_schema()
-    memory_worker = await start_memory_worker()
-    # Loopback Agent Protocol calls query checkpoints and child runs without
-    # creating a Supervisor model run.
-    agent_client = get_client(url=None, api_key=None)
-    _app.state.agent_client = agent_client
+    memory_worker = None
+    agent_client = None
     try:
+        await database.ensure_schema()
+        await redis_limits.initialize_redis()
+        memory_worker = await start_memory_worker()
+        # Loopback Agent Protocol calls query checkpoints and child runs without
+        # creating a Supervisor model run.
+        agent_client = get_client(url=None, api_key=None)
+        _app.state.agent_client = agent_client
         yield
     finally:
-        await agent_client.aclose()
+        if agent_client is not None:
+            await agent_client.aclose()
         if memory_worker is not None:
             await memory_worker.stop()
+        await redis_limits.close_redis()
         await database.close_database()
 
 
@@ -409,6 +434,8 @@ async def register(payload: RegisterRequest, request: Request) -> dict[str, obje
         limit=settings.auth_register_limit,
         window_seconds=settings.auth_register_window_seconds,
         detail="注册请求过于频繁，请稍后再试",
+        error_code="REGISTER_RATE_LIMITED",
+        request_id=str(uuid4()),
     )
     username = payload.username.strip()
     if not _USERNAME_PATTERN.fullmatch(username):
@@ -431,16 +458,27 @@ async def register(payload: RegisterRequest, request: Request) -> dict[str, obje
 async def login(payload: LoginRequest, request: Request) -> dict[str, object]:
     settings = get_settings()
     username = payload.username.strip()
-    login_key = f"{_client_ip(request)}\0{username.casefold()}"
     await _enforce_rate_limit(
-        scope="auth_login",
-        raw_key=login_key,
-        limit=settings.auth_login_failure_limit,
+        scope="login_ip",
+        raw_key=_client_ip(request),
+        limit=settings.auth_login_limit,
         window_seconds=settings.auth_login_window_seconds,
         detail="登录尝试过于频繁，请稍后再试",
+        error_code="LOGIN_RATE_LIMITED",
+        request_id=str(uuid4()),
     )
 
     user = await database.get_user_by_username(username)
+    user_limit_key = user.id if user is not None else f"username:{username.casefold()}"
+    await _enforce_rate_limit(
+        scope="login_user",
+        raw_key=user_limit_key,
+        limit=settings.auth_login_limit,
+        window_seconds=settings.auth_login_window_seconds,
+        detail="登录尝试过于频繁，请稍后再试",
+        error_code="LOGIN_RATE_LIMITED",
+        request_id=str(uuid4()),
+    )
     if user is None or user.is_system or not user.password_hash:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     try:
@@ -451,14 +489,6 @@ async def login(payload: LoginRequest, request: Request) -> dict[str, object]:
         )
     except (VerificationError, InvalidHashError) as exc:
         raise HTTPException(status_code=401, detail="用户名或密码错误") from exc
-    try:
-        await database.clear_rate_limit("auth_login", login_key)
-    except Exception as exc:
-        logger.exception("清除登录限流记录失败")
-        raise HTTPException(
-            status_code=503,
-            detail="请求保护服务暂不可用，请稍后重试",
-        ) from exc
     return await _issue_token(user)
 
 
@@ -493,6 +523,150 @@ async def current_user(
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
     return {"user": _user_payload(user)}
+
+
+async def _busy_supervisor_thread_ids(
+    request: Request,
+    authorization: str | None,
+) -> list[str]:
+    """Return every busy Supervisor thread visible to the current user."""
+
+    client = request.app.state.agent_client
+    headers = {"Authorization": authorization} if authorization else None
+    thread_ids: list[str] = []
+    offset = 0
+    while True:
+        batch = await client.threads.search(
+            metadata={"graph_id": "supervisor"},
+            status="busy",
+            limit=100,
+            offset=offset,
+            select=["thread_id", "status"],
+            headers=headers,
+        )
+        thread_ids.extend(str(thread["thread_id"]) for thread in batch)
+        if len(batch) < 100:
+            return list(dict.fromkeys(thread_ids))
+        offset += 100
+
+
+@app.post("/run-admissions", status_code=201)
+async def create_run_admission(
+    payload: RunAdmissionRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Reserve question quota and one active-thread slot before run creation."""
+
+    user_id = await _authenticated_user_id(authorization)
+    thread_id = str(payload.thread_id) if payload.thread_id else None
+    if thread_id and await database.get_thread_owner(thread_id) != user_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    settings = get_settings()
+    try:
+        async with redis_limits.admission_lock(user_id):
+            token_bucket = await database.get_token_bucket(user_id)
+            await redis_limits.sync_token_bucket(
+                user_id,
+                balance_tokens=token_bucket.balance_tokens,
+                last_refill_hour=token_bucket.last_refill_hour,
+                version=token_bucket.version,
+            )
+            async with asyncio.timeout(settings.redis_socket_timeout_seconds):
+                active_thread_ids = await _busy_supervisor_thread_ids(
+                    request,
+                    authorization,
+                )
+            decision = await redis_limits.admit_run(
+                user_id,
+                str(payload.submission_id),
+                thread_id,
+                active_thread_ids,
+            )
+    except Exception as exc:
+        logger.exception("run 准入服务不可用")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "RATE_LIMIT_SERVICE_UNAVAILABLE",
+                "message": "请求保护服务暂不可用，请稍后重试",
+                "limit": settings.thread_concurrency_limit,
+                "retry_after_seconds": 0,
+                "active_thread_ids": [],
+            },
+        ) from exc
+
+    if decision.allowed:
+        return {
+            "permit_id": str(payload.submission_id),
+            "submission_id": str(payload.submission_id),
+            "permit_expires_in_seconds": decision.permit_expires_in_seconds,
+            "token_balance": decision.token_balance,
+        }
+    if decision.code == "QUESTION_RATE_LIMITED":
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": decision.code,
+                "message": "每分钟最多发起 20 次任务，请稍后再试",
+                "limit": settings.question_limit,
+                "retry_after_seconds": decision.retry_after_seconds,
+                "active_thread_ids": [],
+            },
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
+    if decision.code == "THREAD_CONCURRENCY_LIMIT":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": decision.code,
+                "message": "最多同时运行 3 个会话，请等待或停止其中一个",
+                "limit": settings.thread_concurrency_limit,
+                "retry_after_seconds": 0,
+                "active_thread_ids": list(decision.active_thread_ids),
+            },
+        )
+    if decision.code == "TOKEN_BUDGET_EXHAUSTED":
+        next_refill = datetime.fromtimestamp(
+            int(decision.next_refill_epoch_seconds or 0),
+            tz=ZoneInfo("Asia/Shanghai"),
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": decision.code,
+                "message": "Token 额度不足，请等待整点补充",
+                "balance_tokens": decision.token_balance,
+                "capacity_tokens": settings.token_bucket_capacity,
+                "refill_tokens_per_hour": settings.token_bucket_refill_per_hour,
+                "next_refill_at": next_refill.isoformat(),
+                "retry_after_seconds": decision.retry_after_seconds,
+                "active_thread_ids": [],
+            },
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
+    if decision.code == "TOKEN_BUCKET_UNAVAILABLE":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "RATE_LIMIT_SERVICE_UNAVAILABLE",
+                "message": "请求保护服务暂不可用，请稍后重试",
+                "limit": settings.token_bucket_capacity,
+                "retry_after_seconds": 0,
+                "active_thread_ids": [],
+            },
+        )
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": decision.code,
+            "message": "本次任务准入凭证已使用或与会话不匹配",
+            "limit": settings.question_limit,
+            "retry_after_seconds": 0,
+            "active_thread_ids": [],
+        },
+    )
 
 
 @app.delete("/memories/user")

@@ -45,8 +45,9 @@ from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from deep_data_research_agent.config import create_memory_model, get_settings
-from deep_data_research_agent.identity import user_hash
+from deep_data_research_agent.identity import user_hash, user_identity
 from deep_data_research_agent.sandbox_manager import thread_id_from_runtime
+from deep_data_research_agent.token_usage import metered_model_ainvoke
 
 logger = logging.getLogger(__name__)
 
@@ -876,24 +877,42 @@ def _stored_failure_from_document(document: dict[str, Any]) -> StoredFailure | N
 async def _invoke_structured_memory_model(
     schema: type[BaseModel],
     prompt: str,
+    *,
+    user_id: str = "",
+    root_run_id: str | None = None,
+    thread_id: str | None = None,
 ) -> BaseModel:
     """Retry once only when the provider returns invalid structured data."""
 
     model = create_memory_model().with_structured_output(
         schema,
         method="json_mode",
+        include_raw=True,
     )
     repair_note = ""
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            result = await model.ainvoke(
-                prompt + repair_note,
-                config={"callbacks": [], "tags": ["memory-internal"]},
-            )
-            if not isinstance(result, schema):
+            if user_id:
+                result = await metered_model_ainvoke(
+                    model,
+                    prompt + repair_note,
+                    user_id=user_id,
+                    agent_name="memory-user",
+                    root_run_id=root_run_id,
+                    thread_id=thread_id,
+                    config={"callbacks": [], "tags": ["memory-internal"]},
+                )
+            else:
+                # Jobs queued before token accounting did not retain billing identity.
+                result = await model.ainvoke(
+                    prompt + repair_note,
+                    config={"callbacks": [], "tags": ["memory-internal"]},
+                )
+            parsed = result.get("parsed") if isinstance(result, dict) else None
+            if not isinstance(parsed, schema):
                 raise TypeError("记忆模型未返回指定结构")
-            return result
+            return parsed
         except (OutputParserException, ValidationError, TypeError) as exc:
             last_error = exc
             if attempt == 0:
@@ -917,6 +936,9 @@ async def _extract_user_memory_patch(
     current: UserMemory,
     user_message: str,
     previous_assistant: str,
+    user_id: str = "",
+    root_run_id: str | None = None,
+    thread_id: str | None = None,
 ) -> UserMemoryPatch:
     prompt = f"""你是用户长期记忆整理器，只输出符合 Schema 的 JSON。
 
@@ -980,7 +1002,13 @@ reinforce_behaviors 等最终 UserMemory 字段。
 4. avoid/reinforce 使用简短自然语言；用户撤销旧反馈时放入对应 remove 数组。
 5. 新反馈优先于旧记忆；冲突时通过 remove 和 add 清楚表达，不自行补充隐含偏好。
 6. 无稳定信息时 action=discard，其余数组为空。"""
-    result = await _invoke_structured_memory_model(UserMemoryPatch, prompt)
+    result = await _invoke_structured_memory_model(
+        UserMemoryPatch,
+        prompt,
+        user_id=user_id,
+        root_run_id=root_run_id,
+        thread_id=thread_id,
+    )
     return UserMemoryPatch.model_validate(result)
 
 
@@ -996,6 +1024,9 @@ async def _extract_failure_decision(
     content: str,
     evidence: list[dict[str, str]],
     existing: list[StoredFailure],
+    user_id: str = "",
+    root_run_id: str | None = None,
+    thread_id: str | None = None,
 ) -> FailureDecision:
     compact_index = [
         {
@@ -1023,7 +1054,13 @@ Agent 提交的候选教训：{content}
 4. 与已有条目语义相同或高度重叠时 merge，并使用真实存在的 merge_target_id。
 5. add 或 merge 必须返回完整 lesson；merge 后内容应吸收新证据但保持适用边界。
 6. tags 使用一到六个简短主题词。证据不足时 action=discard。"""
-    result = await _invoke_structured_memory_model(FailureDecision, prompt)
+    result = await _invoke_structured_memory_model(
+        FailureDecision,
+        prompt,
+        user_id=user_id,
+        root_run_id=root_run_id,
+        thread_id=thread_id,
+    )
     return FailureDecision.model_validate(result)
 
 
@@ -1052,6 +1089,9 @@ async def _extract_failure_review_decisions(
     agent_name: AgentName,
     bundle: FailureReviewBundle,
     existing: list[StoredFailure],
+    user_id: str = "",
+    root_run_id: str | None = None,
+    thread_id: str | None = None,
 ) -> tuple[FailureReviewDecisions, dict[str, Any]]:
     compact_index = [
         {
@@ -1093,16 +1133,28 @@ async def _extract_failure_review_decisions(
     started = time.perf_counter()
     last_error: Exception | None = None
     for attempt in range(2):
-        response = await model.ainvoke(
-            messages,
-            config={
+        invoke_kwargs = {
+            "config": {
                 "callbacks": [],
                 "tags": ["memory-internal", "failure-review", agent_name],
             },
             # DeepSeek's OpenAI-compatible API names this parameter
             # ``max_tokens``; extra_body preserves that provider spelling.
-            extra_body={"max_tokens": settings.failure_review_max_output_tokens},
-        )
+            "extra_body": {"max_tokens": settings.failure_review_max_output_tokens},
+        }
+        if user_id:
+            response = await metered_model_ainvoke(
+                model,
+                messages,
+                user_id=user_id,
+                agent_name="memory-failure-review",
+                root_run_id=root_run_id,
+                thread_id=thread_id,
+                model_settings={"max_tokens": settings.failure_review_max_output_tokens},
+                **invoke_kwargs,
+            )
+        else:
+            response = await model.ainvoke(messages, **invoke_kwargs)
         if not isinstance(response, AIMessage):
             raise TypeError("失败回顾模型未返回 AIMessage")
         try:
@@ -1202,6 +1254,15 @@ class FailureReviewMiddleware(AgentMiddleware):
                         payload=payload,
                         source_user_hash=identity_hash,
                         settings_generation=memory_settings.generation,
+                        billing_user_id=user_identity(runtime),
+                        billing_root_run_id=str(
+                            ((runtime.config or {}).get("metadata", {}) or {}).get(
+                                "token_budget_session_id"
+                            )
+                            or ((runtime.config or {}).get("metadata", {}) or {}).get("run_id")
+                            or ""
+                        ),
+                        billing_thread_id=thread_id,
                     )
         except Exception:
             # Background learning must never turn a successful business run
@@ -1351,6 +1412,15 @@ async def capture_user_memory(runtime: ToolRuntime) -> ToolMessage:
                     "user_message": user_message,
                     "previous_assistant": previous_assistant,
                 },
+                billing_user_id=user_identity(runtime),
+                billing_root_run_id=str(
+                    ((runtime.config or {}).get("metadata", {}) or {}).get(
+                        "token_budget_session_id"
+                    )
+                    or ((runtime.config or {}).get("metadata", {}) or {}).get("run_id")
+                    or ""
+                ),
+                billing_thread_id=thread_id,
             )
     except Exception as exc:
         logger.exception("用户记忆入队失败")
@@ -1542,6 +1612,9 @@ class MemoryQueue:
         payload: dict[str, Any],
         source_user_hash: str | None = None,
         settings_generation: int | None = None,
+        billing_user_id: str | None = None,
+        billing_root_run_id: str | None = None,
+        billing_thread_id: str | None = None,
     ) -> bool:
         jobs, _leases, memories = await self._collections()
         now = datetime.now(UTC)
@@ -1567,6 +1640,10 @@ class MemoryQueue:
             "created_at": now,
             "updated_at": now,
         }
+        if billing_user_id:
+            inserted["billing_user_id"] = billing_user_id
+            inserted["billing_root_run_id"] = billing_root_run_id or None
+            inserted["billing_thread_id"] = billing_thread_id or None
         if kind == "failure_review":
             if source_user_hash is None or settings_generation is None:
                 raise ValueError("失败回顾缺少用户设置版本")
@@ -1845,6 +1922,9 @@ class MemoryQueue:
             current=current,
             user_message=str(payload.get("user_message") or ""),
             previous_assistant=str(payload.get("previous_assistant") or ""),
+            user_id=str(job.get("billing_user_id") or ""),
+            root_run_id=str(job.get("billing_root_run_id") or "") or None,
+            thread_id=str(job.get("billing_thread_id") or "") or None,
         )
         updated = _apply_user_patch(current, patch)
         if updated == current:
@@ -1976,6 +2056,9 @@ class MemoryQueue:
             agent_name=agent_name,
             bundle=bundle,
             existing=records,
+            user_id=str(job.get("billing_user_id") or ""),
+            root_run_id=str(job.get("billing_root_run_id") or "") or None,
+            thread_id=str(job.get("billing_thread_id") or "") or None,
         )
         # The user may disable contribution while the review model is running.
         if not await self._failure_review_is_allowed(job):
@@ -2050,6 +2133,9 @@ class MemoryQueue:
                 content=content,
                 evidence=evidence,
                 existing=records,
+                user_id=str(job.get("billing_user_id") or ""),
+                root_run_id=str(job.get("billing_root_run_id") or "") or None,
+                thread_id=str(job.get("billing_thread_id") or "") or None,
             )
             if decision.action == "discard":
                 return

@@ -4,17 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import logging
-import math
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, delete, select
-from sqlalchemy.dialects.postgresql import insert as postgresql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, delete, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -30,8 +26,6 @@ from deep_data_research_agent.config import get_settings
 DEFAULT_USER_ID = "local-user"
 DEFAULT_USERNAME = "default"
 logger = logging.getLogger(__name__)
-_DEVELOPMENT_RATE_LIMIT_SECRET = secrets.token_bytes(32)
-_development_secret_warning_emitted = False
 
 
 def _utcnow() -> datetime:
@@ -88,18 +82,6 @@ class AgentThread(Base):
     )
 
 
-class RateLimitBucket(Base):
-    """One fixed-window counter keyed by a non-reversible request identity."""
-
-    __tablename__ = "rate_limit_buckets"
-
-    scope: Mapped[str] = mapped_column(String(32), primary_key=True)
-    key_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    window_start: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
-    count: Mapped[int] = mapped_column(Integer, nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
-
-
 class EmailDelivery(Base):
     """Durable idempotency and audit state for an external SMTP side effect."""
 
@@ -123,6 +105,43 @@ class EmailDelivery(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow, nullable=False
     )
+
+
+class UserTokenBucket(Base):
+    """Authoritative per-user token balance; Redis only caches this state."""
+
+    __tablename__ = "user_token_buckets"
+
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    balance_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_refill_hour: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    version: Mapped[int] = mapped_column(BigInteger, default=1, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
+class ModelTokenUsage(Base):
+    """Replay-safe model-call reservation and final provider usage."""
+
+    __tablename__ = "model_token_usage"
+
+    call_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    root_run_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    thread_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    usage_source: Mapped[str] = mapped_column(String(16), default="reserved", nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,13 +171,19 @@ class EmailDeliveryRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class RateLimitDecision:
-    """Result of atomically consuming one fixed-window allowance."""
+class TokenBucketRecord:
+    user_id: str
+    balance_tokens: int
+    last_refill_hour: int
+    version: int
 
-    allowed: bool
-    count: int
-    limit: int
-    retry_after_seconds: int
+
+@dataclass(frozen=True, slots=True)
+class TokenUsageReservation:
+    call_id: str
+    bucket: TokenBucketRecord
+    reserved_tokens: int
+    created: bool
 
 
 class UsernameExistsError(ValueError):
@@ -177,41 +202,6 @@ _initialized = False
 
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def _rate_limit_secret() -> bytes:
-    """Return a stable production secret or an ephemeral development secret."""
-
-    global _development_secret_warning_emitted
-    configured = get_settings().rate_limit_key_secret.get_secret_value()
-    if configured:
-        return configured.encode("utf-8")
-    if not _development_secret_warning_emitted:
-        logger.warning(
-            "RATE_LIMIT_KEY_SECRET 未配置；开发环境限流键将在进程重启后变化"
-        )
-        _development_secret_warning_emitted = True
-    return _DEVELOPMENT_RATE_LIMIT_SECRET
-
-
-def _rate_limit_key_hash(scope: str, raw_key: str) -> str:
-    """Hash low-entropy IP and username keys before persistence."""
-
-    payload = f"{scope}\0{raw_key}".encode()
-    return hmac.new(_rate_limit_secret(), payload, hashlib.sha256).hexdigest()
-
-
-def _rate_limit_window(
-    now: datetime,
-    window_seconds: int,
-) -> tuple[datetime, datetime]:
-    """Return deterministic UTC fixed-window boundaries."""
-
-    aware = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
-    epoch = int(aware.timestamp())
-    start_epoch = epoch - (epoch % window_seconds)
-    start = datetime.fromtimestamp(start_epoch, UTC).replace(tzinfo=None)
-    return start, start + timedelta(seconds=window_seconds)
 
 
 def get_engine() -> AsyncEngine:
@@ -294,7 +284,23 @@ async def ensure_schema() -> None:
                         is_system=True,
                     )
                 )
-                await session.commit()
+            user_ids = list((await session.execute(select(User.id))).scalars())
+            existing_bucket_ids = set(
+                (await session.execute(select(UserTokenBucket.user_id))).scalars()
+            )
+            settings = get_settings()
+            current_hour = _current_refill_hour()
+            for user_id in user_ids:
+                if user_id not in existing_bucket_ids:
+                    session.add(
+                        UserTokenBucket(
+                            user_id=user_id,
+                            balance_tokens=settings.token_bucket_capacity,
+                            last_refill_hour=current_hour,
+                            version=1,
+                        )
+                    )
+            await session.commit()
         _initialized = True
 
 
@@ -333,6 +339,164 @@ def _email_delivery_record(delivery: EmailDelivery) -> EmailDeliveryRecord:
     )
 
 
+def _current_refill_hour(now: datetime | None = None) -> int:
+    current = now or _utcnow()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return int(current.timestamp() // 3600)
+
+
+def _refill_token_bucket(bucket: UserTokenBucket, current_hour: int) -> bool:
+    """Apply whole-hour refills, including repayment of a negative balance."""
+
+    elapsed_hours = max(0, current_hour - bucket.last_refill_hour)
+    if elapsed_hours == 0:
+        return False
+    settings = get_settings()
+    bucket.balance_tokens = min(
+        settings.token_bucket_capacity,
+        bucket.balance_tokens + elapsed_hours * settings.token_bucket_refill_per_hour,
+    )
+    bucket.last_refill_hour = current_hour
+    bucket.version += 1
+    bucket.updated_at = _utcnow()
+    return True
+
+
+def _token_bucket_record(bucket: UserTokenBucket) -> TokenBucketRecord:
+    return TokenBucketRecord(
+        user_id=bucket.user_id,
+        balance_tokens=int(bucket.balance_tokens),
+        last_refill_hour=int(bucket.last_refill_hour),
+        version=int(bucket.version),
+    )
+
+
+async def _locked_token_bucket(session: AsyncSession, user_id: str) -> UserTokenBucket:
+    result = await session.execute(
+        select(UserTokenBucket)
+        .where(UserTokenBucket.user_id == str(user_id))
+        .with_for_update()
+    )
+    bucket = result.scalar_one_or_none()
+    if bucket is None:
+        # The foreign key also prevents creating buckets for fabricated identities.
+        if await session.get(User, str(user_id)) is None:
+            raise ValueError("Token 桶用户不存在")
+        settings = get_settings()
+        bucket = UserTokenBucket(
+            user_id=str(user_id),
+            balance_tokens=settings.token_bucket_capacity,
+            last_refill_hour=_current_refill_hour(),
+            version=1,
+        )
+        session.add(bucket)
+        await session.flush()
+    return bucket
+
+
+async def get_token_bucket(user_id: str) -> TokenBucketRecord:
+    """Return a refreshed authoritative snapshot for Redis admission checks."""
+
+    await ensure_schema()
+    async with session_factory()() as session:
+        async with session.begin():
+            bucket = await _locked_token_bucket(session, user_id)
+            _refill_token_bucket(bucket, _current_refill_hour())
+        return _token_bucket_record(bucket)
+
+
+async def reserve_model_tokens(
+    *,
+    call_id: str,
+    user_id: str,
+    root_run_id: str | None,
+    thread_id: str | None,
+    agent_name: str,
+    model_name: str,
+    reserved_tokens: int,
+) -> TokenUsageReservation:
+    """Persist one reservation and debit its user in the same transaction."""
+
+    if reserved_tokens < 1:
+        raise ValueError("模型 Token 预占量必须为正数")
+    await ensure_schema()
+    async with session_factory()() as session:
+        async with session.begin():
+            existing = await session.get(ModelTokenUsage, call_id)
+            bucket = await _locked_token_bucket(session, user_id)
+            _refill_token_bucket(bucket, _current_refill_hour())
+            if existing is not None:
+                if existing.user_id != str(user_id):
+                    raise ValueError("模型调用 ID 已属于其他用户")
+                return TokenUsageReservation(
+                    call_id=call_id,
+                    bucket=_token_bucket_record(bucket),
+                    reserved_tokens=int(existing.reserved_tokens),
+                    created=False,
+                )
+            usage = ModelTokenUsage(
+                call_id=call_id,
+                user_id=str(user_id),
+                root_run_id=root_run_id,
+                thread_id=thread_id,
+                agent_name=agent_name,
+                model_name=model_name,
+                reserved_tokens=reserved_tokens,
+            )
+            session.add(usage)
+            bucket.balance_tokens -= reserved_tokens
+            bucket.version += 1
+            bucket.updated_at = _utcnow()
+        return TokenUsageReservation(
+            call_id=call_id,
+            bucket=_token_bucket_record(bucket),
+            reserved_tokens=reserved_tokens,
+            created=True,
+        )
+
+
+async def settle_model_tokens(
+    *,
+    call_id: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    total_tokens: int,
+    usage_source: str,
+    status: str = "settled",
+) -> TokenBucketRecord:
+    """Finalize actual usage once and reconcile the earlier reservation."""
+
+    if total_tokens < 0 or usage_source not in {"provider", "estimated", "reserved"}:
+        raise ValueError("模型 Token 结算数据无效")
+    if status not in {"settled", "failed"}:
+        raise ValueError("模型 Token 结算状态无效")
+    await ensure_schema()
+    async with session_factory()() as session:
+        async with session.begin():
+            usage = await session.get(ModelTokenUsage, call_id, with_for_update=True)
+            if usage is None:
+                raise RuntimeError("模型 Token 预占记录不存在")
+            bucket = await _locked_token_bucket(session, usage.user_id)
+            _refill_token_bucket(bucket, _current_refill_hour())
+            if usage.status != "pending":
+                return _token_bucket_record(bucket)
+            settings = get_settings()
+            bucket.balance_tokens = min(
+                settings.token_bucket_capacity,
+                bucket.balance_tokens + int(usage.reserved_tokens) - total_tokens,
+            )
+            bucket.version += 1
+            bucket.updated_at = _utcnow()
+            usage.input_tokens = input_tokens
+            usage.output_tokens = output_tokens
+            usage.total_tokens = total_tokens
+            usage.usage_source = usage_source
+            usage.status = status
+            usage.settled_at = _utcnow()
+        return _token_bucket_record(bucket)
+
+
 async def create_user(username: str, password_hash: str) -> UserRecord:
     await ensure_schema()
     user = User(
@@ -344,6 +508,14 @@ async def create_user(username: str, password_hash: str) -> UserRecord:
     )
     async with session_factory()() as session:
         session.add(user)
+        session.add(
+            UserTokenBucket(
+                user_id=user.id,
+                balance_tokens=get_settings().token_bucket_capacity,
+                last_refill_hour=_current_refill_hour(),
+                version=1,
+            )
+        )
         try:
             await session.commit()
         except IntegrityError as exc:
@@ -410,6 +582,8 @@ async def delete_user(user_id: str) -> bool:
         await session.execute(delete(AuthSession).where(AuthSession.user_id == normalized))
         await session.execute(delete(EmailDelivery).where(EmailDelivery.user_id == normalized))
         await session.execute(delete(AgentThread).where(AgentThread.user_id == normalized))
+        await session.execute(delete(ModelTokenUsage).where(ModelTokenUsage.user_id == normalized))
+        await session.execute(delete(UserTokenBucket).where(UserTokenBucket.user_id == normalized))
         await session.execute(delete(User).where(User.id == normalized))
         await session.commit()
     return True
@@ -462,88 +636,6 @@ async def revoke_login_session(token: str) -> bool:
         auth_session.revoked_at = _utcnow()
         await session.commit()
     return True
-
-
-async def consume_rate_limit(
-    scope: str,
-    raw_key: str,
-    *,
-    limit: int,
-    window_seconds: int,
-    now: datetime | None = None,
-) -> RateLimitDecision:
-    """Atomically consume one allowance from a PostgreSQL fixed window."""
-
-    if not scope or not raw_key:
-        raise ValueError("限流作用域和键不能为空")
-    if limit < 1 or window_seconds < 1:
-        raise ValueError("限流次数和窗口必须为正数")
-
-    await ensure_schema()
-    current = now or _utcnow()
-    if current.tzinfo is not None:
-        current = current.astimezone(UTC).replace(tzinfo=None)
-    window_start, window_end = _rate_limit_window(current, window_seconds)
-    key_hash = _rate_limit_key_hash(scope, raw_key)
-    values = {
-        "scope": scope,
-        "key_hash": key_hash,
-        "window_start": window_start,
-        "count": 1,
-        "expires_at": window_end,
-    }
-
-    async with session_factory()() as session:
-        # PostgreSQL is authoritative in production; SQLite keeps unit tests
-        # representative without adding a second external service dependency.
-        dialect = session.get_bind().dialect.name
-        if dialect == "postgresql":
-            insert_statement = postgresql_insert(RateLimitBucket).values(**values)
-        elif dialect == "sqlite":
-            insert_statement = sqlite_insert(RateLimitBucket).values(**values)
-        else:
-            raise RuntimeError(f"不支持的限流数据库方言：{dialect}")
-
-        await session.execute(
-            delete(RateLimitBucket).where(RateLimitBucket.expires_at <= current)
-        )
-        statement = insert_statement.on_conflict_do_update(
-            index_elements=[
-                RateLimitBucket.scope,
-                RateLimitBucket.key_hash,
-                RateLimitBucket.window_start,
-            ],
-            set_={
-                "count": RateLimitBucket.count + 1,
-                "expires_at": window_end,
-            },
-        ).returning(RateLimitBucket.count)
-        result = await session.execute(statement)
-        count = int(result.scalar_one())
-        await session.commit()
-
-    retry_after = max(1, math.ceil((window_end - current).total_seconds()))
-    return RateLimitDecision(
-        allowed=count <= limit,
-        count=count,
-        limit=limit,
-        retry_after_seconds=retry_after,
-    )
-
-
-async def clear_rate_limit(scope: str, raw_key: str) -> None:
-    """Clear all active windows for one hashed key after successful login."""
-
-    await ensure_schema()
-    key_hash = _rate_limit_key_hash(scope, raw_key)
-    async with session_factory()() as session:
-        await session.execute(
-            delete(RateLimitBucket).where(
-                RateLimitBucket.scope == scope,
-                RateLimitBucket.key_hash == key_hash,
-            )
-        )
-        await session.commit()
 
 
 async def claim_thread(thread_id: str, user_id: str) -> None:

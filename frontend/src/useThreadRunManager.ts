@@ -132,8 +132,8 @@ export function useThreadRunManager(client: Client, assistantId: string) {
     threadId: string,
     values: { messages: QueuedMessage[] },
     preview: string,
+    submissionId: string,
   ): Promise<ManagedQueueEntry> => {
-    const submissionId = window.crypto.randomUUID();
     const normalizedPreview = preview.replace(/\s+/g, " ").trim().slice(0, 160);
     const run = await client.runs.create(threadId, assistantId, {
       input: values,

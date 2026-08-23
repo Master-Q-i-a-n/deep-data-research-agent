@@ -8,7 +8,7 @@ from typing import Any
 from langgraph_sdk import Auth
 from starlette.requests import Request
 
-from deep_data_research_agent import database
+from deep_data_research_agent import database, redis_limits
 from deep_data_research_agent.config import get_settings
 
 auth = Auth()
@@ -127,35 +127,84 @@ async def create_run(
     ctx: Auth.types.AuthContext,
     value: Auth.types.on.threads.create_run.value,
 ) -> dict[str, str]:
-    settings = get_settings()
-    try:
-        decision = await database.consume_rate_limit(
-            "agent_run",
-            ctx.user.identity,
-            limit=settings.agent_run_limit,
-            window_seconds=settings.agent_run_window_seconds,
-        )
-    except Exception as exc:
-        logger.exception("Agent run 限流存储不可用")
-        raise Auth.exceptions.HTTPException(
-            status_code=503,
-            detail="请求保护服务暂不可用，请稍后重试",
-        ) from exc
-    if not decision.allowed:
-        raise Auth.exceptions.HTTPException(
-            status_code=429,
-            detail="请求过于频繁，请稍后再试",
-            headers={"Retry-After": str(decision.retry_after_seconds)},
-        )
-
     metadata = value.setdefault("metadata", {})
     metadata["owner"] = ctx.user.identity
     thread_id = value.get("thread_id")
-    if thread_id is not None:
+    if thread_id is None:
+        raise Auth.exceptions.HTTPException(
+            status_code=422,
+            detail="持久化运行缺少 thread_id",
+        )
+
+    internal_marker = metadata.get("deep_data_internal")
+    if isinstance(internal_marker, dict):
+        graph_id = str(metadata.get("graph_id") or "")
         try:
-            await database.claim_thread(str(thread_id), ctx.user.identity)
-        except database.ThreadOwnershipError as exc:
-            raise Auth.exceptions.HTTPException(status_code=404, detail="会话不存在") from exc
+            allowed_internal = await redis_limits.consume_internal_run_marker(
+                internal_marker,
+                user_id=ctx.user.identity,
+                graph_id=graph_id,
+            )
+        except Exception as exc:
+            logger.exception("内部子任务凭据存储不可用")
+            raise Auth.exceptions.HTTPException(
+                status_code=503,
+                detail="请求保护服务暂不可用，请稍后重试",
+                headers={"X-Error-Code": "RATE_LIMIT_SERVICE_UNAVAILABLE"},
+            ) from exc
+        if not allowed_internal:
+            raise Auth.exceptions.HTTPException(
+                status_code=403,
+                detail="内部子任务凭据无效或已使用",
+                headers={"X-Error-Code": "INVALID_INTERNAL_RUN_MARKER"},
+            )
+        metadata["token_budget_session_id"] = str(
+            internal_marker.get("token_budget_session_id") or ""
+        )
+    else:
+        ui_metadata = metadata.get("deep_data_ui")
+        submission_id = (
+            str(ui_metadata.get("submission_id") or "")
+            if isinstance(ui_metadata, dict)
+            else ""
+        )
+        if not submission_id:
+            raise Auth.exceptions.HTTPException(
+                status_code=403,
+                detail="请先完成运行准入检查",
+                headers={"X-Error-Code": "RUN_ADMISSION_REQUIRED"},
+            )
+        try:
+            permit_result = await redis_limits.consume_run_permit(
+                ctx.user.identity,
+                submission_id,
+                str(thread_id),
+            )
+        except Exception as exc:
+            logger.exception("运行准入凭据存储不可用")
+            raise Auth.exceptions.HTTPException(
+                status_code=503,
+                detail="请求保护服务暂不可用，请稍后重试",
+                headers={"X-Error-Code": "RATE_LIMIT_SERVICE_UNAVAILABLE"},
+            ) from exc
+        if permit_result != "CONSUMED":
+            status_code = 403 if permit_result == "THREAD_MISMATCH" else 409
+            code = {
+                "MISSING_OR_EXPIRED": "RUN_ADMISSION_EXPIRED",
+                "ALREADY_USED": "RUN_ADMISSION_ALREADY_USED",
+                "THREAD_MISMATCH": "RUN_ADMISSION_MISMATCH",
+            }.get(permit_result, "RUN_ADMISSION_INVALID")
+            raise Auth.exceptions.HTTPException(
+                status_code=status_code,
+                detail="运行准入凭据无效、已过期或已使用",
+                headers={"X-Error-Code": code},
+            )
+        metadata["token_budget_session_id"] = submission_id
+
+    try:
+        await database.claim_thread(str(thread_id), ctx.user.identity)
+    except database.ThreadOwnershipError as exc:
+        raise Auth.exceptions.HTTPException(status_code=404, detail="会话不存在") from exc
     return _owner_filter(ctx)
 
 

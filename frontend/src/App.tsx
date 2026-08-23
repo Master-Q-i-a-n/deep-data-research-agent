@@ -115,6 +115,40 @@ type MemorySettingsResponse = {
   cancelled_jobs?: number;
   detail?: string;
 };
+type LimitDetail = {
+  code: string;
+  message: string;
+  limit?: number;
+  retry_after_seconds?: number;
+  active_thread_ids?: string[];
+  balance_tokens?: number;
+  capacity_tokens?: number;
+  refill_tokens_per_hour?: number;
+  next_refill_at?: string;
+};
+type LimitDialog = LimitDetail & { retryUntil?: number };
+
+class LangGraphApiError extends Error {
+  readonly status: number;
+  readonly detail?: LimitDetail;
+
+  constructor(status: number, message: string, detail?: LimitDetail) {
+    super(message);
+    this.name = "LangGraphApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+async function langGraphFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const response = await fetch(input, init);
+  if (response.ok) return response;
+  const body = await response.clone().json().catch(() => null) as { detail?: LimitDetail | string } | null;
+  const detail = typeof body?.detail === "object" ? body.detail : undefined;
+  const message = detail?.message
+    ?? (typeof body?.detail === "string" ? body.detail : `请求失败（${response.status}）`);
+  throw new LangGraphApiError(response.status, message, detail);
+}
 
 const AUTH_TOKEN_KEY = "deep-data-auth-token";
 const TASK_POLL_INTERVAL_MS = 4_000;
@@ -864,6 +898,8 @@ export default function App() {
   const [sessions, setSessions] = useState<ConversationThread[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState("");
+  const [limitDialog, setLimitDialog] = useState<LimitDialog | null>(null);
+  const [limitCountdown, setLimitCountdown] = useState(0);
   const [deletingThreadId, setDeletingThreadId] = useState<string>();
   const [threadAllocating, setThreadAllocating] = useState(false);
   const [polledTasks, setPolledTasks] = useState<Record<string, AsyncTask>>({});
@@ -923,7 +959,12 @@ export default function App() {
     [authToken],
   );
   const graphClient = useMemo(
-    () => new Client({ apiUrl, defaultHeaders: authHeaders }),
+    () => new Client({
+      apiUrl,
+      defaultHeaders: authHeaders,
+      // SDK 在 SSE 建立前不会完整保留结构化错误；统一 fetch 保留状态码和 detail。
+      callerOptions: { fetch: langGraphFetch, maxRetries: 0 },
+    }),
     [apiUrl, authHeaders],
   );
   const runManager = useThreadRunManager(graphClient, assistantId);
@@ -937,6 +978,78 @@ export default function App() {
     setAuthStatus("required");
     setAuthError("登录已失效，请重新登录");
   }, []);
+
+  const presentRunAdmissionError = useCallback((error: unknown): boolean => {
+    if (!(error instanceof LangGraphApiError) || !error.detail) return false;
+    const supported = new Set([
+      "QUESTION_RATE_LIMITED",
+      "THREAD_CONCURRENCY_LIMIT",
+      "RATE_LIMIT_SERVICE_UNAVAILABLE",
+      "TOKEN_BUDGET_EXHAUSTED",
+      "RUN_ADMISSION_ALREADY_USED",
+      "RUN_ADMISSION_MISMATCH",
+    ]);
+    if (!supported.has(error.detail.code)) return false;
+    const retrySeconds = Math.max(0, error.detail.retry_after_seconds ?? 0);
+    setLimitDialog({
+      ...error.detail,
+      retryUntil: retrySeconds > 0 ? Date.now() + retrySeconds * 1000 : undefined,
+    });
+    setLimitCountdown(retrySeconds);
+    return true;
+  }, []);
+
+  const requestRunAdmission = useCallback(async (
+    targetThreadId?: string,
+  ): Promise<string | undefined> => {
+    const submissionId = window.crypto.randomUUID();
+    try {
+      const response = await fetch(`${apiUrl}/run-admissions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify({
+          submission_id: submissionId,
+          thread_id: targetThreadId ?? null,
+        }),
+      });
+      if (response.status === 401) {
+        expireAuthentication();
+        return undefined;
+      }
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { detail?: LimitDetail | string } | null;
+        const detail = typeof body?.detail === "object" ? body.detail : undefined;
+        const message = detail?.message
+          ?? (typeof body?.detail === "string" ? body.detail : "任务准入失败，请稍后重试");
+        const error = new LangGraphApiError(response.status, message, detail);
+        if (!presentRunAdmissionError(error)) throw error;
+        return undefined;
+      }
+      return submissionId;
+    } catch (error) {
+      if (error instanceof LangGraphApiError) throw error;
+      presentRunAdmissionError(new LangGraphApiError(503, "请求保护服务暂不可用，请稍后重试", {
+        code: "RATE_LIMIT_SERVICE_UNAVAILABLE",
+        message: "请求保护服务暂不可用，请稍后重试",
+        retry_after_seconds: 0,
+        active_thread_ids: [],
+      }));
+      return undefined;
+    }
+  }, [apiUrl, authHeaders, expireAuthentication, presentRunAdmissionError]);
+
+  useEffect(() => {
+    if (!limitDialog?.retryUntil) {
+      setLimitCountdown(0);
+      return undefined;
+    }
+    const updateCountdown = () => {
+      setLimitCountdown(Math.max(0, Math.ceil((limitDialog.retryUntil! - Date.now()) / 1000)));
+    };
+    updateCountdown();
+    const timer = window.setInterval(updateCountdown, 250);
+    return () => window.clearInterval(timer);
+  }, [limitDialog]);
 
   const loadSessions = useCallback(async (signal?: AbortSignal) => {
     if (!authReady) {
@@ -1597,20 +1710,36 @@ export default function App() {
     const runKeys = completed.map((task) => `${task.task_id}:${task.run_id ?? ""}`);
     runKeys.forEach((key) => autoCollectedTaskRunsRef.current.add(key));
     const taskIds = completed.map((task) => task.task_id).join("、");
-    void Promise.resolve(stream.submit(
-      {
-        messages: [{
-          type: "human",
-          name: "async-task-monitor",
-          content: `后台任务 ${taskIds} 已完成。请调用 check_async_task 读取结果并继续处理，不要重新启动任务。`,
-        }],
-      },
-      { streamSubgraphs: true, streamResumable: true, onDisconnect: "continue" },
-    )).catch(() => {
-      runKeys.forEach((key) => autoCollectedTaskRunsRef.current.delete(key));
-      setTaskRefreshError("任务已完成，但自动读取结果失败，请点击“读取结果”重试");
-    });
-  }, [authReady, currentQueueSize, stream.isLoading, stream.submit, tasks, trackedTasks]);
+    void (async () => {
+      const submissionId = await requestRunAdmission(threadId);
+      if (!submissionId) {
+        runKeys.forEach((key) => autoCollectedTaskRunsRef.current.delete(key));
+        return;
+      }
+      try {
+        await stream.submit(
+          {
+            messages: [{
+              type: "human",
+              name: "async-task-monitor",
+              content: `后台任务 ${taskIds} 已完成。请调用 check_async_task 读取结果并继续处理，不要重新启动任务。`,
+            }],
+          },
+          {
+            metadata: { deep_data_ui: { submission_id: submissionId } },
+            streamSubgraphs: true,
+            streamResumable: true,
+            onDisconnect: "continue",
+          },
+        );
+      } catch (error) {
+        runKeys.forEach((key) => autoCollectedTaskRunsRef.current.delete(key));
+        if (!presentRunAdmissionError(error)) {
+          setTaskRefreshError("任务已完成，但自动读取结果失败，请点击“读取结果”重试");
+        }
+      }
+    })();
+  }, [authReady, currentQueueSize, presentRunAdmissionError, requestRunAdmission, stream.isLoading, stream.submit, tasks, threadId, trackedTasks]);
 
   useEffect(() => {
     const updateAutoFollow = () => {
@@ -1826,7 +1955,7 @@ export default function App() {
     }
   }
 
-  function submitText(text: string, mode: SubmitMode = "enqueue") {
+  async function submitText(text: string, mode: SubmitMode = "enqueue") {
     const value = text.trim();
     if (!authReady || !value || !filesReadyForAnalysis || threadAllocating) return;
     const uploadedPaths = uploadedFiles
@@ -1839,24 +1968,40 @@ export default function App() {
       id: `optimistic-${window.crypto.randomUUID()}`,
       content: message,
     });
+    if (!threadId) setThreadAllocating(true);
+    let submissionId: string | undefined;
+    try {
+      submissionId = await requestRunAdmission(threadId);
+    } catch (error) {
+      setThreadAllocating(false);
+      setSessionsError(error instanceof Error ? error.message : "任务准入失败，请稍后重试");
+      return;
+    }
+    if (!submissionId) {
+      setThreadAllocating(false);
+      return;
+    }
     setInput("");
     if (stream.isLoading && mode === "enqueue") {
       if (!threadId) {
         setInput(value);
+        setThreadAllocating(false);
         return;
       }
       void runManager.enqueue(
         threadId,
         { messages: [{ type: "human", content: message }] },
         message,
+        submissionId,
       ).catch((error: unknown) => {
         setInput((current) => current || value);
-        setSessionsError(error instanceof Error ? `消息排队失败：${error.message}` : "消息排队失败");
+        if (!presentRunAdmissionError(error)) {
+          setSessionsError(error instanceof Error ? `消息排队失败：${error.message}` : "消息排队失败");
+        }
       });
       return;
     }
     const multitaskOptions = stream.isLoading ? { multitaskStrategy: mode } : {};
-    if (!threadId) setThreadAllocating(true);
 
     void stream.submit(
       { messages: [{ type: "human", content: message }] },
@@ -1867,12 +2012,13 @@ export default function App() {
         optimisticValues: (current) => ({
           messages: [...(current.messages ?? []), optimisticMessage],
         }),
-        ...(!threadId && stream.messages.length === 0 ? {
-          metadata: {
+        metadata: {
+          deep_data_ui: { submission_id: submissionId },
+          ...(!threadId && stream.messages.length === 0 ? {
             kind: "conversation",
             title: conversationTitle(value),
-          },
-        } : {}),
+          } : {}),
+        },
         streamResumable: true,
         streamSubgraphs: true,
         onDisconnect: "continue",
@@ -1880,7 +2026,9 @@ export default function App() {
     ).catch((error: unknown) => {
       setThreadAllocating(false);
       setInput((current) => current || value);
-      setSessionsError(error instanceof Error ? `发送任务失败：${error.message}` : "发送任务失败");
+      if (!presentRunAdmissionError(error)) {
+        setSessionsError(error instanceof Error ? `发送任务失败：${error.message}` : "发送任务失败");
+      }
     });
   }
 
@@ -1894,8 +2042,11 @@ export default function App() {
       ? latestPreparedDownload?.key ?? null
       : null;
     try {
+      const submissionId = await requestRunAdmission(threadId);
+      if (!submissionId) return;
       await stream.submit(null, {
         command: { resume: { decisions } },
+        metadata: { deep_data_ui: { submission_id: submissionId } },
         streamResumable: true,
         streamSubgraphs: true,
         onDisconnect: "continue",
@@ -1903,7 +2054,9 @@ export default function App() {
     } catch (error) {
       approvedSemanticDownloadRef.current = false;
       semanticDownloadBaselineRef.current = null;
-      setInterruptError(error instanceof Error ? error.message : "暂时无法恢复任务");
+      if (!presentRunAdmissionError(error)) {
+        setInterruptError(error instanceof Error ? error.message : "暂时无法恢复任务");
+      }
     } finally {
       setInterruptSubmitting(false);
     }
@@ -1911,24 +2064,24 @@ export default function App() {
 
   function onSubmit(event: FormEvent) {
     event.preventDefault();
-    submitText(input);
+    void submitText(input);
   }
 
   function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      submitText(input);
+      void submitText(input);
     }
   }
 
   function checkTask(taskId: string) {
-    submitText(
+    void submitText(
       `请调用 check_async_task 检查任务 ${taskId}。如果远程运行已经结束，请读取结果第一行的业务 status 并继续处理。`,
     );
   }
 
   function updateTask(taskId: string, message: string) {
-    submitText(
+    void submitText(
       `请调用 update_async_task 更新任务 ${taskId}。补充要求：${message}`,
       "interrupt",
     );
@@ -1939,7 +2092,7 @@ export default function App() {
       "确定取消这个后台任务吗？已经完成的请求和文件不会自动删除。",
     );
     if (!confirmed) return;
-    submitText(`请调用 cancel_async_task 取消任务 ${taskId}。`, "interrupt");
+    void submitText(`请调用 cancel_async_task 取消任务 ${taskId}。`, "interrupt");
   }
 
   function refreshTasks() {
@@ -2616,8 +2769,8 @@ export default function App() {
               <button
                 className="interrupt-button"
                 type="button"
-                  disabled={!input.trim() || threadAllocating}
-                onClick={() => submitText(input, "interrupt")}
+                disabled={!input.trim() || threadAllocating}
+                onClick={() => void submitText(input, "interrupt")}
               >
                 立即纠正
               </button>
@@ -2640,6 +2793,76 @@ export default function App() {
           <TodoPanel todos={todos} />
           <SubagentPlanPanel subagents={displayedSubagents} />
         </aside>
+      ) : null}
+
+      {limitDialog ? (
+        <div className="limit-overlay" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setLimitDialog(null);
+        }}>
+          <section className="limit-dialog" role="dialog" aria-modal="true" aria-labelledby="limit-title">
+            <header>
+              <div>
+                <p className="eyebrow">任务保护</p>
+                <h2 id="limit-title">
+                  {limitDialog.code === "THREAD_CONCURRENCY_LIMIT"
+                    ? "运行中的会话已达上限"
+                    : limitDialog.code === "QUESTION_RATE_LIMITED"
+                      ? "本分钟提问次数已达上限"
+                      : limitDialog.code === "TOKEN_BUDGET_EXHAUSTED"
+                        ? "Token 额度不足"
+                      : "暂时无法发起任务"}
+                </h2>
+              </div>
+              <button type="button" onClick={() => setLimitDialog(null)} aria-label="关闭提示">×</button>
+            </header>
+            <p>{limitDialog.message}</p>
+            {limitDialog.code === "QUESTION_RATE_LIMITED" || limitDialog.code === "TOKEN_BUDGET_EXHAUSTED" ? (
+              <div className="limit-dialog__countdown" role="status">
+                <strong>{limitCountdown}</strong>
+                <span>秒后可重试</span>
+              </div>
+            ) : null}
+            {limitDialog.code === "TOKEN_BUDGET_EXHAUSTED" ? (
+              <div className="limit-dialog__token-summary">
+                <span>当前余额</span>
+                <strong>{(limitDialog.balance_tokens ?? 0).toLocaleString()} tokens</strong>
+                <small>
+                  每个整点补充 {(limitDialog.refill_tokens_per_hour ?? 0).toLocaleString()}
+                  {limitDialog.next_refill_at
+                    ? ` · 最早可用时间 ${new Date(limitDialog.next_refill_at).toLocaleString("zh-CN")}`
+                    : ""}
+                </small>
+              </div>
+            ) : null}
+            {limitDialog.code === "THREAD_CONCURRENCY_LIMIT" && limitDialog.active_thread_ids?.length ? (
+              <div className="limit-dialog__threads">
+                <span>正在运行的会话</span>
+                {limitDialog.active_thread_ids.map((activeThreadId) => {
+                  const session = sessions.find((item) => item.thread_id === activeThreadId);
+                  const title = typeof session?.metadata?.title === "string"
+                    ? session.metadata.title
+                    : "研究会话";
+                  return (
+                    <button
+                      type="button"
+                      key={activeThreadId}
+                      onClick={() => {
+                        setLimitDialog(null);
+                        selectSession(activeThreadId);
+                      }}
+                    >
+                      <strong>{title}</strong>
+                      <small>{activeThreadId}</small>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+            <footer>
+              <button type="button" onClick={() => setLimitDialog(null)}>知道了</button>
+            </footer>
+          </section>
+        </div>
       ) : null}
 
       {settingsOpen ? (

@@ -446,7 +446,7 @@ async def test_failure_review_middleware_records_oversize_skip(monkeypatch) -> N
 async def test_failure_consolidator_uses_execution_evidence_scope(monkeypatch) -> None:
     captured: dict[str, str] = {}
 
-    async def invoke(_schema, prompt):
+    async def invoke(_schema, prompt, **_kwargs):
         captured["prompt"] = prompt
         return memory.FailureDecision(action="discard")
 
@@ -690,12 +690,16 @@ async def test_structured_model_repairs_once_and_detaches_callbacks(monkeypatch)
             calls.append({"prompt": prompt, "config": config})
             if len(calls) == 1:
                 raise OutputParserException("bad json")
-            return memory.UserMemoryPatch(action="discard")
+            return {
+                "parsed": memory.UserMemoryPatch(action="discard"),
+                "raw": AIMessage(content="{}"),
+            }
 
     class Model:
-        def with_structured_output(self, schema, *, method):
+        def with_structured_output(self, schema, *, method, include_raw):
             assert schema is memory.UserMemoryPatch
             assert method == "json_mode"
+            assert include_raw is True
             return StructuredModel()
 
     monkeypatch.setattr(

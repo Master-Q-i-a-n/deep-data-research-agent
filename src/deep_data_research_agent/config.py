@@ -112,12 +112,25 @@ class Settings(BaseSettings):
     postgres_pool_timeout_seconds: float = Field(default=30.0, ge=1, le=120)
     auth_session_days: int = Field(default=7, ge=1, le=90)
     rate_limit_key_secret: SecretStr = SecretStr("")
-    auth_login_failure_limit: int = Field(default=5, ge=1, le=100)
-    auth_login_window_seconds: int = Field(default=900, ge=1, le=86400)
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_username: str = "ddra"
+    redis_password_file: Path = Path(".secrets/redis_password")
+    redis_connect_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    redis_socket_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    redis_max_connections: int = Field(default=20, ge=1, le=200)
+    auth_login_limit: int = Field(default=10, ge=1, le=100)
+    auth_login_window_seconds: int = Field(default=60, ge=1, le=86400)
     auth_register_limit: int = Field(default=3, ge=1, le=100)
     auth_register_window_seconds: int = Field(default=3600, ge=1, le=86400)
-    agent_run_limit: int = Field(default=10, ge=1, le=1000)
-    agent_run_window_seconds: int = Field(default=60, ge=1, le=86400)
+    question_limit: int = Field(default=20, ge=1, le=1000)
+    question_window_seconds: int = Field(default=60, ge=1, le=86400)
+    thread_concurrency_limit: int = Field(default=3, ge=1, le=50)
+    run_permit_ttl_seconds: int = Field(default=30, ge=5, le=300)
+    run_reservation_ttl_seconds: int = Field(default=15, ge=5, le=120)
+    run_admission_lock_seconds: int = Field(default=5, ge=1, le=30)
+    token_bucket_capacity: int = Field(default=100_000_000, ge=1)
+    token_bucket_refill_per_hour: int = Field(default=10_000_000, ge=1)
+    token_reservation_output_tokens: int = Field(default=8_192, ge=1, le=1_000_000)
     mongodb_uri: str = ""
     mongodb_database: str = "deep_data_research_agent"
     mongodb_skill_collection: str = "skill_files"
@@ -161,6 +174,8 @@ class Settings(BaseSettings):
         secret = self.rate_limit_key_secret.get_secret_value()
         if self.app_env == "production" and len(secret) < 32:
             raise ValueError("生产环境 RATE_LIMIT_KEY_SECRET 至少需要 32 个字符")
+        if self.app_env == "production" and not self.redis_username.strip():
+            raise ValueError("生产环境 REDIS_USERNAME 不能为空")
         if self.memory_job_timeout_seconds <= self.memory_model_timeout_seconds:
             raise ValueError("MEMORY_JOB_TIMEOUT_SECONDS 必须大于 MEMORY_MODEL_TIMEOUT_SECONDS")
         return self

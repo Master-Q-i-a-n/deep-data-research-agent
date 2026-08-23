@@ -71,16 +71,40 @@ POSTGRES_POOL_TIMEOUT_SECONDS=30
 LANGGRAPH_STRICT_MSGPACK=true
 AUTH_SESSION_DAYS=7
 RATE_LIMIT_KEY_SECRET=
-AUTH_LOGIN_FAILURE_LIMIT=5
-AUTH_LOGIN_WINDOW_SECONDS=900
+REDIS_URL=redis://127.0.0.1:6379/0
+REDIS_USERNAME=ddra
+REDIS_PASSWORD_FILE=.secrets/redis_password
+REDIS_CONNECT_TIMEOUT_SECONDS=2
+REDIS_SOCKET_TIMEOUT_SECONDS=2
+REDIS_MAX_CONNECTIONS=20
+AUTH_LOGIN_LIMIT=10
+AUTH_LOGIN_WINDOW_SECONDS=60
 AUTH_REGISTER_LIMIT=3
 AUTH_REGISTER_WINDOW_SECONDS=3600
-AGENT_RUN_LIMIT=10
-AGENT_RUN_WINDOW_SECONDS=60
+QUESTION_LIMIT=20
+QUESTION_WINDOW_SECONDS=60
+THREAD_CONCURRENCY_LIMIT=3
+TOKEN_BUCKET_CAPACITY=100000000
+TOKEN_BUCKET_REFILL_PER_HOUR=10000000
+TOKEN_RESERVATION_OUTPUT_TOKENS=8192
+RUN_PERMIT_TTL_SECONDS=30
+RUN_RESERVATION_TTL_SECONDS=15
+RUN_ADMISSION_LOCK_SECONDS=5
 ```
 
 不要提交 `.env`，也不要把 API Key 作为命令行参数传递。`APP_ENV=production` 时
 `RATE_LIMIT_KEY_SECRET` 必须是至少 32 字符的稳定随机值；生产环境会拒绝所有未登录请求。
+
+后端启动前先部署项目专用 Redis。脚本会生成被 Git 忽略的随机 ACL 密码；首次从旧的
+`f10fedb99816` 容器切换时，会先把 `redis-data` 备份到 `.redis-backups/`，再由 Compose
+接管同名数据卷：
+
+```powershell
+.\scripts\setup_redis.ps1
+```
+
+Redis 只监听宿主机回环地址，应用使用 `.secrets/redis_password` 认证，不需要把密码写入
+真实 `.env`。详细的验收、备份和恢复步骤见 [Redis 运维说明](docs/redis.md)。
 
 如需使用 QQ 邮箱发送报告，在本地 `.env` 中启用固定发件邮箱。`SMTP_PASSWORD` 必须填写
 QQ 邮箱生成的授权码，而不是登录密码：
@@ -119,8 +143,10 @@ uv run setup-agent-postgres
 动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。开发环境无 Bearer
 Token 时 LangGraph Auth 注入共享身份 `local-user`；生产环境无 Token 返回 401。注册用户使用
 独立 UUID。MongoDB 不配置 TTL 和向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要
-写入 PostgreSQL。注册、登录失败和外部 Agent run 使用 PostgreSQL 固定窗口限流；应用只读取
-ASGI peer 地址，不直接信任 `X-Forwarded-For`。
+写入 PostgreSQL。注册和登录使用 Redis ZSET 滑动窗口；登录按 IP、账户两个维度分别限制
+10 次/60 秒，成功和失败均计数。每个用户最多同时运行 3 个 Supervisor 会话、每分钟最多发起
+20 个顶层 Supervisor run；内部异步子 Agent 通过服务端签名标记排除。Redis 不可用时保护逻辑
+fail-closed，不回退 PostgreSQL。应用只读取 ASGI peer 地址，不直接信任 `X-Forwarded-For`。
 
 自动失败回顾只把当前任务目标、已配对的工具调用/结果和最终结果加入 MongoDB 队列，每个
 Agent 每轮最多整理三条独立教训；不保存完整提示词、历史消息或 Agent 中间思考，也不依赖模型上下文缓存。登录用户可以在前端设置中

@@ -39,6 +39,7 @@ from deep_data_research_agent.subagent_contracts import (
     compact_crawl_summary,
 )
 from deep_data_research_agent.tavily_tools import CRAWL_TOOLS
+from deep_data_research_agent.token_usage import TokenUsageMiddleware
 
 register_mvp_profile()
 
@@ -103,6 +104,7 @@ crawl_agent = create_deep_agent(
     tools=[*CRAWL_TOOLS],
     system_prompt=CRAWL_WORKER_PROMPT,
     middleware=[
+        TokenUsageMiddleware(agent_name="crawl-worker"),
         # Preserve the crawl worker's short planning step after the 0.7 upgrade.
         TodoListMiddleware(),
         SubagentModelCallLimitMiddleware(

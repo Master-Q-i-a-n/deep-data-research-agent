@@ -1,0 +1,37 @@
+name: deep-data-research-agent
+
+services:
+  redis:
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    container_name: redis
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/ddra-redis-entrypoint.sh"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./deploy/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./deploy/redis/entrypoint.sh:/usr/local/bin/ddra-redis-entrypoint.sh:ro
+    secrets:
+      - redis_password
+    tmpfs:
+      - /run/redis:size=1m,mode=0700
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'REDISCLI_AUTH="$$(cat /run/secrets/redis_password)" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG'
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  redis_password:
+    file: ./.secrets/redis_password
+
+volumes:
+  redis-data:
+    external: true
+    name: redis-data

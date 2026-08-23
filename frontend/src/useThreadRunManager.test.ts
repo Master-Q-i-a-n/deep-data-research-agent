@@ -50,11 +50,13 @@ describe("useThreadRunManager", () => {
         "thread-a",
         { messages: [{ type: "human", content: "A 的补充要求" }] },
         `  A 的补充要求  ${"很长".repeat(100)}`,
+        "submission-a",
       );
       await result.current.enqueue(
         "thread-b",
         { messages: [{ type: "human", content: "B 的补充要求" }] },
         "B 的补充要求",
+        "submission-b",
       );
     });
 
@@ -69,7 +71,7 @@ describe("useThreadRunManager", () => {
         streamSubgraphs: true,
         metadata: {
           deep_data_ui: {
-            submission_id: expect.any(String),
+            submission_id: "submission-a",
             preview: expect.any(String),
           },
         },
@@ -113,6 +115,7 @@ describe("useThreadRunManager", () => {
         "thread-a",
         { messages: [{ type: "human", content: "待提升" }] },
         "待提升",
+        "submission-promoted",
       );
     });
 

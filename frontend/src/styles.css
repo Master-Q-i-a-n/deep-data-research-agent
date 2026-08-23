@@ -885,7 +885,8 @@ code, pre {
   font-size: 0.7rem;
 }
 
-.settings-overlay {
+.settings-overlay,
+.limit-overlay {
   position: fixed;
   z-index: 55;
   inset: 0;
@@ -895,6 +896,45 @@ code, pre {
   background: rgba(10, 31, 40, 0.58);
   backdrop-filter: blur(6px);
 }
+.limit-overlay { z-index: 65; }
+.limit-dialog {
+  width: min(500px, 100%);
+  padding: 26px;
+  color: var(--ink);
+  border: 1px solid rgba(207, 138, 59, 0.32);
+  border-radius: 5px 22px 5px 22px;
+  background: var(--paper);
+  box-shadow: 0 28px 80px rgba(16, 40, 51, 0.3);
+}
+.limit-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.limit-dialog h2 { margin: 0; font-family: "Songti SC", "Noto Serif SC", Georgia, serif; font-size: 1.4rem; }
+.limit-dialog > header > button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--muted);
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 9px 3px 9px 3px;
+  background: transparent;
+  font-size: 1.1rem;
+}
+.limit-dialog > p { margin: 18px 0; color: var(--ink-soft); font-size: 0.8rem; line-height: 1.65; }
+.limit-dialog__countdown { display: flex; align-items: baseline; gap: 9px; padding: 18px; border-radius: 4px 14px 4px 14px; background: rgba(207, 138, 59, 0.1); }
+.limit-dialog__countdown strong { color: #a96722; font-family: Georgia, serif; font-size: 2rem; }
+.limit-dialog__countdown span { color: var(--muted); font-size: 0.72rem; }
+.limit-dialog__token-summary { display: grid; gap: 5px; margin-top: 12px; padding: 14px 16px; border: 1px solid rgba(207, 138, 59, 0.22); border-radius: 11px 4px 11px 4px; background: #fffaf3; }
+.limit-dialog__token-summary span { color: var(--muted); font-size: 0.66rem; }
+.limit-dialog__token-summary strong { color: #8f571c; font-family: "Cascadia Code", monospace; font-size: 0.9rem; }
+.limit-dialog__token-summary small { color: var(--ink-soft); font-size: 0.64rem; line-height: 1.55; }
+.limit-dialog__threads { display: grid; gap: 8px; margin: 18px 0; }
+.limit-dialog__threads > span { color: var(--muted); font-size: 0.68rem; }
+.limit-dialog__threads button { display: grid; gap: 3px; padding: 11px 13px; text-align: left; cursor: pointer; border: 1px solid var(--line); border-radius: 4px 11px 4px 11px; background: #f7fafb; }
+.limit-dialog__threads button:hover { border-color: rgba(54, 89, 217, 0.42); background: rgba(54, 89, 217, 0.05); }
+.limit-dialog__threads strong { overflow: hidden; color: var(--ink); font-size: 0.74rem; text-overflow: ellipsis; white-space: nowrap; }
+.limit-dialog__threads small { overflow: hidden; color: var(--muted); font-family: "Cascadia Code", monospace; font-size: 0.58rem; text-overflow: ellipsis; white-space: nowrap; }
+.limit-dialog > footer { display: flex; justify-content: flex-end; margin-top: 20px; }
+.limit-dialog > footer button { padding: 9px 18px; color: #fff; cursor: pointer; border: 0; border-radius: 9px 3px 9px 3px; background: var(--cobalt); font-size: 0.72rem; font-weight: 700; }
 .settings-dialog {
   width: min(520px, 100%);
   max-height: calc(100vh - 48px);
@@ -1005,8 +1045,9 @@ code, pre {
   .send-button { justify-content: center; }
   .send-button span { display: none; }
   .interrupt-button { padding: 6px 4px; font-size: 0.58rem; }
-  .settings-overlay { align-items: end; padding: 12px; }
+  .settings-overlay, .limit-overlay { align-items: end; padding: 12px; }
   .settings-dialog { width: 100%; max-height: calc(100vh - 24px); padding: 21px 18px; border-radius: 5px 18px 5px 18px; }
+  .limit-dialog { width: 100%; padding: 21px 18px; border-radius: 5px 18px 5px 18px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

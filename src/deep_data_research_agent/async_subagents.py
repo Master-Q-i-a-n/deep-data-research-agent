@@ -19,6 +19,8 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.types import Command
 
+from deep_data_research_agent.redis_limits import issue_internal_run_marker
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,6 +126,15 @@ class MetadataPropagatingAsyncSubAgentMiddleware(AsyncSubAgentMiddleware):
         parent_thread_id = parent.get("thread_id")
         if parent_thread_id:
             metadata["parent_thread_id"] = str(parent_thread_id)
+        configurable = config.get("configurable") if isinstance(config.get("configurable"), dict) else {}
+        user_id = str(configurable.get("langgraph_auth_user_id") or "")
+        if user_id:
+            metadata["deep_data_internal"] = issue_internal_run_marker(
+                user_id=user_id,
+                graph_id=graph_id,
+                parent_thread_id=str(parent_thread_id or ""),
+                token_budget_session_id=str(parent.get("token_budget_session_id") or ""),
+            )
         return metadata
 
     @staticmethod

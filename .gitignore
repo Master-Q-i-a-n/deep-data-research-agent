@@ -30,6 +30,8 @@ frontend/.eslintcache
 .playwright-cli/
 output/
 *.log
+.secrets/
+.redis-backups/
 
 # 编辑器与操作系统生成文件
 .idea/

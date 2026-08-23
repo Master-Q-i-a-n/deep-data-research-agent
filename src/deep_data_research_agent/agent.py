@@ -42,6 +42,7 @@ from deep_data_research_agent.subagent_contracts import (
     ReviewerToolGuardMiddleware,
     SubagentModelCallLimitMiddleware,
 )
+from deep_data_research_agent.token_usage import TokenUsageMiddleware
 
 register_mvp_profile()
 
@@ -72,6 +73,7 @@ graph = create_deep_agent(
                 f"{user_skill_root('data-analyst')}/",
             ],
             middleware=[
+                TokenUsageMiddleware(agent_name="data-analyst"),
                 # DeepAgents 0.7 makes planning opt-in; keep it for analysis.
                 TodoListMiddleware(),
                 MemoryRefreshMiddleware(
@@ -101,6 +103,7 @@ graph = create_deep_agent(
             # Explicitly avoid inheriting the Supervisor's business tools.
             tools=[],
             middleware=[
+                TokenUsageMiddleware(agent_name="analysis-reviewer"),
                 # after_model hooks run in reverse order: count the model call
                 # before validating or redirecting its final JSON response.
                 ReviewerResultValidationMiddleware(),
@@ -113,6 +116,7 @@ graph = create_deep_agent(
         ),
     ],
     middleware=[
+        TokenUsageMiddleware(agent_name="supervisor"),
         # Reviewer deliberately omits this official Todo middleware.
         TodoListMiddleware(),
         SandboxLifecycleMiddleware(

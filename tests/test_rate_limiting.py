@@ -1,14 +1,16 @@
-from datetime import UTC, datetime, timedelta
+import asyncio
+import time
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from deep_data_research_agent import auth as auth_module
-from deep_data_research_agent import database, webapp
+from deep_data_research_agent import database, redis_limits, token_usage, webapp
 from deep_data_research_agent.config import Settings
 
 
@@ -37,8 +39,6 @@ def _request(
 
 @pytest_asyncio.fixture
 async def isolated_database(monkeypatch):
-    """Use SQLite to exercise the same atomic upsert used by PostgreSQL."""
-
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(database, "_engine", engine)
@@ -49,6 +49,49 @@ async def isolated_database(monkeypatch):
         yield factory
     finally:
         await database.close_database()
+
+
+@pytest_asyncio.fixture
+async def redis_service(monkeypatch):
+    """Use real Redis/Lua with an isolated prefix and never call FLUSHDB."""
+
+    await redis_limits.close_redis()
+    monkeypatch.setattr(redis_limits, "_KEY_PREFIX", f"ddra:test:{uuid4()}")
+    try:
+        client = await redis_limits.initialize_redis()
+    except (OSError, RedisError, RuntimeError) as exc:
+        pytest.skip(f"测试 Redis 不可用：{exc}")
+    try:
+        yield client
+    finally:
+        await redis_limits.close_redis()
+
+
+async def _delete_rate_key(client, scope: str, raw_key: str) -> None:
+    key = f"{redis_limits._KEY_PREFIX}:rl:{scope}:{redis_limits._digest(scope, raw_key)}"
+    await client.delete(key)
+
+
+async def _delete_user_keys(client, user_id: str, submission_ids: list[str]) -> None:
+    base = f"{redis_limits._KEY_PREFIX}:{{{redis_limits._user_tag(user_id)}}}"
+    keys = [
+        f"{base}:questions",
+        f"{base}:reservations",
+        f"{base}:admission-lock",
+        f"{base}:token-bucket",
+    ]
+    for submission_id in submission_ids:
+        keys.extend([f"{base}:permit:{submission_id}", f"{base}:used:{submission_id}"])
+    await client.delete(*keys)
+
+
+async def _seed_token_bucket(user_id: str, balance: int = 100_000_000) -> None:
+    await redis_limits.sync_token_bucket(
+        user_id,
+        balance_tokens=balance,
+        last_refill_hour=int(time.time() // 3600),
+        version=1,
+    )
 
 
 def test_production_requires_stable_rate_limit_secret() -> None:
@@ -66,10 +109,8 @@ async def test_production_rejects_anonymous_langgraph_request(monkeypatch) -> No
         "get_settings",
         lambda: SimpleNamespace(app_env="production"),
     )
-
     with pytest.raises(Exception) as caught:
         await auth_module.authenticate_request(_request())
-
     assert caught.value.status_code == 401
     assert caught.value.detail == "请先登录"
 
@@ -82,9 +123,7 @@ async def test_production_keeps_auth_entry_points_public(monkeypatch, path: str)
         "get_settings",
         lambda: SimpleNamespace(app_env="production"),
     )
-
     user = await auth_module.authenticate_request(_request(path=path))
-
     assert user["identity"] == "public-auth"
     assert user["is_authenticated"] is False
 
@@ -96,173 +135,505 @@ async def test_production_auth_me_rejects_anonymous_request(monkeypatch) -> None
         "get_settings",
         lambda: SimpleNamespace(app_env="production"),
     )
-
     with pytest.raises(Exception) as caught:
         await webapp.current_user(None)
-
     assert caught.value.status_code == 401
     assert caught.value.detail == "请先登录"
 
 
 @pytest.mark.asyncio
-async def test_fixed_window_hashes_keys_and_resets_after_expiry(
+async def test_sliding_window_boundary_retry_ttl_and_idempotency(redis_service) -> None:
+    raw_key = f"ip:{uuid4()}"
+    try:
+        first = await redis_limits.consume_sliding_window(
+            "login_ip", raw_key, limit=2, window_seconds=60, request_id="request-1"
+        )
+        duplicate = await redis_limits.consume_sliding_window(
+            "login_ip", raw_key, limit=2, window_seconds=60, request_id="request-1"
+        )
+        second = await redis_limits.consume_sliding_window(
+            "login_ip", raw_key, limit=2, window_seconds=60, request_id="request-2"
+        )
+        denied = await redis_limits.consume_sliding_window(
+            "login_ip", raw_key, limit=2, window_seconds=60, request_id="request-3"
+        )
+
+        assert (first.allowed, first.count) == (True, 1)
+        assert duplicate.allowed is True and duplicate.duplicate is True
+        assert (second.allowed, second.count) == (True, 2)
+        assert denied.allowed is False
+        assert 1 <= denied.retry_after_seconds <= 60
+        key = (
+            f"{redis_limits._KEY_PREFIX}:rl:login_ip:"
+            f"{redis_limits._digest('login_ip', raw_key)}"
+        )
+        assert 0 < await redis_service.pttl(key) <= 61_000
+    finally:
+        await _delete_rate_key(redis_service, "login_ip", raw_key)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sliding_window_allows_exactly_twenty(redis_service) -> None:
+    raw_key = f"user:{uuid4()}"
+    try:
+        decisions = await asyncio.gather(*[
+            redis_limits.consume_sliding_window(
+                "questions",
+                raw_key,
+                limit=20,
+                window_seconds=60,
+                request_id=f"request-{index}",
+            )
+            for index in range(21)
+        ])
+        assert sum(decision.allowed for decision in decisions) == 20
+        assert sum(not decision.allowed for decision in decisions) == 1
+    finally:
+        await _delete_rate_key(redis_service, "questions", raw_key)
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_database_refill_reserve_and_idempotent_settlement(
     isolated_database,
 ) -> None:
-    now = datetime(2026, 8, 14, 12, 0, 10, tzinfo=UTC)
-    decisions = [
-        await database.consume_rate_limit(
-            "auth_login",
-            "127.0.0.1\0alice",
-            limit=2,
-            window_seconds=60,
-            now=now,
-        )
-        for _ in range(3)
-    ]
+    bucket = await database.get_token_bucket(database.DEFAULT_USER_ID)
+    assert bucket.balance_tokens == 100_000_000
 
-    assert [decision.allowed for decision in decisions] == [True, True, False]
-    assert decisions[-1].count == 3
-    assert decisions[-1].retry_after_seconds == 50
+    call_id = str(uuid4())
+    reservation = await database.reserve_model_tokens(
+        call_id=call_id,
+        user_id=database.DEFAULT_USER_ID,
+        root_run_id="run-a",
+        thread_id="thread-a",
+        agent_name="supervisor",
+        model_name="test-model",
+        reserved_tokens=10_000,
+    )
+    assert reservation.bucket.balance_tokens == 99_990_000
+    settled = await database.settle_model_tokens(
+        call_id=call_id,
+        input_tokens=3_000,
+        output_tokens=1_000,
+        total_tokens=4_000,
+        usage_source="provider",
+    )
+    assert settled.balance_tokens == 99_996_000
+    duplicate = await database.settle_model_tokens(
+        call_id=call_id,
+        input_tokens=9_000,
+        output_tokens=9_000,
+        total_tokens=18_000,
+        usage_source="provider",
+    )
+    assert duplicate.balance_tokens == 99_996_000
 
     async with isolated_database() as session:
-        bucket = (await session.execute(select(database.RateLimitBucket))).scalar_one()
-        assert bucket.key_hash != "127.0.0.1\0alice"
-        assert len(bucket.key_hash) == 64
-
-    next_window = await database.consume_rate_limit(
-        "auth_login",
-        "127.0.0.1\0alice",
-        limit=2,
-        window_seconds=60,
-        now=now + timedelta(seconds=60),
-    )
-    assert next_window.allowed is True
-    assert next_window.count == 1
+        state = await session.get(database.UserTokenBucket, database.DEFAULT_USER_ID)
+        assert state is not None
+        state.balance_tokens = -15_000_000
+        state.last_refill_hour = int(time.time() // 3600) - 2
+        await session.commit()
+    refilled = await database.get_token_bucket(database.DEFAULT_USER_ID)
+    assert refilled.balance_tokens == 5_000_000
 
 
 @pytest.mark.asyncio
-async def test_successful_login_clear_removes_current_bucket(isolated_database) -> None:
-    await database.consume_rate_limit(
-        "auth_login",
-        "127.0.0.1\0alice",
-        limit=1,
-        window_seconds=900,
-    )
-    await database.clear_rate_limit("auth_login", "127.0.0.1\0alice")
-
-    decision = await database.consume_rate_limit(
-        "auth_login",
-        "127.0.0.1\0alice",
-        limit=1,
-        window_seconds=900,
-    )
-    assert decision.allowed is True
-    assert decision.count == 1
-
-
-@pytest.mark.asyncio
-async def test_failed_login_sixth_attempt_is_limited(isolated_database, monkeypatch) -> None:
-    monkeypatch.setattr(
-        webapp,
-        "get_settings",
-        lambda: SimpleNamespace(
-            auth_login_failure_limit=5,
-            auth_login_window_seconds=900,
-        ),
-    )
-    payload = webapp.LoginRequest(username="Alice", password="wrong-password")
-    request = _request(client_host="198.51.100.10")
-
-    for _ in range(5):
-        with pytest.raises(Exception) as caught:
-            await webapp.login(payload, request)
-        assert caught.value.status_code == 401
-        assert caught.value.detail == "用户名或密码错误"
-
-    with pytest.raises(Exception) as limited:
-        await webapp.login(payload, request)
-    assert limited.value.status_code == 429
-    assert int(limited.value.headers["Retry-After"]) > 0
-
-
-@pytest.mark.asyncio
-async def test_register_counts_validated_requests_before_business_checks(
+async def test_metered_direct_model_call_uses_provider_usage(
     isolated_database,
     monkeypatch,
 ) -> None:
+    class Model:
+        model_name = "test-model"
+
+        def get_num_tokens_from_messages(self, _messages):
+            return 100
+
+        async def ainvoke(self, _input, config=None, **_kwargs):
+            assert config == {"tags": ["test"]}
+            return token_usage.AIMessage(
+                content="ok",
+                usage_metadata={
+                    "input_tokens": 70,
+                    "output_tokens": 30,
+                    "total_tokens": 100,
+                },
+            )
+
+    async def ignore_sync(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(token_usage, "_sync_bucket", ignore_sync)
+    result = await token_usage.metered_model_ainvoke(
+        Model(),
+        "hello",
+        user_id=database.DEFAULT_USER_ID,
+        agent_name="memory-user",
+        config={"tags": ["test"]},
+    )
+    assert result.content == "ok"
+    bucket = await database.get_token_bucket(database.DEFAULT_USER_ID)
+    assert bucket.balance_tokens == 99_999_900
+
+    async with isolated_database() as session:
+        rows = (await session.execute(database.select(database.ModelTokenUsage))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == "settled"
+    assert rows[0].usage_source == "provider"
+    assert rows[0].total_tokens == 100
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_blocks_zero_and_calculates_debt_retry(redis_service) -> None:
+    user_id = f"token-user-{uuid4()}"
+    submissions = [str(uuid4()), str(uuid4())]
+    try:
+        await _seed_token_bucket(user_id, 0)
+        zero = await redis_limits.admit_run(user_id, submissions[0], None, [])
+        assert zero.code == "TOKEN_BUDGET_EXHAUSTED"
+        assert zero.token_balance == 0
+        assert 1 <= zero.retry_after_seconds <= 3600
+
+        await redis_limits.sync_token_bucket(
+            user_id,
+            balance_tokens=-10_000_000,
+            last_refill_hour=int(time.time() // 3600),
+            version=2,
+        )
+        debt = await redis_limits.admit_run(user_id, submissions[1], None, [])
+        assert debt.code == "TOKEN_BUDGET_EXHAUSTED"
+        assert 3600 < debt.retry_after_seconds <= 7200
+    finally:
+        await _delete_user_keys(redis_service, user_id, submissions)
+
+
+@pytest.mark.asyncio
+async def test_run_admission_thread_limit_same_thread_and_permit_guards(redis_service) -> None:
+    user_id = f"user-{uuid4()}"
+    submissions = [f"submission-{index}-{uuid4()}" for index in range(6)]
+    try:
+        await _seed_token_bucket(user_id)
+        for index in range(3):
+            decision = await redis_limits.admit_run(
+                user_id, submissions[index], f"thread-{index}", []
+            )
+            assert decision.allowed is True
+
+        duplicate = await redis_limits.admit_run(
+            user_id, submissions[0], "thread-0", []
+        )
+        assert duplicate.allowed is True
+        assert await redis_limits.consume_run_permit(
+            f"other-{user_id}", submissions[0], "thread-0"
+        ) == "MISSING_OR_EXPIRED"
+
+        denied = await redis_limits.admit_run(user_id, submissions[3], "thread-3", [])
+        assert denied.code == "THREAD_CONCURRENCY_LIMIT"
+        assert set(denied.active_thread_ids) == {"thread-0", "thread-1", "thread-2"}
+
+        same_thread = await redis_limits.admit_run(
+            user_id, submissions[4], "thread-0", []
+        )
+        assert same_thread.allowed is True
+        assert await redis_limits.consume_run_permit(
+            user_id, submissions[4], "thread-other"
+        ) == "THREAD_MISMATCH"
+        assert await redis_limits.consume_run_permit(
+            user_id, submissions[4], "thread-0"
+        ) == "CONSUMED"
+        assert await redis_limits.consume_run_permit(
+            user_id, submissions[4], "thread-0"
+        ) == "ALREADY_USED"
+        assert await redis_limits.consume_run_permit(
+            user_id, submissions[0], "thread-0"
+        ) == "CONSUMED"
+        used = await redis_limits.admit_run(user_id, submissions[0], "thread-0", [])
+        assert used.code == "RUN_ADMISSION_ALREADY_USED"
+
+        new_thread = await redis_limits.admit_run(user_id, submissions[5], None, [])
+        assert new_thread.allowed is False
+        assert new_thread.code == "THREAD_CONCURRENCY_LIMIT"
+    finally:
+        await _delete_user_keys(redis_service, user_id, submissions)
+
+
+@pytest.mark.asyncio
+async def test_expired_reservations_release_thread_slot_and_permit(redis_service, monkeypatch) -> None:
+    settings = redis_limits.get_settings().model_copy(
+        update={"run_permit_ttl_seconds": 1, "run_reservation_ttl_seconds": 1}
+    )
+    monkeypatch.setattr(redis_limits, "get_settings", lambda: settings)
+    user_id = f"expiring-user-{uuid4()}"
+    submissions = [f"expiring-{index}-{uuid4()}" for index in range(4)]
+    try:
+        await _seed_token_bucket(user_id)
+        for index in range(3):
+            assert (
+                await redis_limits.admit_run(
+                    user_id, submissions[index], f"thread-{index}", []
+                )
+            ).allowed is True
+        await asyncio.sleep(1.05)
+        assert await redis_limits.consume_run_permit(
+            user_id, submissions[0], "thread-0"
+        ) == "MISSING_OR_EXPIRED"
+        assert (
+            await redis_limits.admit_run(user_id, submissions[3], "thread-3", [])
+        ).allowed is True
+    finally:
+        await _delete_user_keys(redis_service, user_id, submissions)
+
+
+@pytest.mark.asyncio
+async def test_run_admission_endpoint_returns_structured_active_threads(
+    redis_service,
+    monkeypatch,
+) -> None:
+    user_id = f"endpoint-user-{uuid4()}"
+    submission_id = str(uuid4())
+    active_ids = [str(uuid4()) for _ in range(3)]
+
+    class Threads:
+        async def search(self, **_kwargs):
+            return [{"thread_id": thread_id, "status": "busy"} for thread_id in active_ids]
+
+    async def authenticated(_authorization: str | None) -> str:
+        return user_id
+
+    request = _request(path="/run-admissions")
+    request.scope["app"] = SimpleNamespace(
+        state=SimpleNamespace(agent_client=SimpleNamespace(threads=Threads()))
+    )
+    monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated)
+    async def token_bucket(_user_id: str) -> database.TokenBucketRecord:
+        return database.TokenBucketRecord(
+            _user_id, 100_000_000, int(time.time() // 3600), 1
+        )
+
+    monkeypatch.setattr(database, "get_token_bucket", token_bucket)
+    try:
+        with pytest.raises(Exception) as caught:
+            await webapp.create_run_admission(
+                webapp.RunAdmissionRequest(submission_id=submission_id),
+                request,
+                None,
+            )
+        assert caught.value.status_code == 409
+        assert caught.value.detail == {
+            "code": "THREAD_CONCURRENCY_LIMIT",
+            "message": "最多同时运行 3 个会话，请等待或停止其中一个",
+            "limit": 3,
+            "retry_after_seconds": 0,
+            "active_thread_ids": active_ids,
+        }
+    finally:
+        await _delete_user_keys(redis_service, user_id, [submission_id])
+
+
+@pytest.mark.asyncio
+async def test_run_admission_endpoint_returns_token_budget_details(
+    redis_service,
+    monkeypatch,
+) -> None:
+    user_id = f"token-endpoint-user-{uuid4()}"
+    submission_id = str(uuid4())
+    current_hour = int(time.time() // 3600)
+
+    class Threads:
+        async def search(self, **_kwargs):
+            return []
+
+    async def authenticated(_authorization: str | None) -> str:
+        return user_id
+
+    async def token_bucket(_user_id: str) -> database.TokenBucketRecord:
+        return database.TokenBucketRecord(_user_id, -10_000_000, current_hour, 1)
+
+    request = _request(path="/run-admissions")
+    request.scope["app"] = SimpleNamespace(
+        state=SimpleNamespace(agent_client=SimpleNamespace(threads=Threads()))
+    )
+    monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated)
+    monkeypatch.setattr(database, "get_token_bucket", token_bucket)
+    try:
+        with pytest.raises(Exception) as caught:
+            await webapp.create_run_admission(
+                webapp.RunAdmissionRequest(submission_id=submission_id),
+                request,
+                None,
+            )
+        assert caught.value.status_code == 429
+        assert caught.value.detail["code"] == "TOKEN_BUDGET_EXHAUSTED"
+        assert caught.value.detail["balance_tokens"] == -10_000_000
+        assert caught.value.detail["capacity_tokens"] == 100_000_000
+        assert 3600 < caught.value.detail["retry_after_seconds"] <= 7200
+        assert caught.value.headers["Retry-After"] == str(
+            caught.value.detail["retry_after_seconds"]
+        )
+    finally:
+        await _delete_user_keys(redis_service, user_id, [submission_id])
+
+
+@pytest.mark.asyncio
+async def test_internal_child_marker_is_signed_and_single_use(redis_service) -> None:
+    user_id = f"user-{uuid4()}"
+    marker = redis_limits.issue_internal_run_marker(
+        user_id=user_id,
+        graph_id="crawl-worker",
+        parent_thread_id="parent-thread",
+        token_budget_session_id="root-run-a",
+    )
+    key = (
+        f"{redis_limits._KEY_PREFIX}:internal-used:"
+        f"{redis_limits._user_tag(user_id)}:{marker['nonce']}"
+    )
+    try:
+        assert await redis_limits.consume_internal_run_marker(
+            marker, user_id=user_id, graph_id="crawl-worker"
+        ) is True
+        assert await redis_limits.consume_internal_run_marker(
+            marker, user_id=user_id, graph_id="crawl-worker"
+        ) is False
+        forged = {**marker, "nonce": "forged"}
+        assert await redis_limits.consume_internal_run_marker(
+            forged, user_id=user_id, graph_id="crawl-worker"
+        ) is False
+        forged_session = {**marker, "token_budget_session_id": "other-run"}
+        assert await redis_limits.consume_internal_run_marker(
+            forged_session, user_id=user_id, graph_id="crawl-worker"
+        ) is False
+    finally:
+        await redis_service.delete(key)
+
+
+@pytest.mark.asyncio
+async def test_login_checks_ip_then_fallback_user_bucket(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def allow(scope: str, raw_key: str, **_kwargs) -> redis_limits.RateLimitDecision:
+        calls.append((scope, raw_key))
+        return redis_limits.RateLimitDecision(True, 1, 10, 0)
+
+    async def missing_user(_username: str):
+        return None
+
+    monkeypatch.setattr(redis_limits, "consume_sliding_window", allow)
+    monkeypatch.setattr(database, "get_user_by_username", missing_user)
+    payload = webapp.LoginRequest(username="MissingUser", password="wrong-password")
+    with pytest.raises(Exception) as caught:
+        await webapp.login(payload, _request(client_host="198.51.100.10"))
+    assert caught.value.status_code == 401
+    assert calls == [
+        ("login_ip", "198.51.100.10"),
+        ("login_user", "username:missinguser"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_login_also_keeps_both_rate_limit_counts(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    user = database.UserRecord(
+        id="user-a",
+        username="Alice",
+        is_system=False,
+        password_hash="test-password-hash",
+    )
+
+    async def allow(scope: str, raw_key: str, **_kwargs) -> redis_limits.RateLimitDecision:
+        calls.append((scope, raw_key))
+        return redis_limits.RateLimitDecision(True, len(calls), 10, 0)
+
+    async def find_user(_username: str) -> database.UserRecord:
+        return user
+
+    async def issue_token(_user: database.UserRecord) -> dict[str, object]:
+        return {"token": "token-a", "user": {"id": "user-a"}}
+
+    monkeypatch.setattr(redis_limits, "consume_sliding_window", allow)
+    monkeypatch.setattr(database, "get_user_by_username", find_user)
+    monkeypatch.setattr(webapp, "_issue_token", issue_token)
     monkeypatch.setattr(
         webapp,
-        "get_settings",
-        lambda: SimpleNamespace(
-            auth_register_limit=3,
-            auth_register_window_seconds=3600,
-        ),
+        "_PASSWORD_HASHER",
+        SimpleNamespace(verify=lambda *_args: True),
     )
+    payload = webapp.LoginRequest(username="Alice", password="correct-password")
+    await webapp.login(payload, _request(client_host="198.51.100.11"))
+    await webapp.login(payload, _request(client_host="198.51.100.11"))
+    assert calls == [
+        ("login_ip", "198.51.100.11"),
+        ("login_user", "user-a"),
+        ("login_ip", "198.51.100.11"),
+        ("login_user", "user-a"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_register_uses_redis_before_business_validation(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def allow(scope: str, *_args, **_kwargs) -> redis_limits.RateLimitDecision:
+        calls.append(scope)
+        return redis_limits.RateLimitDecision(True, 1, 3, 0)
+
+    monkeypatch.setattr(redis_limits, "consume_sliding_window", allow)
     payload = webapp.RegisterRequest(
         username="Alice",
         password="password-a",
         confirm_password="password-b",
     )
-    request = _request(client_host="198.51.100.20")
-
-    for _ in range(3):
-        with pytest.raises(Exception) as caught:
-            await webapp.register(payload, request)
-        assert caught.value.status_code == 422
-        assert caught.value.detail == "两次输入的密码不一致"
-
-    with pytest.raises(Exception) as limited:
-        await webapp.register(payload, request)
-    assert limited.value.status_code == 429
-    assert int(limited.value.headers["Retry-After"]) > 0
+    with pytest.raises(Exception) as caught:
+        await webapp.register(payload, _request(client_host="198.51.100.20"))
+    assert caught.value.status_code == 422
+    assert calls == ["auth_register"]
 
 
 @pytest.mark.asyncio
-async def test_create_run_limits_before_thread_claim(monkeypatch) -> None:
+async def test_create_run_requires_and_consumes_permit_before_claim(monkeypatch) -> None:
     claims: list[tuple[str, str]] = []
 
-    async def deny(*_args, **_kwargs) -> database.RateLimitDecision:
-        return database.RateLimitDecision(False, 11, 10, 27)
+    async def consume(*_args, **_kwargs) -> str:
+        return "CONSUMED"
 
     async def claim(thread_id: str, user_id: str) -> None:
         claims.append((thread_id, user_id))
 
-    monkeypatch.setattr(database, "consume_rate_limit", deny)
+    monkeypatch.setattr(redis_limits, "consume_run_permit", consume)
     monkeypatch.setattr(database, "claim_thread", claim)
-    monkeypatch.setattr(
-        auth_module,
-        "get_settings",
-        lambda: SimpleNamespace(agent_run_limit=10, agent_run_window_seconds=60),
-    )
     ctx = SimpleNamespace(user=SimpleNamespace(identity="user-a"))
-    value = {"thread_id": "thread-a", "metadata": {}}
+    value = {
+        "thread_id": "thread-a",
+        "metadata": {"deep_data_ui": {"submission_id": "submission-a"}},
+    }
+    await auth_module.create_run(ctx, value)
+    assert claims == [("thread-a", "user-a")]
+    assert value["metadata"]["owner"] == "user-a"
+    assert value["metadata"]["token_budget_session_id"] == "submission-a"
 
-    with pytest.raises(Exception) as caught:
-        await auth_module.create_run(ctx, value)
-
-    assert caught.value.status_code == 429
-    assert caught.value.headers["Retry-After"] == "27"
-    assert claims == []
-    assert value["metadata"] == {}
+    with pytest.raises(Exception) as missing:
+        await auth_module.create_run(ctx, {"thread_id": "thread-b", "metadata": {}})
+    assert missing.value.status_code == 403
+    assert missing.value.headers["X-Error-Code"] == "RUN_ADMISSION_REQUIRED"
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_storage_failure_closes_agent_run(monkeypatch) -> None:
+async def test_redis_failure_is_fail_closed_without_postgres_fallback(monkeypatch) -> None:
     async def fail(*_args, **_kwargs):
-        raise RuntimeError("database unavailable")
+        raise RuntimeError("redis unavailable")
 
-    monkeypatch.setattr(database, "consume_rate_limit", fail)
-    monkeypatch.setattr(
-        auth_module,
-        "get_settings",
-        lambda: SimpleNamespace(agent_run_limit=10, agent_run_window_seconds=60),
-    )
-    ctx = SimpleNamespace(user=SimpleNamespace(identity="user-a"))
-
+    monkeypatch.setattr(redis_limits, "consume_sliding_window", fail)
     with pytest.raises(Exception) as caught:
-        await auth_module.create_run(ctx, {"thread_id": "thread-a"})
-
+        await webapp._enforce_rate_limit(
+            scope="login_ip",
+            raw_key="127.0.0.1",
+            limit=10,
+            window_seconds=60,
+            detail="登录尝试过于频繁",
+            error_code="LOGIN_RATE_LIMITED",
+            request_id="request-a",
+        )
     assert caught.value.status_code == 503
+    assert caught.value.detail["code"] == "RATE_LIMIT_SERVICE_UNAVAILABLE"
+    assert not hasattr(database, "consume_rate_limit")
 
 
 def test_client_ip_uses_asgi_peer_and_ignores_forwarded_header() -> None:
