@@ -1,0 +1,41 @@
+# Version-control and CI metadata
+.git
+.github
+.gitignore
+
+# Local credentials and deployment-only configuration
+.env
+.env.*
+.secrets
+*.pem
+*.key
+
+# Python environments and caches
+.venv
+.uv-cache
+.pytest_cache
+.ruff_cache
+.mypy_cache
+**/__pycache__
+**/*.py[cod]
+
+# Runtime state and generated output
+.langgraph_api
+data
+dist
+output
+.redis-backups
+
+# Development, evaluation, and local infrastructure files
+tests
+evals
+docs
+infra
+scripts/dev.ps1
+compose*.yml
+compose*.yaml
+CLAUDE.md
+order.txt
+
+# The frontend will be published as a separate image.
+frontend
