@@ -46,9 +46,22 @@ def celery_broker_url() -> str:
     )
 
 
-celery_app = Celery(
+class _SecretFileCelery(Celery):
+    """Resolve the password-backed broker URL only when a connection is needed."""
+
+    def connection_for_read(self, url=None, **kwargs):
+        """Create a consumer connection without reading secrets during import."""
+
+        return super().connection_for_read(url or celery_broker_url(), **kwargs)
+
+    def connection_for_write(self, url=None, **kwargs):
+        """Create a producer connection without reading secrets during import."""
+
+        return super().connection_for_write(url or celery_broker_url(), **kwargs)
+
+
+celery_app = _SecretFileCelery(
     "deep-data-research-agent",
-    broker=celery_broker_url(),
     include=[
         "deep_data_research_agent.workers.tasks.memory",
         "deep_data_research_agent.workers.tasks.email",

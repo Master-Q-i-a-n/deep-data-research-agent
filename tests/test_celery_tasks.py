@@ -12,6 +12,7 @@ from deep_data_research_agent.infrastructure.workspace import (
     WorkspaceScope,
 )
 from deep_data_research_agent.tools.interaction import _SMTPDeliveryError
+from deep_data_research_agent.workers import app as celery_config
 from deep_data_research_agent.workers.app import celery_app
 from deep_data_research_agent.workers.tasks import email as celery_tasks
 
@@ -78,6 +79,30 @@ def test_celery_routes_use_three_explicit_queues() -> None:
     assert routes["ddra.maintenance.recover_memory"]["queue"] == "maintenance"
     assert celery_app.conf.task_ignore_result is True
     assert celery_app.conf.broker_transport_options["global_keyprefix"] == "ddra-celery:"
+
+
+def test_celery_defers_secret_file_read_until_connection(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    password_file = tmp_path / "missing-redis-password"
+    settings = Settings(
+        _env_file=None,
+        redis_password_file=password_file,
+    )
+    monkeypatch.setattr(celery_config, "get_settings", lambda: settings)
+
+    app = celery_config._SecretFileCelery("lazy-secret-test")
+
+    with pytest.raises(RuntimeError, match="无法读取 Redis 密钥文件"):
+        app.connection_for_write()
+
+    password_file.write_text("p" * 32, encoding="utf-8")
+    connection = app.connection_for_read()
+
+    assert connection.userid == "ddra-celery"
+    assert connection.password == "p" * 32
+    assert connection.virtual_host == "1"
 
 
 @pytest.mark.asyncio
