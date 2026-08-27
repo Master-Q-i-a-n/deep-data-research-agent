@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """使用 Python-Markdown 和 WeasyPrint 将 Markdown 转换为 PDF。"""
 
 from __future__ import annotations
