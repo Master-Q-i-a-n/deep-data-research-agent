@@ -6,11 +6,25 @@ x-backend-service: &backend-service
   env_file:
     - "${PRODUCTION_ENV_FILE:-.env.production}"
   environment:
-    # 应用和 Celery 在真正建立 Redis 连接时才读取该文件。
+    # 单机练习部署通过 Compose 服务名访问基础设施，不依赖公网数据库。
+    POSTGRES_URI: "postgresql://deep_data_research_agent_app:${POSTGRES_APP_PASSWORD:?请设置 POSTGRES_APP_PASSWORD}@postgres:5432/deep_data_research_agent"
+    MONGODB_URI: "mongodb://root:${MONGO_ROOT_PASSWORD:?请设置 MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin"
+    REDIS_URL: redis://redis:6379/0
+    REDIS_USERNAME: ddra
     REDIS_PASSWORD_FILE: /run/secrets/redis_password
+    CELERY_BROKER_URL: redis://redis:6379/1
+    CELERY_REDIS_USERNAME: ddra-celery
+    OPEN_SANDBOX_DOMAIN: opensandbox:8080
+    OPEN_SANDBOX_API_KEY: "${OPEN_SANDBOX_API_KEY:?请设置 OPEN_SANDBOX_API_KEY}"
+    OPEN_SANDBOX_PROTOCOL: http
+    OPEN_SANDBOX_USE_SERVER_PROXY: "true"
+    OPEN_SANDBOX_IMAGE: "${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}:sandbox-${IMAGE_TAG}"
     TZ: Asia/Shanghai
   secrets:
     - redis_password
+  extra_hosts:
+    # OpenSandbox bridge 模式返回宿主机动态端口，Linux 容器通过该名称访问。
+    - host.docker.internal:host-gateway
   networks:
     - application
   restart: unless-stopped
@@ -22,11 +36,193 @@ x-backend-service: &backend-service
       max-file: "5"
 
 services:
+  postgres:
+    image: postgres:18.4
+    restart: unless-stopped
+    shm_size: 256mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_ADMIN_PASSWORD:?请设置 POSTGRES_ADMIN_PASSWORD}"
+      POSTGRES_DB: postgres
+      TZ: Asia/Shanghai
+    volumes:
+      # PostgreSQL 18 官方镜像使用该数据卷根目录。
+      - postgres-data:/var/lib/postgresql
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+
+  postgres-init:
+    <<: *backend-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    healthcheck:
+      disable: true
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        printf '%s\n' \
+          "POSTGRES_ADMIN_URI=postgresql://postgres:$${POSTGRES_ADMIN_PASSWORD}@postgres:5432/postgres" \
+          "POSTGRES_MIGRATOR_PASSWORD=$${POSTGRES_MIGRATOR_PASSWORD}" \
+          "POSTGRES_APP_PASSWORD=$${POSTGRES_APP_PASSWORD}" \
+          > .env.postgres-admin
+        exec setup-agent-postgres
+
+  redis:
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        password="$$(tr -d '\r\n' < /run/secrets/redis_password)"
+        if [ "$${#password}" -lt 32 ]; then
+          echo "Redis password must contain at least 32 characters" >&2
+          exit 1
+        fi
+        umask 077
+        mkdir -p /run/redis
+        {
+          echo "user default off"
+          printf '%s\n' "user langgraph on >$${password} ~* &* +@all -@admin -@dangerous"
+          printf '%s\n' "user ddra on >$${password} ~ddra:* &* +ping +time +eval +evalsha +script|load +script|exists +zadd +zrem +zremrangebyscore +zcard +zrange +zscore +pexpire +pttl +set +get +getdel +del +unlink +hget +hset +hmget +hgetall +hdel"
+          printf '%s\n' "user ddra-celery on >$${password} ~ddra-celery:* &* +@all -@admin -@dangerous +eval +evalsha +script|load +script|exists"
+        } > /run/redis/users.acl
+        exec redis-server \
+          --bind 0.0.0.0 \
+          --protected-mode yes \
+          --appendonly yes \
+          --appendfsync everysec \
+          --maxmemory 256mb \
+          --maxmemory-policy noeviction \
+          --aclfile /run/redis/users.acl
+    volumes:
+      - redis-data:/data
+    secrets:
+      - redis_password
+    tmpfs:
+      - /run/redis:size=1m,mode=0700
+    networks:
+      - application
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'password="$$(cat /run/secrets/redis_password)"; REDISCLI_AUTH="$$password" redis-cli --user langgraph --no-auth-warning -n 2 ping | grep -qx PONG && REDISCLI_AUTH="$$password" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG && REDISCLI_AUTH="$$password" redis-cli --user ddra-celery --no-auth-warning -n 1 ping | grep -qx PONG'
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_ROOT_PASSWORD:?请设置 MONGO_ROOT_PASSWORD}"
+      TZ: Asia/Shanghai
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - application
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'mongosh --quiet --host 127.0.0.1 --username "$$MONGO_INITDB_ROOT_USERNAME" --password "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "quit(db.adminCommand({ping:1}).ok ? 0 : 2)"'
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+
+  sandbox-image-cache:
+    image: "${ACR_REGISTRY:?请设置 ACR_REGISTRY}/${ACR_NAMESPACE:?请设置 ACR_NAMESPACE}/${ACR_REPOSITORY:?请设置 ACR_REPOSITORY}:sandbox-${IMAGE_TAG:?请设置完整的 Git commit SHA}"
+    pull_policy: always
+    restart: "no"
+    entrypoint: ["/bin/true"]
+
+  opensandbox:
+    image: opensandbox/server:v0.2.2
+    restart: unless-stopped
+    depends_on:
+      # 先把私有 ACR 沙箱镜像缓存到宿主机，避免 Docker API 拉取时缺少鉴权。
+      sandbox-image-cache:
+        condition: service_completed_successfully
+    environment:
+      SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
+      OPENSANDBOX_SERVER_API_KEY: "${OPEN_SANDBOX_API_KEY:?请设置 OPEN_SANDBOX_API_KEY}"
+      TZ: Asia/Shanghai
+    volumes:
+      # OpenSandbox 通过宿主机 Docker Engine 创建、停止和删除沙箱容器。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - opensandbox-data:/var/lib/opensandbox
+    configs:
+      - source: opensandbox-config
+        target: /etc/opensandbox/config.toml
+    expose:
+      - "8080"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - application
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+
   api:
     <<: *backend-service
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      opensandbox:
+        condition: service_healthy
+    environment:
+      <<: &backend-environment
+        POSTGRES_URI: "postgresql://deep_data_research_agent_app:${POSTGRES_APP_PASSWORD}@postgres:5432/deep_data_research_agent"
+        MONGODB_URI: "mongodb://root:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin"
+        REDIS_URL: redis://redis:6379/0
+        REDIS_USERNAME: ddra
+        REDIS_PASSWORD_FILE: /run/secrets/redis_password
+        CELERY_BROKER_URL: redis://redis:6379/1
+        CELERY_REDIS_USERNAME: ddra-celery
+        OPEN_SANDBOX_DOMAIN: opensandbox:8080
+        OPEN_SANDBOX_API_KEY: "${OPEN_SANDBOX_API_KEY}"
+        OPEN_SANDBOX_PROTOCOL: http
+        OPEN_SANDBOX_USE_SERVER_PROXY: "true"
+        OPEN_SANDBOX_IMAGE: "${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}:sandbox-${IMAGE_TAG}"
+        TZ: Asia/Shanghai
+      DATABASE_URI: "postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@postgres:5432/postgres"
+    # LangGraph 运行时不支持密码文件，因此在进程启动前从 secret 构造 REDIS_URI。
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        redis_password="$$(tr -d '\r\n' < /run/secrets/redis_password)"
+        export REDIS_URI="redis://langgraph:$${redis_password}@redis:6379/2"
+        exec /storage/entrypoint.sh
     expose:
       - "8000"
-    # API 镜像自带健康检查，前端会等它就绪后再启动。
     stop_grace_period: 60s
 
   web:
@@ -48,6 +244,14 @@ services:
 
   celery-worker:
     <<: *backend-service
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    environment: *backend-environment
     # 后端镜像默认入口是 LangGraph API，Celery 服务必须显式覆盖入口。
     entrypoint: ["celery"]
     command:
@@ -64,6 +268,14 @@ services:
 
   celery-beat:
     <<: *backend-service
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    environment: *backend-environment
     entrypoint: ["celery"]
     command:
       - -A
@@ -83,8 +295,45 @@ networks:
     driver: bridge
 
 volumes:
+  postgres-data:
+  redis-data:
+  mongo-data:
+  opensandbox-data:
   celery-beat-data:
 
 secrets:
   redis_password:
     file: "${REDIS_PASSWORD_FILE_HOST:-./.secrets/redis_password}"
+
+configs:
+  opensandbox-config:
+    content: |
+      [server]
+      host = "0.0.0.0"
+      port = 8080
+
+      [log]
+      level = "INFO"
+
+      [runtime]
+      type = "docker"
+      execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.21"
+
+      [egress]
+      image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.5"
+
+      [docker]
+      network_mode = "bridge"
+      host_ip = "host.docker.internal"
+      port_range_min = 40000
+      port_range_max = 40200
+      drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+      no_new_privileges = true
+      pids_limit = 4096
+
+      [ingress]
+      mode = "direct"
+
+      [store]
+      type = "sqlite"
+      path = "/var/lib/opensandbox/opensandbox.db"

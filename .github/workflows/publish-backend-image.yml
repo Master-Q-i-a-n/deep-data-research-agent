@@ -67,3 +67,21 @@ jobs:
           cache-from: type=gha,scope=frontend-image
           cache-to: type=gha,mode=max,scope=frontend-image
           provenance: false
+
+      - name: Build and push sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./infra/sandbox/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:sandbox-${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:sandbox-latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=deep-data-research-agent-sandbox
+          cache-from: type=gha,scope=sandbox-image
+          cache-to: type=gha,mode=max,scope=sandbox-image
+          provenance: false
