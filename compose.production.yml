@@ -1,0 +1,90 @@
+name: deep-data-research-agent
+
+x-backend-service: &backend-service
+  image: "${ACR_REGISTRY:?请设置 ACR_REGISTRY}/${ACR_NAMESPACE:?请设置 ACR_NAMESPACE}/${ACR_REPOSITORY:?请设置 ACR_REPOSITORY}:${IMAGE_TAG:?请设置完整的 Git commit SHA}"
+  pull_policy: always
+  env_file:
+    - "${PRODUCTION_ENV_FILE:-.env.production}"
+  environment:
+    # 应用和 Celery 在真正建立 Redis 连接时才读取该文件。
+    REDIS_PASSWORD_FILE: /run/secrets/redis_password
+    TZ: Asia/Shanghai
+  secrets:
+    - redis_password
+  networks:
+    - application
+  restart: unless-stopped
+  init: true
+  logging: &default-logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  api:
+    <<: *backend-service
+    expose:
+      - "8000"
+    # API 镜像自带健康检查，前端会等它就绪后再启动。
+    stop_grace_period: 60s
+
+  web:
+    image: "${ACR_REGISTRY:?请设置 ACR_REGISTRY}/${ACR_NAMESPACE:?请设置 ACR_NAMESPACE}/${ACR_REPOSITORY:?请设置 ACR_REPOSITORY}:web-${IMAGE_TAG:?请设置完整的 Git commit SHA}"
+    pull_policy: always
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # 默认只开放给 ECS 本机，之后可由宿主机 Nginx 或负载均衡器提供 HTTPS。
+      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:80"
+    networks:
+      - application
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: Asia/Shanghai
+    logging: *default-logging
+
+  celery-worker:
+    <<: *backend-service
+    # 后端镜像默认入口是 LangGraph API，Celery 服务必须显式覆盖入口。
+    entrypoint: ["celery"]
+    command:
+      - -A
+      - deep_data_research_agent.workers.app:celery_app
+      - worker
+      - --pool=solo
+      - -Q
+      - memory,mail,maintenance
+      - --loglevel=INFO
+    healthcheck:
+      disable: true
+    stop_grace_period: 120s
+
+  celery-beat:
+    <<: *backend-service
+    entrypoint: ["celery"]
+    command:
+      - -A
+      - deep_data_research_agent.workers.app:celery_app
+      - beat
+      - --loglevel=INFO
+      - --schedule
+      - /var/lib/celery/celerybeat-schedule
+    volumes:
+      - celery-beat-data:/var/lib/celery
+    healthcheck:
+      disable: true
+    stop_grace_period: 30s
+
+networks:
+  application:
+    driver: bridge
+
+volumes:
+  celery-beat-data:
+
+secrets:
+  redis_password:
+    file: "${REDIS_PASSWORD_FILE_HOST:-./.secrets/redis_password}"
