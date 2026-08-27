@@ -221,6 +221,18 @@ services:
         redis_password="$$(tr -d '\r\n' < /run/secrets/redis_password)"
         export REDIS_URI="redis://langgraph:$${redis_password}@redis:6379/2"
         exec /storage/entrypoint.sh
+    # 基础镜像的健康检查会在独立进程中导入 REDIS_URI，无法读取入口脚本
+    # 动态导出的 secret。这里直接检查 API 监听端口，避免复制 Redis 密码。
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=3).close()"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
     expose:
       - "8000"
     stop_grace_period: 60s
