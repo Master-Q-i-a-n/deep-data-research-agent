@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from celery import Celery
+from celery.signals import worker_process_shutdown
 
 from deep_data_research_agent.core.config import get_settings
 
@@ -92,6 +93,17 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_process_shutdown.connect
+def _close_workspace_storage(**_kwargs) -> None:
+    """Close the per-process asynchronous OSS transport during worker shutdown."""
+
+    from deep_data_research_agent.infrastructure.sandbox import (
+        manager as sandbox_manager,
+    )
+
+    asyncio.run(sandbox_manager.SANDBOX_MANAGER.workspace_store.close())
 
 
 def publish_memory_job(job_id: str) -> None:

@@ -9,6 +9,7 @@ from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.infrastructure.mongodb.health import ping_mongodb
 from deep_data_research_agent.infrastructure.redis.client import ping_redis
+from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
 
 Check = Callable[[], Awaitable[None]]
 
@@ -28,11 +29,15 @@ async def readiness_checks() -> dict[str, str]:
     """Run independent core dependency checks concurrently."""
 
     timeout = get_settings().health_check_timeout_seconds
-    names = ("postgres", "redis", "mongodb")
+    names = ("postgres", "redis", "mongodb", "workspace_storage")
     results = await asyncio.gather(
         _run_check(database.check_database_ready, timeout),
         _run_check(ping_redis, timeout),
         _run_check(ping_mongodb, timeout),
+        _run_check(
+            sandbox_manager.SANDBOX_MANAGER.workspace_store.check_ready,
+            timeout,
+        ),
     )
     return dict(zip(names, results, strict=True))
 

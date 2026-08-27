@@ -11,7 +11,7 @@ import ssl
 from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import make_msgid
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import Annotated
 
 from langchain.tools import ToolRuntime, tool
@@ -22,12 +22,13 @@ from deep_data_research_agent.artifacts.service import (
     DOWNLOADABLE_SUFFIXES,
     ArtifactError,
     build_markdown_bundle,
-    resolve_download_path,
+    resolve_download_object,
 )
 from deep_data_research_agent.core.config import Settings, get_settings
 from deep_data_research_agent.core.identity import user_identity
 from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.infrastructure.workspace import WorkspaceScope
 from deep_data_research_agent.workers.app import publish_email_delivery
 
 logger = logging.getLogger(__name__)
@@ -188,22 +189,25 @@ def _build_report_email(
     return email
 
 
-def _load_report_attachments(
-    root: Path,
+async def _load_report_attachments(
+    scope: WorkspaceScope,
     pdf_path: str,
     markdown_path: str,
 ) -> tuple[str, bytes, str, bytes]:
-    """Resolve and read report attachments outside the async event loop."""
+    """Resolve and read report attachments from durable workspace storage."""
 
-    # Path resolution, stat calls, recursive directory scans, and file reads are
-    # all blocking operations. Keep the complete filesystem workflow in one
-    # worker-thread boundary so LangGraph Server's BlockBuster remains satisfied.
-    pdf_file = resolve_download_path(root, pdf_path)
-    if pdf_file.suffix.lower() != ".pdf":
+    store = sandbox_manager.SANDBOX_MANAGER.workspace_store
+    pdf_file = await resolve_download_object(store, scope, pdf_path)
+    pdf_relative = sandbox_manager.workspace_relative_path(pdf_file.path)
+    if pdf_relative.suffix.lower() != ".pdf":
         raise ValueError("PDF 报告文件类型无效。")
-    pdf_content = pdf_file.read_bytes()
-    zip_content, zip_filename = build_markdown_bundle(root, markdown_path)
-    return pdf_file.name, pdf_content, zip_filename, zip_content
+    pdf_content = await store.read(scope, pdf_relative)
+    zip_content, zip_filename = await build_markdown_bundle(
+        store,
+        scope,
+        markdown_path,
+    )
+    return pdf_relative.name, pdf_content, zip_filename, zip_content
 
 
 def _send_smtp_message(

@@ -175,7 +175,13 @@ class Settings(BaseSettings):
     )
     failure_review_payload_ttl_hours: int = Field(default=24, ge=1, le=168)
 
+    workspace_storage_backend: Literal["local", "oss"] = "local"
     artifact_root: Path = Path("data/users")
+    oss_region: str = "cn-beijing"
+    oss_endpoint: str = "https://oss-cn-beijing-internal.aliyuncs.com"
+    oss_bucket_name: str = ""
+    oss_prefix: str = "users"
+    oss_ecs_ram_role: str = "DeepAgentsECSRole"
 
     @model_validator(mode="after")
     def validate_production_security(self) -> Settings:
@@ -188,6 +194,19 @@ class Settings(BaseSettings):
             raise ValueError("生产环境 REDIS_USERNAME 不能为空")
         if self.app_env == "production" and not self.celery_redis_username.strip():
             raise ValueError("生产环境 CELERY_REDIS_USERNAME 不能为空")
+        if self.app_env == "production" and self.workspace_storage_backend != "oss":
+            raise ValueError("生产环境 WORKSPACE_STORAGE_BACKEND 必须为 oss")
+        if self.workspace_storage_backend == "oss":
+            required_oss = {
+                "OSS_REGION": self.oss_region,
+                "OSS_ENDPOINT": self.oss_endpoint,
+                "OSS_BUCKET_NAME": self.oss_bucket_name,
+                "OSS_PREFIX": self.oss_prefix,
+                "OSS_ECS_RAM_ROLE": self.oss_ecs_ram_role,
+            }
+            missing = [name for name, value in required_oss.items() if not value.strip()]
+            if missing:
+                raise ValueError(f"OSS 工作区存储缺少配置：{'、'.join(missing)}")
         if not self.celery_broker_key_prefix or self.celery_broker_key_prefix.startswith(
             "ddra:"
         ):

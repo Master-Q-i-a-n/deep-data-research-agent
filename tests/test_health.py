@@ -46,6 +46,36 @@ async def test_readiness_returns_200_when_all_dependencies_are_ready(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_readiness_includes_workspace_storage(monkeypatch) -> None:
+    checked: list[str] = []
+
+    async def ready() -> None:
+        return None
+
+    async def workspace_ready() -> None:
+        checked.append("workspace")
+
+    monkeypatch.setattr(health.database, "check_database_ready", ready)
+    monkeypatch.setattr(health, "ping_redis", ready)
+    monkeypatch.setattr(health, "ping_mongodb", ready)
+    monkeypatch.setattr(
+        health.sandbox_manager.SANDBOX_MANAGER.workspace_store,
+        "check_ready",
+        workspace_ready,
+    )
+
+    checks = await health.readiness_checks()
+
+    assert checks == {
+        "postgres": "ok",
+        "redis": "ok",
+        "mongodb": "ok",
+        "workspace_storage": "ok",
+    }
+    assert checked == ["workspace"]
+
+
+@pytest.mark.asyncio
 async def test_probe_failures_do_not_expose_exception_text() -> None:
     async def fail() -> None:
         raise RuntimeError("mongodb://secret-host")

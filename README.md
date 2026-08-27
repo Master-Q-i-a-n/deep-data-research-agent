@@ -203,6 +203,29 @@ uv run celery -A deep_data_research_agent.workers.app:celery_app beat --loglevel
 `GET /email-deliveries/{delivery_id}` 查询 `queued/processing/retry/submitting/sent/failed/uncertain`
 状态。生产环境应在Linux上用独立进程管理worker和Beat，并确保同一环境只运行一个Beat。
 
+## 一行启动开发环境
+
+完成 PostgreSQL、MongoDB 和项目 `.env` 的首次配置后，可在仓库根目录一次启动 Redis、
+OpenSandbox、LangGraph、Celery Worker/Beat 和前端：
+
+```powershell
+.\scripts\dev.ps1
+```
+
+脚本会在 Redis 不健康时调用 Compose 初始化，并通过 WSL 的 `Debian` 发行版使用
+`~/.sandbox.toml` 启动 OpenSandbox；首次启动时还会安装前端依赖。各进程日志写入
+Windows 临时目录的 `deep-data-research-agent/dev-logs/`，避免日志触发 LangGraph 热重载。
+脚本会等待 OpenSandbox、LangGraph 和前端端口可用后再报告就绪。按 `Ctrl+C` 会停止本次启动的
+开发进程，但保留 Redis 容器。Alembic 迁移仍需
+在部署或数据库结构变更时单独执行，不会随开发启动自动运行。发行版或配置路径不同时可传入
+`-SandboxDistro` 和 `-SandboxConfig`。
+
+已有外部 Redis 或只需要后端进程时可使用：
+
+```powershell
+.\scripts\dev.ps1 -SkipRedis -SkipFrontend
+```
+
 ## OpenSandbox
 
 所有 Agent 运行前必须能够连接已经启动的 OpenSandbox Server。当前配置假设服务监听
@@ -216,8 +239,8 @@ OPEN_SANDBOX_TIMEOUT_SECONDS=1800
 
 每个 thread 按 `supervisor`、`crawl-worker` 组件创建或复用 Agent 沙箱；同步 data-analyst
 继承并共享 supervisor 沙箱与工作区。
-沙箱失效时会创建新实例，并从 `data/users/<user-id>/jobs/<thread-id>/<component>/workspace/` 恢复上一次
-成功快照。`supervisor` 沙箱已联网（Skill 下载和依赖安装可直接用 `execute`），
+沙箱失效时会创建新实例，并从配置的本地或 OSS 工作区存储恢复上一次成功快照。
+`supervisor` 沙箱已联网（Skill 下载和依赖安装可直接用 `execute`），
 `crawl-worker` 保持断网隔离，Tavily 请求始终由宿主进程完成。
 
 Skill 在 `/skill-manage/{name}/` 下创建或下载：下载支持公开 GitHub、HTTPS ZIP/TAR
@@ -303,9 +326,9 @@ Skill 流程已简化为一步分配：
 4. 目标 Agent 在下一轮对话中自动加载该 Skill；公共与用户 Skill 分别恢复到
    `/skills/public/{agent}/active/` 和 `/skills/user/{agent}/active/`。
 
-## 本地产物
+## 工作区持久化
 
-Agent 执行期间文件位于沙箱 `/workspace`；任务成功后按组件合并导出到：
+Agent 执行期间文件始终位于沙箱 `/workspace`。开发环境默认按组件合并导出到本地：
 
 ```text
 data/users/<user-id>/
@@ -317,6 +340,22 @@ data/users/<user-id>/
         ├── *_pages.jsonl
         └── crawl_report.md
 ```
+
+生产环境使用阿里云 OSS 保存同一份逻辑快照：
+
+```dotenv
+WORKSPACE_STORAGE_BACKEND=oss
+OSS_REGION=cn-beijing
+OSS_ENDPOINT=https://oss-cn-beijing-internal.aliyuncs.com
+OSS_BUCKET_NAME=your-private-bucket
+OSS_PREFIX=users
+OSS_ECS_RAM_ROLE=DeepAgentsECSRole
+```
+
+Object Key 为
+`users/<user-id>/jobs/<thread-id>/<component>/workspace/<relative-path>`。ECS 通过实例
+RAM Role 获取自动刷新的 STS 临时凭证；不要配置长期 AccessKey。沙箱重建时从持久化快照
+恢复 `/workspace`，用户上传、报告下载、ZIP 和邮件附件也使用同一存储后端。
 
 checkpoint 已存入 PostgreSQL；切换前已有的 `checkpoints.sqlite*` 仅作为本地回退备份保留，
 新版本不会读取或迁移这些文件。
@@ -349,6 +388,9 @@ uv run pytest
 # 需要真实 OpenSandbox Server 时再运行：
 $env:RUN_OPENSANDBOX_INTEGRATION='1'
 uv run pytest tests/test_sandbox_manager.py -k real_opensandbox
+# 仅在已绑定 RAM Role 的 ECS 上运行真实 OSS 集成测试：
+$env:RUN_OSS_INTEGRATION='1'
+uv run pytest tests/test_workspace_store.py -k real_oss
 Set-Location -LiteralPath '.\frontend'
 npm test -- --run
 npm run build

@@ -222,6 +222,22 @@ def test_runtime_thread_id_falls_back_to_tool_config() -> None:
     assert sandbox_manager.thread_id_from_runtime(runtime) == "tool-thread"
 
 
+def test_sandbox_metadata_values_satisfy_provider_label_limits(tmp_path) -> None:
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    thread_id = f"!{('long-thread_' * 8)}!"
+    manager._user_for_thread(thread_id, "user-with-a-private-identifier")
+
+    first = manager._sandbox_metadata(thread_id, "crawl-worker", False)
+    second = manager._sandbox_metadata(thread_id, "crawl-worker", False)
+
+    assert first == second
+    for value in first.values():
+        assert len(value) <= 63
+        assert value[0].isalnum()
+        assert value[-1].isalnum()
+        assert all(character.isalnum() or character in "-_." for character in value)
+
+
 @pytest.mark.asyncio
 async def test_missing_opensandbox_configuration_fails_explicitly(
     tmp_path,

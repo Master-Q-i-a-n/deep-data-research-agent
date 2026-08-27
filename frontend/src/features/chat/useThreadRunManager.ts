@@ -80,7 +80,6 @@ async function listRunsByStatus(
       status,
       limit: RUN_PAGE_SIZE,
       offset,
-      select: ["run_id", "thread_id", "assistant_id", "created_at", "updated_at", "status", "metadata", "multitask_strategy"],
       signal,
     });
     runs.push(...batch);

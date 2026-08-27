@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
@@ -21,6 +22,8 @@ from psycopg_pool import AsyncConnectionPool
 from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+
+logger = logging.getLogger(__name__)
 
 
 def configured_user_id(config: RunnableConfig | None) -> str | None:
@@ -126,12 +129,19 @@ class UserOwnedPostgresCheckpointer(BaseCheckpointSaver):
         owner = await database.get_thread_owner(thread_id)
         if owner is None:
             return
-        # External resources are removed first. If their idempotent cleanup
-        # fails, checkpoints and ownership remain so the deletion can be retried.
-        await sandbox_manager.SANDBOX_MANAGER.delete_thread_resources(
-            thread_id,
-            user_id=owner,
-        )
+        # 沙箱属于外部派生资源；服务暂时不可用时不能阻塞用户删除会话。
+        # 清理操作本身是幂等的，失败会保留告警供运维后续处理。
+        try:
+            await sandbox_manager.SANDBOX_MANAGER.delete_thread_resources(
+                thread_id,
+                user_id=owner,
+            )
+        except Exception:
+            logger.warning(
+                "删除会话时清理 Sandbox 资源失败，继续删除会话：thread_id=%s",
+                thread_id,
+                exc_info=True,
+            )
         await self._saver.adelete_thread(thread_id)
         await database.delete_thread_claim(thread_id, owner)
 

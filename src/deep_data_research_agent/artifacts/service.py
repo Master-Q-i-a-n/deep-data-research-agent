@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-import io
 import mimetypes
 import re
 import zipfile
-from pathlib import Path, PurePosixPath
+from io import BytesIO
+from pathlib import PurePosixPath
 
-from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.infrastructure.workspace import (
+    WorkspaceFileNotFound,
+    WorkspaceObject,
+    WorkspaceScope,
+    WorkspaceStore,
+    workspace_relative_path,
+)
 
 DOWNLOADABLE_SUFFIXES = frozenset(
     {".csv", ".json", ".md", ".pdf", ".png", ".xlsx", ".zip"}
@@ -36,35 +42,29 @@ class ArtifactError(ValueError):
         self.status_code = status_code
 
 
-def workspace_artifacts(root: Path) -> list[dict[str, object]]:
-    """List user-facing artifacts without following links outside the snapshot."""
+async def workspace_artifacts(
+    store: WorkspaceStore,
+    scope: WorkspaceScope,
+) -> list[dict[str, object]]:
+    """List user-facing artifacts while preserving the existing card policy."""
 
-    if not root.is_dir():
-        return []
-    resolved_root = root.resolve()
     artifacts: list[dict[str, object]] = []
-    for candidate in resolved_root.rglob("*"):
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
-        resolved = candidate.resolve()
-        if not resolved.is_relative_to(resolved_root):
-            continue
-        relative = resolved.relative_to(resolved_root)
+    for item in await store.list(scope):
+        relative = workspace_relative_path(item.path)
         if relative.parts[0] in {"input", "profile", "raw", "scripts"}:
             continue
         is_output = relative.parts[0] in {"charts", "output"}
-        is_report = "report" in resolved.stem.lower()
+        is_report = "report" in relative.stem.lower()
         if not is_output and not is_report:
             continue
-        # Images and data tables belong in the report ZIP rather than the card list.
-        if resolved.suffix.lower() not in ARTIFACT_CARD_SUFFIXES:
+        if relative.suffix.lower() not in ARTIFACT_CARD_SUFFIXES:
             continue
-        mime_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        mime_type = mimetypes.guess_type(relative.name)[0] or "application/octet-stream"
         artifacts.append(
             {
-                "path": f"/workspace/{relative.as_posix()}",
-                "filename": resolved.name,
-                "size": resolved.stat().st_size,
+                "path": item.path,
+                "filename": relative.name,
+                "size": item.size,
                 "mime_type": mime_type,
             }
         )
@@ -80,37 +80,39 @@ def workspace_artifacts(root: Path) -> list[dict[str, object]]:
     )
 
 
-def resolve_download_path(root: Path, virtual_path: str) -> Path:
-    """Resolve one virtual workspace path while rejecting traversal and links."""
+async def resolve_download_object(
+    store: WorkspaceStore,
+    scope: WorkspaceScope,
+    virtual_path: str,
+) -> WorkspaceObject:
+    """Resolve one allowed virtual workspace object."""
 
     try:
-        relative = sandbox_manager.workspace_relative_path(virtual_path)
+        relative = workspace_relative_path(virtual_path)
     except ValueError as exc:
         raise ArtifactError(str(exc)) from exc
     if relative.suffix.lower() not in DOWNLOADABLE_SUFFIXES:
         raise ArtifactError("下载文件类型不受支持")
-
-    resolved_root = root.resolve()
-    candidate = resolved_root / Path(*relative.parts)
-    if candidate.is_symlink():
-        raise ArtifactError("文件不存在", status_code=404)
-    target = candidate.resolve()
-    if not target.is_relative_to(resolved_root):
-        raise ArtifactError("下载路径越过工作区")
-    if not target.is_file():
-        raise ArtifactError("文件不存在", status_code=404)
-    return target
+    try:
+        return await store.stat(scope, relative)
+    except WorkspaceFileNotFound as exc:
+        raise ArtifactError("文件不存在", status_code=404) from exc
 
 
-def build_markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
-    """Build a Markdown ZIP containing referenced images and companion data files."""
+async def build_markdown_bundle(
+    store: WorkspaceStore,
+    scope: WorkspaceScope,
+    virtual_path: str,
+) -> tuple[bytes, str]:
+    """Build a Markdown ZIP from durable workspace objects."""
 
-    report_path = resolve_download_path(root, virtual_path)
-    if report_path.suffix.lower() != ".md":
+    report = await resolve_download_object(store, scope, virtual_path)
+    report_relative = workspace_relative_path(report.path)
+    if report_relative.suffix.lower() != ".md":
         raise ArtifactError("只有 Markdown 报告支持图片打包下载")
 
     try:
-        markdown = report_path.read_text(encoding="utf-8")
+        markdown = (await store.read(scope, report_relative)).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ArtifactError("Markdown 报告不是 UTF-8 编码", status_code=409) from exc
 
@@ -120,10 +122,9 @@ def build_markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
     ]
     sources.extend(match.group("src") for match in _HTML_IMAGE_PATTERN.finditer(markdown))
 
-    resolved_root = root.resolve()
-    report_parent = report_path.parent.resolve()
-    assets: dict[str, Path] = {}
-    included_files: set[Path] = set()
+    report_parent = report_relative.parent
+    assets: dict[str, PurePosixPath] = {}
+    included_files: set[PurePosixPath] = set()
     rewrites: dict[str, str] = {}
     for raw_source in sources:
         source = raw_source.strip().replace("\\", "/")
@@ -134,47 +135,60 @@ def build_markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
         if ".." in pure.parts:
             raise ArtifactError(f"报告图片路径不安全：{source}", status_code=409)
         if source_path.startswith("/workspace/"):
-            relative = sandbox_manager.workspace_relative_path(source_path)
-            archive_path = PurePosixPath(*relative.parts).as_posix()
-            candidate = resolved_root / Path(*relative.parts)
-            # The report is extracted at the ZIP root, where /workspace is absent.
+            try:
+                relative = workspace_relative_path(source_path)
+            except ValueError as exc:
+                raise ArtifactError(f"报告图片路径不安全：{source}", status_code=409) from exc
+            archive_path = relative.as_posix()
             rewrites[raw_source] = archive_path
         elif pure.is_absolute():
             raise ArtifactError(f"报告图片必须位于工作区：{source}", status_code=409)
         else:
+            relative = report_parent / pure
             archive_path = pure.as_posix()
-            candidate = report_parent / Path(*pure.parts)
 
-        if candidate.is_symlink():
-            raise ArtifactError(f"报告图片不能是符号链接：{source}", status_code=409)
-        image_path = candidate.resolve()
-        if not image_path.is_relative_to(resolved_root):
-            raise ArtifactError(f"报告图片越过工作区：{source}", status_code=409)
-        if not image_path.is_file():
-            raise ArtifactError(f"报告引用的图片不存在：{source}", status_code=409)
-        assets[archive_path] = image_path
-        included_files.add(image_path)
+        try:
+            await store.stat(scope, relative)
+        except WorkspaceFileNotFound as exc:
+            raise ArtifactError(f"报告引用的图片不存在：{source}", status_code=409) from exc
+        assets[archive_path] = relative
+        included_files.add(relative)
 
-    # Include analysis outputs beside the report even when they are not embedded.
-    for candidate in report_parent.rglob("*"):
-        if candidate.is_symlink() or not candidate.is_file():
+    # Include analysis outputs beside the report even when Markdown does not embed them.
+    parent_prefix = None if report_parent == PurePosixPath(".") else report_parent
+    for item in await store.list(scope, prefix=parent_prefix):
+        relative = workspace_relative_path(item.path)
+        if relative == report_relative or relative in included_files:
             continue
-        if candidate.suffix.lower() not in BUNDLE_COMPANION_SUFFIXES:
+        if relative.suffix.lower() not in BUNDLE_COMPANION_SUFFIXES:
             continue
-        resolved = candidate.resolve()
-        if not resolved.is_relative_to(resolved_root) or resolved in included_files:
+        if report_parent != PurePosixPath(".") and not relative.is_relative_to(
+            report_parent
+        ):
             continue
-        archive_path = PurePosixPath(*resolved.relative_to(report_parent).parts).as_posix()
-        assets[archive_path] = resolved
-        included_files.add(resolved)
+        archive_path = (
+            relative.relative_to(report_parent).as_posix()
+            if report_parent != PurePosixPath(".")
+            else relative.as_posix()
+        )
+        assets[archive_path] = relative
+        included_files.add(relative)
 
     bundled_markdown = markdown
     for original, replacement in rewrites.items():
         bundled_markdown = bundled_markdown.replace(original, replacement)
 
-    buffer = io.BytesIO()
+    buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(report_path.name, bundled_markdown.encode("utf-8"))
-        for archive_path, asset_path in sorted(assets.items()):
-            archive.write(asset_path, archive_path)
-    return buffer.getvalue(), f"{report_path.stem}-bundle.zip"
+        archive.writestr(report_relative.name, bundled_markdown.encode("utf-8"))
+        for archive_path, relative in sorted(assets.items()):
+            archive.writestr(archive_path, await store.read(scope, relative))
+    return buffer.getvalue(), f"{report_relative.stem}-bundle.zip"
+
+
+__all__ = [
+    "ArtifactError",
+    "build_markdown_bundle",
+    "resolve_download_object",
+    "workspace_artifacts",
+]

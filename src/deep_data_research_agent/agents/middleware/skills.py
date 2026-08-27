@@ -58,6 +58,14 @@ class SandboxLifecycleMiddleware(AgentMiddleware):
 
     async def aafter_agent(self, state, runtime):
         thread_id = sandbox_manager.thread_id_from_runtime(runtime)
+        # HITL resume or another worker process may not share the in-memory
+        # handle from before_agent. Re-adopt it from the Redis registry first.
+        await sandbox_manager.SANDBOX_MANAGER.ensure(
+            thread_id,
+            component=self._component,
+            network_enabled=self._network_enabled,
+            user_id=user_identity(runtime),
+        )
         await sandbox_manager.SANDBOX_MANAGER.export_workspace(
             thread_id,
             component=self._component,

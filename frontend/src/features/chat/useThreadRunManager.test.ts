@@ -96,6 +96,9 @@ describe("useThreadRunManager", () => {
     });
 
     expect(active).toEqual({ running, pending: [pendingEarly, pendingLate] });
+    // LangGraph API expects repeated `select` query parameters, while the
+    // current JS SDK serializes an array as one JSON string and receives 422.
+    expect(list.mock.calls.every(([, options]) => options.select === undefined)).toBe(true);
     expect(result.current.runtimes["thread-a"]).toMatchObject({
       activeRunId: "run-active",
       connection: "detached",

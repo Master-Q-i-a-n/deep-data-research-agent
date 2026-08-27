@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated
+from urllib.parse import quote
 from uuid import uuid4
 from xml.etree.ElementTree import ParseError
 from zoneinfo import ZoneInfo
@@ -23,7 +24,7 @@ from zoneinfo import ZoneInfo
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph_sdk import get_client
 from langsmith import traceable
 from openpyxl import load_workbook
@@ -43,7 +44,7 @@ from deep_data_research_agent.api.schemas import (
 from deep_data_research_agent.artifacts.service import (
     ArtifactError,
     build_markdown_bundle,
-    resolve_download_path,
+    resolve_download_object,
     workspace_artifacts,
 )
 from deep_data_research_agent.core.config import get_settings
@@ -56,6 +57,12 @@ from deep_data_research_agent.infrastructure.redis.lock import (
     DistributedLockUnavailable,
 )
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.infrastructure.workspace import (
+    WorkspaceFileNotFound,
+    WorkspaceScope,
+    WorkspaceStorageError,
+    workspace_relative_path,
+)
 from deep_data_research_agent.memory.service import MEMORY_QUEUE
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
@@ -79,6 +86,15 @@ _WINDOWS_RESERVED_NAMES = frozenset(
     | {f"LPT{number}" for number in range(1, 10)}
 )
 _WINDOWS_INVALID_CHARACTERS = frozenset('<>:"|?*')
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Encode non-ASCII download names using the standard RFC 5987 form."""
+
+    encoded = quote(filename)
+    if encoded == filename:
+        return f'attachment; filename="{filename}"'
+    return f"attachment; filename*=utf-8''{encoded}"
 
 
 def _sanitized_task_error(status: str, error: object = None) -> str | None:
@@ -181,37 +197,39 @@ async def _enforce_rate_limit(
         )
 
 
-def _workspace_artifacts(root: Path) -> list[dict[str, object]]:
+async def _workspace_artifacts(scope: WorkspaceScope) -> list[dict[str, object]]:
     """Keep the existing webapp helper name while sharing artifact policy."""
 
-    return workspace_artifacts(root)
+    return await workspace_artifacts(
+        sandbox_manager.SANDBOX_MANAGER.workspace_store,
+        scope,
+    )
 
 
-def _uploaded_files(root: Path) -> list[dict[str, object]]:
-    """List immutable input files from a user-owned local snapshot."""
+async def _uploaded_files(scope: WorkspaceScope) -> list[dict[str, object]]:
+    """List immutable input files from a user-owned durable snapshot."""
 
-    input_root = (root / "input").resolve()
-    if not input_root.is_dir():
-        return []
     files: list[dict[str, object]] = []
-    for candidate in sorted(input_root.iterdir()):
-        if candidate.is_symlink() or not candidate.is_file():
+    objects = await sandbox_manager.SANDBOX_MANAGER.workspace_store.list(
+        scope,
+        prefix="input",
+    )
+    for item in objects:
+        relative = workspace_relative_path(item.path)
+        if len(relative.parts) != 2 or relative.parts[0] != "input":
             continue
-        resolved = candidate.resolve()
-        if not resolved.is_relative_to(input_root):
-            continue
-        suffix = resolved.suffix.lower()
+        suffix = relative.suffix.lower()
         if suffix not in _UPLOAD_SUFFIXES:
             continue
         files.append(
             {
-                "name": resolved.name,
-                "path": f"/workspace/input/{resolved.name}",
-                "size": resolved.stat().st_size,
+                "name": relative.name,
+                "path": item.path,
+                "size": item.size,
                 "media_type": _UPLOAD_MEDIA_TYPES[suffix],
             }
         )
-    return files
+    return sorted(files, key=lambda item: str(item["name"]))
 
 
 def _validated_upload_name(value: str | None) -> str:
@@ -358,22 +376,37 @@ async def _upload_to_supervisor_workspace(
         raise
 
 
-def _download_path(root: Path, virtual_path: str) -> Path:
+async def _download_object(scope: WorkspaceScope, virtual_path: str):
     """Translate artifact validation failures into API responses."""
 
     try:
-        return resolve_download_path(root, virtual_path)
+        return await resolve_download_object(
+            sandbox_manager.SANDBOX_MANAGER.workspace_store,
+            scope,
+            virtual_path,
+        )
     except ArtifactError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
 
 
-def _markdown_bundle(root: Path, virtual_path: str) -> tuple[bytes, str]:
+async def _markdown_bundle(
+    scope: WorkspaceScope,
+    virtual_path: str,
+) -> tuple[bytes, str]:
     """Translate shared bundle validation failures into API responses."""
 
     try:
-        return build_markdown_bundle(root, virtual_path)
+        return await build_markdown_bundle(
+            sandbox_manager.SANDBOX_MANAGER.workspace_store,
+            scope,
+            virtual_path,
+        )
     except ArtifactError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
 
 
 def _user_payload(user: database.UserRecord) -> dict[str, object]:
@@ -406,6 +439,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if agent_client is not None:
             await agent_client.aclose()
         await MEMORY_QUEUE.close()
+        await sandbox_manager.SANDBOX_MANAGER.workspace_store.close()
         await close_mongodb_health_client()
         await redis_limits.close_redis()
         await database.close_database()
@@ -785,12 +819,15 @@ async def list_artifacts(
     user_id = await _authenticated_user_id(authorization)
     if await database.get_thread_owner(thread_id) != user_id:
         raise HTTPException(status_code=404, detail="会话不存在")
-    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+    scope = sandbox_manager.SANDBOX_MANAGER.workspace_scope(
         thread_id,
         "supervisor",
         user_id=user_id,
     )
-    return {"artifacts": await asyncio.to_thread(_workspace_artifacts, root)}
+    try:
+        return {"artifacts": await _workspace_artifacts(scope)}
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
 
 
 @app.get("/files/{thread_id}")
@@ -807,12 +844,15 @@ async def list_uploaded_files(
         user_id,
         request.app.state.agent_client,
     )
-    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+    scope = sandbox_manager.SANDBOX_MANAGER.workspace_scope(
         thread_id,
         "supervisor",
         user_id=user_id,
     )
-    return {"files": await asyncio.to_thread(_uploaded_files, root)}
+    try:
+        return {"files": await _uploaded_files(scope)}
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
 
 
 @app.post("/files/{thread_id}")
@@ -833,12 +873,15 @@ async def upload_files(
     if not files or len(files) > _MAX_UPLOAD_FILES:
         raise HTTPException(status_code=400, detail="一次最多上传 5 个文件")
 
-    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+    scope = sandbox_manager.SANDBOX_MANAGER.workspace_scope(
         thread_id,
         "supervisor",
         user_id=user_id,
     )
-    existing = await asyncio.to_thread(_uploaded_files, root)
+    try:
+        existing = await _uploaded_files(scope)
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
     existing_names = {str(item["name"]).casefold() for item in existing}
     if len(existing) + len(files) > _MAX_UPLOAD_FILES:
         raise HTTPException(status_code=400, detail="当前会话最多保留 5 个上传文件")
@@ -904,12 +947,15 @@ async def delete_uploaded_file(
     if len(relative.parts) != 2 or relative.parts[0] != "input":
         raise HTTPException(status_code=400, detail="只能删除 /workspace/input 下的文件")
 
-    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+    scope = sandbox_manager.SANDBOX_MANAGER.workspace_scope(
         thread_id,
         "supervisor",
         user_id=user_id,
     )
-    existing = await asyncio.to_thread(_uploaded_files, root)
+    try:
+        existing = await _uploaded_files(scope)
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
     if path not in {str(item["path"]) for item in existing}:
         raise HTTPException(status_code=404, detail="上传文件不存在")
     try:
@@ -939,20 +985,38 @@ async def download_artifact(
     thread_id: str,
     path: str = Query(..., min_length=1),
     authorization: str | None = Header(default=None),
-) -> FileResponse:
+) -> StreamingResponse:
     """Download one authenticated file from a Supervisor workspace snapshot."""
 
     user_id = await _authenticated_user_id(authorization)
     if await database.get_thread_owner(thread_id) != user_id:
         raise HTTPException(status_code=404, detail="会话不存在")
-    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+    scope = sandbox_manager.SANDBOX_MANAGER.workspace_scope(
         thread_id,
         "supervisor",
         user_id=user_id,
     )
-    target = await asyncio.to_thread(_download_path, root, path)
-    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    return FileResponse(target, media_type=media_type, filename=target.name)
+    item = await _download_object(scope, path)
+    try:
+        streamed, chunks = await sandbox_manager.SANDBOX_MANAGER.workspace_store.stream(
+            scope,
+            item.path,
+        )
+    except WorkspaceFileNotFound as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
+    filename = workspace_relative_path(item.path).name
+    media_type = (
+        mimetypes.guess_type(filename)[0]
+        or streamed.content_type
+        or "application/octet-stream"
+    )
+    headers = {
+        "Content-Disposition": _attachment_disposition(filename),
+        "Content-Length": str(streamed.size),
+    }
+    return StreamingResponse(chunks, media_type=media_type, headers=headers)
 
 
 @app.get("/artifacts/{thread_id}/bundle")
@@ -966,13 +1030,13 @@ async def download_markdown_bundle(
     user_id = await _authenticated_user_id(authorization)
     if await database.get_thread_owner(thread_id) != user_id:
         raise HTTPException(status_code=404, detail="会话不存在")
-    root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+    scope = sandbox_manager.SANDBOX_MANAGER.workspace_scope(
         thread_id,
         "supervisor",
         user_id=user_id,
     )
-    content, filename = await asyncio.to_thread(_markdown_bundle, root, path)
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    content, filename = await _markdown_bundle(scope, path)
+    headers = {"Content-Disposition": _attachment_disposition(filename)}
     return StreamingResponse(io.BytesIO(content), media_type="application/zip", headers=headers)
 
 

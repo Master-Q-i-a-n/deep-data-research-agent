@@ -39,14 +39,13 @@ async def _process_email_delivery(delivery_id: str) -> int | None:
     try:
         if not delivery.pdf_path or not delivery.markdown_path:
             raise ValueError("邮件投递缺少报告源路径")
-        root = sandbox_manager.SANDBOX_MANAGER.local_workspace_path(
+        scope = sandbox_manager.SANDBOX_MANAGER.workspace_scope(
             delivery.thread_id,
             "supervisor",
             user_id=delivery.user_id,
         )
-        pdf_filename, pdf_content, zip_filename, zip_content = await asyncio.to_thread(
-            _load_report_attachments,
-            root,
+        pdf_filename, pdf_content, zip_filename, zip_content = await _load_report_attachments(
+            scope,
             delivery.pdf_path,
             delivery.markdown_path,
         )

@@ -69,6 +69,7 @@ async def test_supervisor_lifecycle_ensures_and_exports(monkeypatch) -> None:
 
     assert manager.calls == [
         ("ensure", "thread-a", "supervisor", True, "local-user"),
+        ("ensure", "thread-a", "supervisor", True, "local-user"),
         ("export", "thread-a", "supervisor"),
     ]
 

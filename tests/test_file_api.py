@@ -10,6 +10,10 @@ from openpyxl import Workbook
 from deep_data_research_agent.api import app as webapp
 from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.infrastructure.workspace import (
+    LocalWorkspaceStore,
+    WorkspaceScope,
+)
 
 
 class _ThreadClient:
@@ -25,6 +29,14 @@ def _request():
             )
         )
     )
+
+
+def _install_workspace_store(monkeypatch, tmp_path: Path) -> Path:
+    store = LocalWorkspaceStore(tmp_path)
+    scope = WorkspaceScope(database.DEFAULT_USER_ID, "thread-a", "supervisor")
+    sandbox_manager.SANDBOX_MANAGER._thread_users.pop("thread-a", None)
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
+    return store.workspace_path(scope)
 
 
 @pytest.fixture
@@ -103,11 +115,7 @@ async def test_upload_files_returns_sandbox_paths(
 ) -> None:
     uploaded: list[tuple[str, bytes]] = []
 
-    monkeypatch.setattr(
-        sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: tmp_path / "workspace",
-    )
+    _install_workspace_store(monkeypatch, tmp_path)
 
     async def upload(_thread_id: str, _user_id: str, prepared):
         uploaded.extend(prepared)
@@ -133,14 +141,9 @@ async def test_upload_rejects_duplicate_existing_filename(
     tmp_path: Path,
     owned_thread,
 ) -> None:
-    workspace = tmp_path / "workspace"
+    workspace = _install_workspace_store(monkeypatch, tmp_path)
     (workspace / "input").mkdir(parents=True)
     (workspace / "input" / "Orders.csv").write_text("id\n1", encoding="utf-8")
-    monkeypatch.setattr(
-        sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: workspace,
-    )
     duplicate = UploadFile(file=io.BytesIO(b"id\n2"), filename="orders.CSV")
 
     with pytest.raises(HTTPException) as caught:
@@ -184,11 +187,7 @@ async def test_upload_enforces_file_count_and_size(
     tmp_path: Path,
     owned_thread,
 ) -> None:
-    monkeypatch.setattr(
-        sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: tmp_path / "workspace",
-    )
+    _install_workspace_store(monkeypatch, tmp_path)
     too_many = [
         UploadFile(file=io.BytesIO(b"id\n1"), filename=f"part-{index}.csv")
         for index in range(6)
@@ -210,14 +209,9 @@ async def test_upload_enforces_per_thread_total_size(
     tmp_path: Path,
     owned_thread,
 ) -> None:
-    workspace = tmp_path / "workspace"
+    workspace = _install_workspace_store(monkeypatch, tmp_path)
     (workspace / "input").mkdir(parents=True)
     (workspace / "input" / "existing.csv").write_bytes(b"123")
-    monkeypatch.setattr(
-        sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: workspace,
-    )
     monkeypatch.setattr(webapp, "_MAX_UPLOAD_TOTAL_BYTES", 4)
     extra = UploadFile(file=io.BytesIO(b"12"), filename="extra.csv")
 
@@ -233,14 +227,9 @@ async def test_delete_file_calls_owned_supervisor_sandbox(
     tmp_path: Path,
     owned_thread,
 ) -> None:
-    workspace = tmp_path / "workspace"
+    workspace = _install_workspace_store(monkeypatch, tmp_path)
     (workspace / "input").mkdir(parents=True)
     (workspace / "input" / "orders.csv").write_text("id\n1", encoding="utf-8")
-    monkeypatch.setattr(
-        sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: workspace,
-    )
     ensured: list[tuple[str, str, str]] = []
     deleted: list[tuple[str, str, str]] = []
 

@@ -7,6 +7,10 @@ import pytest
 from pydantic import SecretStr
 
 from deep_data_research_agent.core.config import Settings
+from deep_data_research_agent.infrastructure.workspace import (
+    LocalWorkspaceStore,
+    WorkspaceScope,
+)
 from deep_data_research_agent.tools.interaction import _SMTPDeliveryError
 from deep_data_research_agent.workers.app import celery_app
 from deep_data_research_agent.workers.tasks import email as celery_tasks
@@ -58,6 +62,15 @@ def _workspace(root: Path) -> None:
     (output / "metrics.csv").write_text("name,value\na,1\n", encoding="utf-8")
 
 
+def _install_worker_workspace(monkeypatch, tmp_path: Path, delivery) -> None:
+    store = LocalWorkspaceStore(tmp_path)
+    scope = WorkspaceScope(delivery.user_id, delivery.thread_id, "supervisor")
+    manager = celery_tasks.sandbox_manager.SANDBOX_MANAGER
+    manager._thread_users.pop(delivery.thread_id, None)
+    monkeypatch.setattr(manager, "workspace_store", store)
+    _workspace(store.workspace_path(scope))
+
+
 def test_celery_routes_use_three_explicit_queues() -> None:
     routes = celery_app.conf.task_routes
     assert routes["ddra.memory.process"]["queue"] == "memory"
@@ -72,8 +85,8 @@ async def test_email_worker_builds_complete_zip_and_marks_sent(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    _workspace(tmp_path)
     delivery = _delivery()
+    _install_worker_workspace(monkeypatch, tmp_path, delivery)
     submitted: list[str] = []
     finished: list[tuple[str, str, str | None]] = []
     sent_messages = []
@@ -101,11 +114,6 @@ async def test_email_worker_builds_complete_zip_and_marks_sent(
     monkeypatch.setattr(celery_tasks.database, "close_database", close_database)
     monkeypatch.setattr(celery_tasks, "get_settings", _settings)
     monkeypatch.setattr(celery_tasks, "_send_smtp_message", send)
-    monkeypatch.setattr(
-        celery_tasks.sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: tmp_path,
-    )
 
     assert await celery_tasks._process_email_delivery(delivery.idempotency_key) is None
     assert submitted == [delivery.idempotency_key]
@@ -128,8 +136,8 @@ async def test_email_worker_retries_only_known_pre_submit_disconnects(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    _workspace(tmp_path)
     delivery = _delivery(attempts=1)
+    _install_worker_workspace(monkeypatch, tmp_path, delivery)
     retries: list[tuple[int, str]] = []
 
     async def claim(_delivery_id):
@@ -154,11 +162,6 @@ async def test_email_worker_retries_only_known_pre_submit_disconnects(
     monkeypatch.setattr(celery_tasks.database, "close_database", close_database)
     monkeypatch.setattr(celery_tasks, "get_settings", _settings)
     monkeypatch.setattr(celery_tasks, "_send_smtp_message", disconnect)
-    monkeypatch.setattr(
-        celery_tasks.sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: tmp_path,
-    )
 
     assert await celery_tasks._process_email_delivery(delivery.idempotency_key) == 10
     assert retries == [(10, "暂时无法连接 SMTP")]
@@ -169,8 +172,8 @@ async def test_email_worker_marks_ambiguous_submission_uncertain(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    _workspace(tmp_path)
     delivery = _delivery()
+    _install_worker_workspace(monkeypatch, tmp_path, delivery)
     finished: list[str] = []
 
     async def claim(_delivery_id):
@@ -195,11 +198,6 @@ async def test_email_worker_marks_ambiguous_submission_uncertain(
     monkeypatch.setattr(celery_tasks.database, "close_database", close_database)
     monkeypatch.setattr(celery_tasks, "get_settings", _settings)
     monkeypatch.setattr(celery_tasks, "_send_smtp_message", disconnect)
-    monkeypatch.setattr(
-        celery_tasks.sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: tmp_path,
-    )
 
     assert await celery_tasks._process_email_delivery(delivery.idempotency_key) is None
     assert finished == ["uncertain"]

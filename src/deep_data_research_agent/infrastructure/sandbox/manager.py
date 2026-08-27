@@ -7,7 +7,6 @@ import json
 import logging
 import re
 import shlex
-import shutil
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -34,10 +33,19 @@ from deep_data_research_agent.infrastructure.redis.lock import (
     DistributedLockUnavailable,
     distributed_lock,
 )
+from deep_data_research_agent.infrastructure.workspace import (
+    LocalWorkspaceStore,
+    WorkspaceScope,
+    WorkspaceStore,
+    create_workspace_store,
+    virtual_workspace_path,
+)
+from deep_data_research_agent.infrastructure.workspace import (
+    workspace_relative_path as stored_workspace_relative_path,
+)
 from deep_data_research_agent.skill_system.storage import SKILL_AGENT_NAMES
 
 _SAFE_THREAD_ID = re.compile(r"[^A-Za-z0-9_.-]")
-_WORKSPACE_ROOT = PurePosixPath("/workspace")
 # OpenSandbox 的 Docker 冷启动会同时创建容器、端口和可选 egress sidecar。
 # 整个进程统一串行创建，避免不同 Agent 任务同时争用这些资源。
 _SANDBOX_CREATE_SEMAPHORE = asyncio.Semaphore(1)
@@ -54,6 +62,23 @@ def sanitize_thread_id(value: Any) -> str:
     """Return a filesystem-safe representation of a LangGraph thread ID."""
 
     return _SAFE_THREAD_ID.sub("_", str(value)) or "local"
+
+
+def _sandbox_metadata_value(value: Any) -> str:
+    """Return one OpenSandbox-compatible metadata label value.
+
+    OpenSandbox follows the Kubernetes label-value limit of 63 characters.
+    Long values keep a readable prefix plus a stable keyed suffix so provider
+    recovery queries use exactly the same value as sandbox creation.
+    """
+
+    original = str(value)
+    label = _SAFE_THREAD_ID.sub("_", original).strip("._-") or "value"
+    if len(label) <= 63:
+        return label
+    suffix = digest_key("sandbox-metadata", original)[:16]
+    prefix = label[:46].rstrip("._-") or "value"
+    return f"{prefix}-{suffix}"
 
 
 def thread_id_from_config(config: dict[str, Any] | None) -> str:
@@ -135,16 +160,7 @@ def _add_trace_metadata(
 def _workspace_relative(path: str) -> PurePosixPath:
     """Validate a path and return its location relative to ``/workspace``."""
 
-    candidate = PurePosixPath(path)
-    if candidate.is_absolute():
-        try:
-            candidate = candidate.relative_to(_WORKSPACE_ROOT)
-        except ValueError as exc:
-            raise ValueError(f"沙箱文件必须位于 /workspace：{path}") from exc
-
-    if not candidate.parts or any(part in {"", ".", ".."} for part in candidate.parts):
-        raise ValueError(f"无效的沙箱工作区路径：{path}")
-    return candidate
+    return stored_workspace_relative_path(path)
 
 
 def workspace_relative_path(path: str) -> PurePosixPath:
@@ -154,67 +170,7 @@ def workspace_relative_path(path: str) -> PurePosixPath:
 
 
 def _sandbox_path(relative: PurePosixPath) -> str:
-    return f"/workspace/{relative.as_posix()}"
-
-
-def _load_local_workspace(root: Path) -> list[tuple[str, bytes]]:
-    """Read a successful local snapshot in a worker thread."""
-
-    if not root.is_dir():
-        return []
-
-    files: list[tuple[str, bytes]] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
-            relative = PurePosixPath(path.relative_to(root).as_posix())
-            files.append((_sandbox_path(relative), path.read_bytes()))
-    return files
-
-
-def _write_local_workspace(
-    root: Path,
-    files: list[tuple[PurePosixPath, bytes]],
-) -> None:
-    """Merge a sandbox snapshot into the local artifact directory."""
-
-    root.mkdir(parents=True, exist_ok=True)
-    resolved_root = root.resolve()
-    for relative, content in files:
-        target = (root.joinpath(*relative.parts)).resolve()
-        if not target.is_relative_to(resolved_root):
-            raise ValueError(f"拒绝导出工作区之外的文件：{relative}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-
-
-def _delete_local_workspace_file(root: Path, relative: PurePosixPath) -> None:
-    """Delete one snapshot file without following links outside the workspace."""
-
-    resolved_root = root.resolve()
-    target = (root.joinpath(*relative.parts)).resolve()
-    if not target.is_relative_to(resolved_root):
-        raise ValueError(f"拒绝删除工作区之外的文件：{relative}")
-    if target.is_file() or target.is_symlink():
-        target.unlink()
-
-    # Remove empty parent directories but never remove the workspace root here.
-    parent = target.parent
-    while parent != resolved_root:
-        try:
-            parent.rmdir()
-        except OSError:
-            break
-        parent = parent.parent
-
-
-def _delete_local_job_root(root: Path, user_id: str, thread_id: str) -> None:
-    """Delete exactly one user's thread workspace tree."""
-
-    jobs_root = (root / user_id / "jobs").resolve()
-    target = (jobs_root / sanitize_thread_id(thread_id)).resolve()
-    if not target.is_relative_to(jobs_root):
-        raise ValueError("拒绝删除用户任务目录之外的路径")
-    shutil.rmtree(target, ignore_errors=True)
+    return virtual_workspace_path(relative)
 
 
 class _LinePreservingOpensandboxBackend(OpensandboxBackend):
@@ -314,12 +270,17 @@ class SandboxManager:
         *,
         settings: Settings | None = None,
         artifact_root: Path | None = None,
+        workspace_store: WorkspaceStore | None = None,
         coordination_enabled: bool = False,
     ) -> None:
         self._settings = settings or get_settings()
         configured_root = artifact_root or self._settings.artifact_root
         # Resolve once during module initialization, outside ASGI request handling.
         self._artifact_root = configured_root.expanduser().resolve()
+        self.workspace_store = workspace_store or create_workspace_store(
+            self._settings,
+            local_root=self._artifact_root,
+        )
         self._handles: dict[tuple[str, str, str], _SandboxHandle] = {}
         self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._thread_users: dict[str, str] = {}
@@ -350,15 +311,33 @@ class SandboxManager:
         *,
         user_id: str | None = None,
     ) -> Path:
-        """Return the user-scoped local workspace snapshot directory."""
+        """Return a local snapshot path for development-only callers."""
 
-        return (
-            self._artifact_root
-            / self._user_for_thread(thread_id, user_id)
-            / "jobs"
-            / sanitize_thread_id(thread_id)
-            / component
-            / "workspace"
+        owner = self._user_for_thread(thread_id, user_id)
+        if not isinstance(self.workspace_store, LocalWorkspaceStore):
+            raise TypeError("OSS 工作区存储没有本地持久化路径")
+        return self.workspace_store.workspace_path(
+            WorkspaceScope(
+                user_id=owner,
+                thread_id=sanitize_thread_id(thread_id),
+                component=component,
+            )
+        )
+
+    def workspace_scope(
+        self,
+        thread_id: str,
+        component: str,
+        *,
+        user_id: str | None = None,
+    ) -> WorkspaceScope:
+        """Return a validated durable-storage scope for one component."""
+
+        normalized_thread = sanitize_thread_id(thread_id)
+        return WorkspaceScope(
+            user_id=self._user_for_thread(normalized_thread, user_id),
+            thread_id=normalized_thread,
+            component=component,
         )
 
     def _key(
@@ -389,6 +368,16 @@ class SandboxManager:
             lock = asyncio.Lock()
             self._lifecycle_locks[key] = lock
         return lock
+
+    def _forget_thread_state(self, user_id: str, thread_id: str) -> None:
+        """Drop process-local coordination state after durable cleanup is attempted."""
+
+        if self._thread_users.get(thread_id) == user_id:
+            self._thread_users.pop(thread_id, None)
+        self._lifecycle_locks.pop((user_id, thread_id), None)
+        for key in list(self._locks):
+            if key[0] == user_id and key[2] == thread_id:
+                self._locks.pop(key, None)
 
     def _sandbox_keys(self, user_id: str, thread_id: str) -> tuple[str, str, str]:
         logical_id = digest_key(
@@ -426,10 +415,14 @@ class SandboxManager:
     ) -> dict[str, str]:
         user_id = self._thread_users.get(sanitize_thread_id(thread_id), "unbound")
         return {
-            "thread_id": sanitize_thread_id(thread_id),
-            "component": component,
-            "ddra_owner": digest_key("sandbox-owner", user_id),
-            "ddra_config": self._config_fingerprint(component, network_enabled),
+            "thread_id": _sandbox_metadata_value(sanitize_thread_id(thread_id)),
+            "component": _sandbox_metadata_value(component),
+            "ddra_owner": _sandbox_metadata_value(
+                digest_key("sandbox-owner", user_id)
+            ),
+            "ddra_config": _sandbox_metadata_value(
+                self._config_fingerprint(component, network_enabled)
+            ),
         }
 
     def _list_sandboxes_sync(self, metadata: dict[str, str]) -> list[SandboxInfo]:
@@ -950,16 +943,19 @@ class SandboxManager:
         *,
         component: str = "crawl-worker",
     ) -> int:
-        """Restore the last successful local snapshot into a new sandbox."""
+        """Restore the last successful durable snapshot into a new sandbox."""
 
         thread_id = sanitize_thread_id(thread_id)
         active_handle = handle or self._get_handle(thread_id, component)
-        files = await asyncio.to_thread(
-            _load_local_workspace,
-            self.local_workspace_path(thread_id, component),
-        )
-        if not files:
+        scope = self.workspace_scope(thread_id, component)
+        objects = await self.workspace_store.list(scope)
+        if not objects:
             return 0
+
+        files = [
+            (item.path, await self.workspace_store.read(scope, item.path))
+            for item in objects
+        ]
 
         directories = {
             str(PurePosixPath(path).parent)
@@ -986,7 +982,7 @@ class SandboxManager:
         component: str = "crawl-worker",
         persist: bool = False,
     ) -> None:
-        """Upload task files and optionally merge them into the local snapshot."""
+        """Upload task files and optionally merge them into the durable snapshot."""
 
         handle = self._get_handle(thread_id, component)
         normalized: list[tuple[str, bytes]] = []
@@ -1003,14 +999,9 @@ class SandboxManager:
         if failures:
             raise RuntimeError(f"写入沙箱文件失败：{'、'.join(failures)}")
         if persist:
-            snapshot_files = [
-                (_workspace_relative(path), content)
-                for path, content in normalized
-            ]
-            await asyncio.to_thread(
-                _write_local_workspace,
-                self.local_workspace_path(thread_id, component),
-                snapshot_files,
+            await self.workspace_store.write_many(
+                self.workspace_scope(thread_id, component),
+                [(_workspace_relative(path), content) for path, content in normalized],
             )
 
     async def delete_workspace_file(
@@ -1020,7 +1011,7 @@ class SandboxManager:
         *,
         component: str = "crawl-worker",
     ) -> None:
-        """Delete one workspace file from both sandbox and local snapshot."""
+        """Delete one workspace file from both sandbox and durable storage."""
 
         relative = _workspace_relative(path)
         sandbox_path = _sandbox_path(relative)
@@ -1036,9 +1027,8 @@ class SandboxManager:
         if result.exit_code not in {None, 0}:
             detail = result.output.strip() or f"退出码 {result.exit_code}"
             raise RuntimeError(f"删除沙箱文件失败：{detail}")
-        await asyncio.to_thread(
-            _delete_local_workspace_file,
-            self.local_workspace_path(thread_id, component),
+        await self.workspace_store.delete_file(
+            self.workspace_scope(thread_id, component),
             relative,
         )
 
@@ -1048,7 +1038,7 @@ class SandboxManager:
         *,
         user_id: str,
     ) -> None:
-        """Destroy active sandboxes and delete one thread's local workspaces."""
+        """Destroy active sandboxes and delete one thread's durable workspaces."""
 
         normalized_thread = sanitize_thread_id(thread_id)
         self._user_for_thread(normalized_thread, user_id)
@@ -1100,8 +1090,10 @@ class SandboxManager:
                         targets.setdefault(handle.sandbox.id, set()).add(key[1])
 
                     owner_metadata = {
-                        "thread_id": normalized_thread,
-                        "ddra_owner": digest_key("sandbox-owner", user_id),
+                        "thread_id": _sandbox_metadata_value(normalized_thread),
+                        "ddra_owner": _sandbox_metadata_value(
+                            digest_key("sandbox-owner", user_id)
+                        ),
                     }
                     provider_infos = await asyncio.to_thread(
                         self._list_sandboxes_sync, owner_metadata
@@ -1142,19 +1134,16 @@ class SandboxManager:
                             "销毁任务 Sandbox 失败：" + "；".join(destroy_errors)
                         )
                     await client.delete(registry_key)
-
-            await asyncio.to_thread(
-                _delete_local_job_root,
-                self._artifact_root,
-                user_id,
-                normalized_thread,
-            )
-            if self._thread_users.get(normalized_thread) == user_id:
-                self._thread_users.pop(normalized_thread, None)
-            self._lifecycle_locks.pop((user_id, normalized_thread), None)
-            for key in list(self._locks):
-                if key[0] == user_id and key[2] == normalized_thread:
-                    self._locks.pop(key, None)
+                    lease.ensure_owned()
+                    try:
+                        # Keep durable prefix deletion inside the distributed
+                        # lifecycle lock so a concurrent restore cannot race it.
+                        await self.workspace_store.delete_thread(
+                            user_id,
+                            normalized_thread,
+                        )
+                    finally:
+                        self._forget_thread_state(user_id, normalized_thread)
             return
 
         matching_keys = [
@@ -1177,14 +1166,10 @@ class SandboxManager:
                         destroy_errors.append(str(exc))
             self._locks.pop(key, None)
 
-        await asyncio.to_thread(
-            _delete_local_job_root,
-            self._artifact_root,
-            user_id,
-            normalized_thread,
-        )
-        if self._thread_users.get(normalized_thread) == user_id:
-            self._thread_users.pop(normalized_thread, None)
+        try:
+            await self.workspace_store.delete_thread(user_id, normalized_thread)
+        finally:
+            self._forget_thread_state(user_id, normalized_thread)
         if destroy_errors:
             raise RuntimeError(
                 "销毁任务沙箱失败：" + "；".join(destroy_errors)
@@ -1303,9 +1288,8 @@ class SandboxManager:
         if failures:
             raise RuntimeError(f"导出沙箱文件失败：{'、'.join(failures)}")
 
-        await asyncio.to_thread(
-            _write_local_workspace,
-            self.local_workspace_path(thread_id, component),
+        await self.workspace_store.write_many(
+            self.workspace_scope(thread_id, component),
             downloaded,
         )
         _add_trace_metadata(

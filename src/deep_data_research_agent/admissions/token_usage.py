@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -11,10 +12,14 @@ from uuid import uuid4
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, BaseMessage
+from langgraph.config import get_config
 
 from deep_data_research_agent.admissions import redis_limits
 from deep_data_research_agent.core.config import get_settings
-from deep_data_research_agent.core.identity import user_identity_from_config
+from deep_data_research_agent.core.identity import (
+    user_identity,
+    user_identity_from_config,
+)
 from deep_data_research_agent.database import repository as database
 
 logger = logging.getLogger(__name__)
@@ -70,7 +75,10 @@ def _output_reservation(model: Any, model_settings: Mapping[str, Any] | None) ->
     return get_settings().token_reservation_output_tokens
 
 
-def _usage_from_message(message: AIMessage, model: Any) -> tuple[int, int, int, str]:
+async def _usage_from_message(
+    message: AIMessage,
+    model: Any,
+) -> tuple[int, int, int, str]:
     usage = message.usage_metadata or {}
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
@@ -79,7 +87,7 @@ def _usage_from_message(message: AIMessage, model: Any) -> tuple[int, int, int, 
         return input_tokens, output_tokens, total_tokens, "provider"
     if input_tokens > 0 or output_tokens > 0:
         return input_tokens, output_tokens, input_tokens + output_tokens, "provider"
-    estimated_output = estimate_tokens(model, [message])
+    estimated_output = await asyncio.to_thread(estimate_tokens, model, [message])
     return 0, estimated_output, estimated_output, "estimated"
 
 
@@ -121,7 +129,8 @@ async def _reserve(
     root_run_id: str | None,
     thread_id: str | None,
 ) -> database.TokenUsageReservation:
-    reserved = estimate_tokens(model, messages) + _output_reservation(model, model_settings)
+    estimated_input = await asyncio.to_thread(estimate_tokens, model, messages)
+    reserved = estimated_input + _output_reservation(model, model_settings)
     reservation = await database.reserve_model_tokens(
         call_id=str(uuid4()),
         user_id=user_id,
@@ -163,9 +172,21 @@ class TokenUsageMiddleware(AgentMiddleware):
         self._agent_name = agent_name
 
     async def awrap_model_call(self, request: ModelRequest, handler) -> ModelResponse:
-        config = request.runtime.config if request.runtime is not None else {}
-        user_id = user_identity_from_config(config)
+        # LangGraph Runtime intentionally has no `config` attribute. Runnable
+        # configuration remains available through the context variable.
+        try:
+            config = get_config()
+        except RuntimeError:
+            config = getattr(request.runtime, "config", {}) or {}
+        user_id = (
+            user_identity(request.runtime)
+            if request.runtime is not None
+            else user_identity_from_config(config)
+        )
         root_run_id, thread_id = _runtime_fields(config)
+        execution_info = getattr(request.runtime, "execution_info", None)
+        root_run_id = root_run_id or getattr(execution_info, "run_id", None)
+        thread_id = thread_id or getattr(execution_info, "thread_id", None)
         messages = ([request.system_message] if request.system_message else []) + list(
             request.messages
         )
@@ -180,9 +201,10 @@ class TokenUsageMiddleware(AgentMiddleware):
         )
         try:
             response = await handler(request)
-        except Exception:
-            # The provider may have consumed tokens before raising. Conservatively
-            # keep the full reservation and make the ledger terminal.
+        except (Exception, asyncio.CancelledError):
+            # A server reload cancels in-flight calls with CancelledError, which is
+            # outside Exception on modern Python. Keep the conservative reservation
+            # but always leave a terminal ledger row.
             await _settle(
                 reservation,
                 user_id=user_id,
@@ -201,10 +223,14 @@ class TokenUsageMiddleware(AgentMiddleware):
         if message is None:
             usage = (0, 0, reservation.reserved_tokens, "reserved")
         else:
-            usage = _usage_from_message(message, request.model)
+            usage = await _usage_from_message(message, request.model)
             if usage[3] == "estimated":
                 # Provider-less output estimates still need the already estimated input.
-                estimated_input = estimate_tokens(request.model, messages)
+                estimated_input = await asyncio.to_thread(
+                    estimate_tokens,
+                    request.model,
+                    messages,
+                )
                 usage = (estimated_input, usage[1], estimated_input + usage[1], "estimated")
         await _settle(
             reservation,
@@ -243,7 +269,7 @@ async def metered_model_ainvoke(
     )
     try:
         result = await model.ainvoke(input_value, config=config, **kwargs)
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         await _settle(
             reservation,
             user_id=user_id,
@@ -258,13 +284,15 @@ async def metered_model_ainvoke(
     if isinstance(result, Mapping) and isinstance(result.get("raw"), AIMessage):
         raw_message = result["raw"]
     if raw_message is None:
-        input_tokens = estimate_tokens(model, messages)
-        output_tokens = estimate_tokens(model, [result])
+        input_tokens, output_tokens = await asyncio.gather(
+            asyncio.to_thread(estimate_tokens, model, messages),
+            asyncio.to_thread(estimate_tokens, model, [result]),
+        )
         usage = (input_tokens, output_tokens, input_tokens + output_tokens, "estimated")
     else:
-        usage = _usage_from_message(raw_message, model)
+        usage = await _usage_from_message(raw_message, model)
         if usage[3] == "estimated":
-            input_tokens = estimate_tokens(model, messages)
+            input_tokens = await asyncio.to_thread(estimate_tokens, model, messages)
             usage = (input_tokens, usage[1], input_tokens + usage[1], "estimated")
     await _settle(
         reservation,

@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from langgraph.runtime import ExecutionInfo, Runtime
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
@@ -15,6 +16,110 @@ from deep_data_research_agent.api import auth as auth_module
 from deep_data_research_agent.core.config import Settings
 from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.database.models import Base
+
+
+@pytest.mark.asyncio
+async def test_token_usage_middleware_supports_runtime_without_config(monkeypatch) -> None:
+    """Modern LangGraph Runtime exposes execution info but no config attribute."""
+
+    captured: dict[str, object] = {}
+    reservation = SimpleNamespace(call_id="call-a", reserved_tokens=100)
+
+    async def reserve(**kwargs):
+        captured.update(kwargs)
+        return reservation
+
+    async def settle(_reservation, **kwargs):
+        captured["settled"] = kwargs
+
+    monkeypatch.setattr(token_usage, "_reserve", reserve)
+    monkeypatch.setattr(token_usage, "_settle", settle)
+    monkeypatch.setattr(
+        token_usage,
+        "get_config",
+        lambda: {
+            "configurable": {"thread_id": "thread-a"},
+            "metadata": {"token_budget_session_id": "submission-a"},
+        },
+    )
+    runtime = Runtime(
+        server_info=SimpleNamespace(user=SimpleNamespace(identity="user-a")),
+        execution_info=ExecutionInfo(
+            checkpoint_id="checkpoint-a",
+            checkpoint_ns="",
+            task_id="task-a",
+            thread_id="thread-a",
+            run_id="run-a",
+        ),
+    )
+    request = token_usage.ModelRequest(
+        model=SimpleNamespace(model_name="test-model"),
+        messages=[token_usage.AIMessage(content="hello")],
+        runtime=runtime,
+    )
+
+    async def handler(_request):
+        return token_usage.ModelResponse(
+            result=[
+                token_usage.AIMessage(
+                    content="ok",
+                    usage_metadata={
+                        "input_tokens": 3,
+                        "output_tokens": 2,
+                        "total_tokens": 5,
+                    },
+                )
+            ]
+        )
+
+    response = await token_usage.TokenUsageMiddleware(
+        agent_name="supervisor"
+    ).awrap_model_call(request, handler)
+
+    assert response.result[0].content == "ok"
+    assert captured["user_id"] == "user-a"
+    assert captured["root_run_id"] == "submission-a"
+    assert captured["thread_id"] == "thread-a"
+    assert captured["settled"]["total_tokens"] == 5  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_token_usage_middleware_settles_cancelled_call(monkeypatch) -> None:
+    """Server shutdown must not leave a reserved model call pending forever."""
+
+    captured: dict[str, object] = {}
+    reservation = SimpleNamespace(call_id="call-cancelled", reserved_tokens=321)
+
+    async def reserve(**_kwargs):
+        return reservation
+
+    async def settle(_reservation, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(token_usage, "_reserve", reserve)
+    monkeypatch.setattr(token_usage, "_settle", settle)
+    monkeypatch.setattr(token_usage, "get_config", dict)
+    request = token_usage.ModelRequest(
+        model=SimpleNamespace(model_name="test-model"),
+        messages=[token_usage.AIMessage(content="hello")],
+        runtime=Runtime(
+            server_info=SimpleNamespace(
+                user=SimpleNamespace(identity=database.DEFAULT_USER_ID)
+            )
+        ),
+    )
+
+    async def handler(_request):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await token_usage.TokenUsageMiddleware(
+            agent_name="supervisor"
+        ).awrap_model_call(request, handler)
+
+    assert captured["total_tokens"] == 321
+    assert captured["usage_source"] == "reserved"
+    assert captured["status"] == "failed"
 
 
 async def _noop_schema_check(**_kwargs) -> None:
@@ -108,7 +213,12 @@ def test_production_requires_stable_rate_limit_secret() -> None:
     with pytest.raises(ValueError, match="至少需要 32 个字符"):
         Settings(app_env="production", rate_limit_key_secret="short")
 
-    settings = Settings(app_env="production", rate_limit_key_secret="x" * 32)
+    settings = Settings(
+        app_env="production",
+        rate_limit_key_secret="x" * 32,
+        workspace_storage_backend="oss",
+        oss_bucket_name="test-bucket",
+    )
     assert settings.app_env == "production"
 
 

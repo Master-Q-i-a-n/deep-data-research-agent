@@ -117,6 +117,40 @@ async def test_delete_thread_removes_checkpoint_and_owner_claim(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_delete_thread_continues_when_external_resource_cleanup_fails(
+    monkeypatch,
+) -> None:
+    """An unavailable sandbox service must not make conversations undeletable."""
+
+    deleted_claims: list[tuple[str, str]] = []
+
+    async def get_owner(_thread_id: str) -> str:
+        return "user-a"
+
+    async def delete_claim(thread_id: str, user_id: str) -> None:
+        deleted_claims.append((thread_id, user_id))
+
+    async def fail_delete_resources(_thread_id: str, *, user_id: str) -> None:
+        del user_id
+        raise ConnectionError("sandbox unavailable")
+
+    monkeypatch.setattr(database, "get_thread_owner", get_owner)
+    monkeypatch.setattr(database, "delete_thread_claim", delete_claim)
+    monkeypatch.setattr(
+        sandbox_manager.SANDBOX_MANAGER,
+        "delete_thread_resources",
+        fail_delete_resources,
+    )
+    saver = FakePostgresSaver()
+    checkpointer = UserOwnedPostgresCheckpointer(saver)  # type: ignore[arg-type]
+
+    await checkpointer.adelete_thread("thread-a")
+
+    assert saver.deleted_threads == ["thread-a"]
+    assert deleted_claims == [("thread-a", "user-a")]
+
+
+@pytest.mark.asyncio
 async def test_copy_failure_rolls_back_target_claim(monkeypatch) -> None:
     deleted_claims: list[tuple[str, str]] = []
 

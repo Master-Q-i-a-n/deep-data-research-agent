@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.runtime import ExecutionInfo, Runtime
 from langgraph.types import Command
 from pydantic import ValidationError
 
@@ -364,13 +365,28 @@ async def test_failure_review_middleware_enqueues_compact_bundle_once(monkeypatc
             raise AssertionError("工具轨迹不应超限")
 
     monkeypatch.setattr(memory, "MEMORY_QUEUE", Queue())
+    monkeypatch.setattr(
+        memory,
+        "get_config",
+        lambda: {"metadata": {"token_budget_session_id": "submission-a"}},
+    )
     middleware = memory.FailureReviewMiddleware(
         agent_name="data-analyst",
         reviewable_tools={"database_query_preview"},
     )
+    runtime = Runtime(
+        server_info=SimpleNamespace(user=SimpleNamespace(identity="user-a")),
+        execution_info=ExecutionInfo(
+            checkpoint_id="checkpoint-a",
+            checkpoint_ns="",
+            task_id="task-a",
+            thread_id="thread-a",
+            run_id="run-a",
+        ),
+    )
     result = await middleware.aafter_agent(
         {"messages": _review_messages(result="空结果", final="分析完成")},
-        _runtime(),
+        runtime,
     )
 
     assert result is None
@@ -378,8 +394,10 @@ async def test_failure_review_middleware_enqueues_compact_bundle_once(monkeypatc
     assert calls[0]["kind"] == "failure_review"
     assert calls[0]["scope"] == "data-analyst"
     assert calls[0]["payload"]["bundle"]["tool_events"][0]["tool_name"] == "database_query_preview"
-    assert calls[0]["source_user_hash"] == memory.user_hash(_runtime())
+    assert calls[0]["source_user_hash"] == memory.user_hash(runtime)
     assert calls[0]["settings_generation"] == 0
+    assert calls[0]["billing_root_run_id"] == "submission-a"
+    assert calls[0]["billing_thread_id"] == "thread-a"
     assert len(calls[0]["idempotency_key"]) == 64
 
 

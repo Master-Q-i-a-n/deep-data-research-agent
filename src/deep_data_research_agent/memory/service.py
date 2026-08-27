@@ -29,6 +29,7 @@ from langchain_core.messages import (
     ToolMessage,
     message_to_dict,
 )
+from langgraph.config import get_config
 from langgraph.types import Command
 from langsmith import traceable
 from openai import APIConnectionError, APIStatusError, RateLimitError
@@ -1228,7 +1229,11 @@ class FailureReviewMiddleware(AgentMiddleware):
                 try:
                     thread_id = thread_id_from_runtime(runtime)
                 except (RuntimeError, ValueError, KeyError, AttributeError):
-                    configurable = (runtime.config or {}).get("configurable", {})
+                    try:
+                        runtime_config = get_config()
+                    except RuntimeError:
+                        runtime_config = getattr(runtime, "config", {}) or {}
+                    configurable = runtime_config.get("configurable", {})
                     thread_id = str(configurable.get("thread_id") or "unknown-thread")
                 thread_digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
                 fingerprint = hashlib.sha256(serialized).hexdigest()
@@ -1247,6 +1252,12 @@ class FailureReviewMiddleware(AgentMiddleware):
                         bundle_bytes=len(serialized),
                     )
                 else:
+                    try:
+                        runtime_config = get_config()
+                    except RuntimeError:
+                        runtime_config = getattr(runtime, "config", {}) or {}
+                    metadata = runtime_config.get("metadata", {}) or {}
+                    execution_info = getattr(runtime, "execution_info", None)
                     await MEMORY_QUEUE.enqueue(
                         kind="failure_review",
                         scope=self.agent_name,
@@ -1257,10 +1268,9 @@ class FailureReviewMiddleware(AgentMiddleware):
                         settings_generation=memory_settings.generation,
                         billing_user_id=user_identity(runtime),
                         billing_root_run_id=str(
-                            ((runtime.config or {}).get("metadata", {}) or {}).get(
-                                "token_budget_session_id"
-                            )
-                            or ((runtime.config or {}).get("metadata", {}) or {}).get("run_id")
+                            metadata.get("token_budget_session_id")
+                            or metadata.get("run_id")
+                            or getattr(execution_info, "run_id", None)
                             or ""
                         ),
                         billing_thread_id=thread_id,

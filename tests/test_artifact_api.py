@@ -8,6 +8,10 @@ from fastapi import HTTPException
 from deep_data_research_agent.api import app as webapp
 from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.infrastructure.workspace import (
+    LocalWorkspaceStore,
+    WorkspaceScope,
+)
 
 
 @pytest.mark.asyncio
@@ -15,7 +19,9 @@ async def test_artifact_list_and_download_use_owned_workspace(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "workspace"
+    store = LocalWorkspaceStore(tmp_path)
+    scope = WorkspaceScope(database.DEFAULT_USER_ID, "artifact-thread", "supervisor")
+    workspace = store.workspace_path(scope)
     output = workspace / "output"
     charts = output / "charts"
     metrics = output / "metrics"
@@ -43,28 +49,28 @@ async def test_artifact_list_and_download_use_owned_workspace(
         return database.DEFAULT_USER_ID
 
     monkeypatch.setattr(database, "get_thread_owner", owner)
-    monkeypatch.setattr(
-        sandbox_manager.SANDBOX_MANAGER,
-        "local_workspace_path",
-        lambda *_args, **_kwargs: workspace,
-    )
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
 
-    listing = await webapp.list_artifacts("thread-a", None)
+    listing = await webapp.list_artifacts("artifact-thread", None)
     assert [item["path"] for item in listing["artifacts"]] == [
         "/workspace/output/final_report.pdf",
         "/workspace/output/final_report.md",
     ]
 
     response = await webapp.download_artifact(
-        "thread-a",
+        "artifact-thread",
         "/workspace/output/final_report.md",
         None,
     )
-    assert Path(response.path) == output / "final_report.md"
-    assert response.filename == "final_report.md"
+    downloaded = b"".join([chunk async for chunk in response.body_iterator])
+    assert downloaded.decode("utf-8").startswith("# 报告")
+    assert response.headers["content-length"] == str(
+        (output / "final_report.md").stat().st_size
+    )
+    assert 'filename="final_report.md"' in response.headers["content-disposition"]
 
-    content, filename = webapp._markdown_bundle(
-        workspace,
+    content, filename = await webapp._markdown_bundle(
+        scope,
         "/workspace/output/final_report.md",
     )
     assert filename == "final_report-bundle.zip"
@@ -94,25 +100,36 @@ async def test_artifact_api_hides_other_users_thread(monkeypatch) -> None:
     assert caught.value.status_code == 404
 
 
-def test_download_path_rejects_traversal(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_download_path_rejects_traversal(monkeypatch, tmp_path: Path) -> None:
+    store = LocalWorkspaceStore(tmp_path)
+    scope = WorkspaceScope(database.DEFAULT_USER_ID, "traversal-thread", "supervisor")
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
     with pytest.raises(HTTPException) as caught:
-        webapp._download_path(tmp_path, "/workspace/../secret.md")
+        await webapp._download_object(scope, "/workspace/../secret.md")
 
     assert caught.value.status_code == 400
 
 
-def test_markdown_bundle_rejects_missing_or_unsafe_images(tmp_path: Path) -> None:
-    report = tmp_path / "output" / "final_report.md"
-    report.parent.mkdir()
+@pytest.mark.asyncio
+async def test_markdown_bundle_rejects_missing_or_unsafe_images(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    store = LocalWorkspaceStore(tmp_path)
+    scope = WorkspaceScope(database.DEFAULT_USER_ID, "bundle-thread", "supervisor")
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
+    report = store.workspace_path(scope) / "output" / "final_report.md"
+    report.parent.mkdir(parents=True)
     report.write_text("![缺失](charts/missing.png)", encoding="utf-8")
 
     with pytest.raises(HTTPException) as missing:
-        webapp._markdown_bundle(tmp_path, "/workspace/output/final_report.md")
+        await webapp._markdown_bundle(scope, "/workspace/output/final_report.md")
     assert missing.value.status_code == 409
     assert "图片不存在" in str(missing.value.detail)
 
     report.write_text("![越界](../secret.png)", encoding="utf-8")
     with pytest.raises(HTTPException) as unsafe:
-        webapp._markdown_bundle(tmp_path, "/workspace/output/final_report.md")
+        await webapp._markdown_bundle(scope, "/workspace/output/final_report.md")
     assert unsafe.value.status_code == 409
     assert "路径不安全" in str(unsafe.value.detail)
