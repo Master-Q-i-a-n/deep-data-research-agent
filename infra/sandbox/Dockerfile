@@ -37,7 +37,8 @@ RUN apt-get update \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 
-COPY infra/sandbox/requirements.txt /tmp/sandbox-requirements.txt
+# 沙箱镜像使用 infra/sandbox 作为独立构建上下文。
+COPY requirements.txt /tmp/sandbox-requirements.txt
 
 RUN python -m pip install --index-url "${PYPI_INDEX_URL}" --upgrade pip \
     && python -m pip install --index-url "${PYPI_INDEX_URL}" --only-binary=:all: \
