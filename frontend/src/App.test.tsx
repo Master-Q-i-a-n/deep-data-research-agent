@@ -13,6 +13,7 @@ const cancelRun = vi.fn();
 const cancelQueuedRun = vi.fn();
 const clearQueue = vi.fn();
 let capturedOptions: Record<string, unknown> | null = null;
+let capturedClientConfig: Record<string, unknown> | null = null;
 
 type TestMessage = {
   id: string;
@@ -145,6 +146,10 @@ vi.mock("@langchain/react", () => ({
 
 vi.mock("@langchain/langgraph-sdk/client", () => ({
   Client: class MockClient {
+    constructor(config: Record<string, unknown>) {
+      capturedClientConfig = config;
+    }
+
     get runs() {
       return streamState.client.runs;
     }
@@ -209,13 +214,24 @@ afterEach(() => {
   clearQueue.mockReset();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   capturedOptions = null;
+  capturedClientConfig = null;
   window.history.replaceState({}, "", "http://localhost:5174/");
   window.localStorage.clear();
   window.sessionStorage.clear();
 });
 
 describe("研究工作台", () => {
+  it("将相对 API 地址解析为 LangGraph SDK 可使用的绝对地址", async () => {
+    vi.stubEnv("VITE_LANGGRAPH_API_URL", "/api");
+
+    render(<App />);
+    await screen.findByText("默认账户");
+
+    expect(capturedClientConfig?.apiUrl).toBe(`${window.location.origin}/api`);
+  });
+
   it("新任务取得 thread ID 后立即刷新左侧会话记录", async () => {
     let searchCount = 0;
     vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {

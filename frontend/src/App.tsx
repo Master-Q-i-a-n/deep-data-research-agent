@@ -878,7 +878,12 @@ function InterruptCard({
 }
 
 export default function App() {
-  const apiUrl = import.meta.env.VITE_LANGGRAPH_API_URL ?? "http://127.0.0.1:2024";
+  const configuredApiUrl = import.meta.env.VITE_LANGGRAPH_API_URL ?? "http://127.0.0.1:2024";
+  // LangGraph SDK 内部使用 new URL() 拼接请求路径，因此生产环境的 /api
+  // 必须先解析为当前站点下的绝对地址。
+  const apiUrl = new URL(configuredApiUrl, `${window.location.origin}/`)
+    .toString()
+    .replace(/\/$/, "");
   const assistantId = import.meta.env.VITE_LANGGRAPH_ASSISTANT_ID ?? "supervisor";
   const [threadId, setThreadId] = useState<string | undefined>(
     () => new URLSearchParams(window.location.search).get("thread") ?? undefined,
