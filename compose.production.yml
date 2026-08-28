@@ -244,8 +244,14 @@ services:
       api:
         condition: service_healthy
     ports:
-      # 默认只开放给 ECS 本机，之后可由宿主机 Nginx 或负载均衡器提供 HTTPS。
-      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:80"
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-80}:80"
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_HTTPS_PORT:-443}:443"
+    configs:
+      - source: frontend-nginx-self-signed-config
+        target: /etc/nginx/nginx.conf
+    secrets:
+      - tls_certificate
+      - tls_private_key
     networks:
       - application
     restart: unless-stopped
@@ -316,8 +322,14 @@ volumes:
 secrets:
   redis_password:
     file: "${REDIS_PASSWORD_FILE_HOST:-./.secrets/redis_password}"
+  tls_certificate:
+    file: "${TLS_CERTIFICATE_FILE_HOST:-./.secrets/tls/server.crt}"
+  tls_private_key:
+    file: "${TLS_PRIVATE_KEY_FILE_HOST:-./.secrets/tls/server.key}"
 
 configs:
+  frontend-nginx-self-signed-config:
+    file: ./deploy/nginx.self-signed.conf
   opensandbox-config:
     content: |
       [server]
