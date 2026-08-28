@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import mimetypes
 import shutil
@@ -488,7 +489,12 @@ class OSSWorkspaceStore:
         async def chunks() -> AsyncIterator[bytes]:
             assert result.body is not None
             async with result.body as body:
-                async for chunk in body.iter_bytes(block_size=_STREAM_CHUNK_BYTES):
+                iterator = body.iter_bytes(block_size=_STREAM_CHUNK_BYTES)
+                # OSS v2 的 AsyncStreamBodyReader 先返回 coroutine，而部分兼容
+                # 实现会直接返回 AsyncIterator；两种 SDK 形态都需要支持。
+                if inspect.isawaitable(iterator):
+                    iterator = await iterator
+                async for chunk in iterator:
                     yield chunk
 
         return metadata, chunks()

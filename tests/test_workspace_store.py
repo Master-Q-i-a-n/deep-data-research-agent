@@ -92,6 +92,15 @@ class _AsyncBody:
         yield self.content
 
 
+class _CoroutineAsyncBody(_AsyncBody):
+    async def iter_bytes(self, **_kwargs):
+        async def chunks():
+            yield self.content
+
+        # alibabacloud-oss-v2 的 AsyncStreamBodyReader 使用这种返回形态。
+        return chunks()
+
+
 class _FakeOSSClient:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
@@ -99,6 +108,7 @@ class _FakeOSSClient:
         self.put_content_types: list[str | None] = []
         self.delete_batches: list[list[str]] = []
         self.closed = False
+        self.body_type = _AsyncBody
 
     async def list_objects_v2(self, request):
         keys = sorted(key for key in self.files if key.startswith(request.prefix or ""))
@@ -128,7 +138,7 @@ class _FakeOSSClient:
             raise WorkspaceFileNotFound(request.key)
         content = self.files[request.key]
         return SimpleNamespace(
-            body=_AsyncBody(content),
+            body=self.body_type(content),
             content_length=len(content),
             content_type="application/octet-stream",
             etag="etag",
@@ -229,6 +239,19 @@ async def test_oss_store_maps_keys_pages_and_streams() -> None:
     metadata, chunks = await store.stream(scope, "output/report.md")
     assert metadata.size == 6
     assert b"".join([chunk async for chunk in chunks]) == b"report"
+
+
+@pytest.mark.asyncio
+async def test_oss_store_stream_accepts_sdk_coroutine_iterator() -> None:
+    store, client = _fake_oss_store()
+    client.body_type = _CoroutineAsyncBody
+    scope = WorkspaceScope("user-a", "thread-a", "supervisor")
+    await store.write_many(scope, [("output/report.pdf", b"pdf-content")])
+
+    metadata, chunks = await store.stream(scope, "output/report.pdf")
+
+    assert metadata.size == len(b"pdf-content")
+    assert b"".join([chunk async for chunk in chunks]) == b"pdf-content"
 
 
 @pytest.mark.asyncio
