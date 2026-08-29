@@ -12,6 +12,20 @@ from deep_data_research_agent.core.config import Settings
 from deep_data_research_agent.memory import service as memory
 
 
+async def _invoke_without_metering(model, input_, *, config=None, **kwargs):
+    """Keep model-call unit tests independent from PostgreSQL token accounting."""
+
+    for name in (
+        "user_id",
+        "agent_name",
+        "root_run_id",
+        "thread_id",
+        "model_settings",
+    ):
+        kwargs.pop(name, None)
+    return await model.ainvoke(input_, config=config, **kwargs)
+
+
 def test_memory_timeout_and_review_output_defaults_are_independent() -> None:
     settings = Settings(_env_file=None)
 
@@ -508,6 +522,8 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
     invocation_count = 0
 
     class Model:
+        model_name = "deepseek-memory"
+
         async def ainvoke(self, messages, config=None, **kwargs):
             nonlocal invocation_count
             invocation_count += 1
@@ -523,7 +539,11 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
                 usage_metadata={"input_tokens": 60, "output_tokens": 4, "total_tokens": 64},
             )
 
-    monkeypatch.setattr(memory, "create_memory_model", lambda: Model())
+    async def runtime_model(_user_id, _role):
+        return Model()
+
+    monkeypatch.setattr(memory, "get_runtime_model", runtime_model)
+    monkeypatch.setattr(memory, "metered_model_ainvoke", _invoke_without_metering)
     monkeypatch.setattr(
         memory,
         "get_settings",
@@ -546,6 +566,7 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
         agent_name="data-analyst",
         bundle=bundle,
         existing=[],
+        user_id="test-user",
     )
 
     assert [item.action for item in result.decisions] == ["add"]
@@ -585,7 +606,11 @@ async def test_failure_reviewer_rejects_tool_calls_and_never_executes_them(
             calls.append(list(messages))
             return responses.pop(0)
 
-    monkeypatch.setattr(memory, "create_memory_model", lambda: Model())
+    async def runtime_model(_user_id, _role):
+        return Model()
+
+    monkeypatch.setattr(memory, "get_runtime_model", runtime_model)
+    monkeypatch.setattr(memory, "metered_model_ainvoke", _invoke_without_metering)
     monkeypatch.setattr(
         memory,
         "get_settings",
@@ -610,6 +635,7 @@ async def test_failure_reviewer_rejects_tool_calls_and_never_executes_them(
         agent_name="supervisor",
         bundle=bundle,
         existing=[],
+        user_id="test-user",
     )
 
     assert [item.action for item in result.decisions] == ["discard"]
@@ -720,16 +746,17 @@ async def test_structured_model_repairs_once_and_detaches_callbacks(monkeypatch)
             assert include_raw is True
             return StructuredModel()
 
-    monkeypatch.setattr(
-        memory,
-        "create_memory_model",
-        lambda: Model(),
-    )
+    async def runtime_model(_user_id, _role):
+        return Model()
+
+    monkeypatch.setattr(memory, "get_runtime_model", runtime_model)
+    monkeypatch.setattr(memory, "metered_model_ainvoke", _invoke_without_metering)
 
     result = await memory._extract_user_memory_patch(
         current=memory.UserMemory(),
         user_message="本轮只导出 CSV",
         previous_assistant="",
+        user_id="test-user",
     )
 
     assert result.action == "discard"

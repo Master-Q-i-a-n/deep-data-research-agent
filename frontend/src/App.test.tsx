@@ -133,6 +133,24 @@ function withDevelopmentAuth(handler: FetchHandler) {
         json: async () => ({ failure_lesson_saving_enabled: true }),
       };
     }
+    if (url.endsWith("/model-provider") && !init?.method) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          configured: true,
+          provider: {
+            provider_type: "openai_compatible",
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model_name: "qwen-plus",
+            has_api_key: true,
+            api_key_hint: "1234",
+            version: 1,
+            updated_at: "2026-08-28T10:00:00",
+          },
+        }),
+      };
+    }
     return handler(input, init);
   });
 }
@@ -192,6 +210,24 @@ beforeEach(() => {
     }
     if (url.endsWith("/memories/settings")) {
       return { ok: true, status: 200, json: async () => ({ failure_lesson_saving_enabled: true }) };
+    }
+    if (url.endsWith("/model-provider")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          configured: true,
+          provider: {
+            provider_type: "openai_compatible",
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model_name: "qwen-plus",
+            has_api_key: true,
+            api_key_hint: "1234",
+            version: 1,
+            updated_at: "2026-08-28T10:00:00",
+          },
+        }),
+      };
     }
     return {
       ok: true,
@@ -650,6 +686,150 @@ describe("研究工作台", () => {
     );
   });
 
+  it("未配置时阻止发送，并只把 API Key 提交到 Provider 保存接口", async () => {
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    const secret = "sk-browser-memory-only";
+    let savedBody: Record<string, unknown> | null = null;
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ user: { id: "local-user", username: "默认账户", is_default: true } }),
+        };
+      }
+      if (url.endsWith("/memories/settings")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ failure_lesson_saving_enabled: true }),
+        };
+      }
+      if (url.endsWith("/model-provider") && init?.method === "PUT") {
+        savedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            configured: true,
+            provider: {
+              provider_type: "openai_compatible",
+              base_url: "https://models.example.com/v1",
+              model_name: "safe-model",
+              has_api_key: true,
+              api_key_hint: "only",
+              version: 1,
+              updated_at: "2026-08-28T10:00:00",
+            },
+          }),
+        };
+      }
+      if (url.endsWith("/model-provider")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ configured: false, provider: null }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => (url.endsWith("/async-tasks/status") ? { tasks: [] } : []),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    await screen.findByText("尚未配置模型 Provider");
+    expect((screen.getByRole("button", { name: "发送分析任务" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "前往设置" }));
+    fireEvent.change(screen.getByLabelText("API Base URL"), {
+      target: { value: "https://models.example.com/v1" },
+    });
+    fireEvent.change(screen.getByLabelText("模型名"), { target: { value: "safe-model" } });
+    fireEvent.change(screen.getByLabelText("API Key"), { target: { value: secret } });
+
+    expect(JSON.stringify(window.localStorage)).not.toContain(secret);
+    expect(JSON.stringify(window.sessionStorage)).not.toContain(secret);
+    expect(JSON.stringify(capturedOptions)).not.toContain(secret);
+    fireEvent.click(screen.getByRole("button", { name: "保存 Provider" }));
+
+    await screen.findByText("模型 Provider 已保存");
+    expect(savedBody).toEqual({
+      provider_type: "openai_compatible",
+      base_url: "https://models.example.com/v1",
+      model_name: "safe-model",
+      api_key: secret,
+    });
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).value).toBe("");
+    expect(JSON.stringify(window.localStorage)).not.toContain(secret);
+    expect(JSON.stringify(window.sessionStorage)).not.toContain(secret);
+  });
+
+  it("已保存 Key 可留空测试、更新和删除", async () => {
+    streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
+    const provider = {
+      provider_type: "openai_compatible",
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      model_name: "qwen-max",
+      has_api_key: true,
+      api_key_hint: "1234",
+      version: 2,
+      updated_at: "2026-08-28T10:00:00",
+    };
+    const mutationBodies: Array<{ method: string; body?: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/model-provider/test")) {
+        mutationBodies.push({ method: "POST", body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        return { ok: true, status: 200, json: async () => ({ ok: true, latency_ms: 42 }) };
+      }
+      if (url.endsWith("/model-provider") && init?.method === "PUT") {
+        mutationBodies.push({ method: "PUT", body: JSON.parse(String(init.body)) as Record<string, unknown> });
+        return { ok: true, status: 200, json: async () => ({ configured: true, provider }) };
+      }
+      if (url.endsWith("/model-provider") && init?.method === "DELETE") {
+        mutationBodies.push({ method: "DELETE" });
+        return { ok: true, status: 200, json: async () => ({ configured: false, deleted: true }) };
+      }
+      return { ok: true, status: 200, json: async () => (url.endsWith("/async-tasks/status") ? { tasks: [] } : []) };
+    })));
+    render(<App />);
+
+    await screen.findByText("默认账户");
+    fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).placeholder).toContain("尾号 1234");
+    fireEvent.change(screen.getByLabelText("模型名"), { target: { value: "qwen-max" } });
+    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    await screen.findByText("连接成功 · 42 ms");
+    fireEvent.click(screen.getByRole("button", { name: "保存 Provider" }));
+    await screen.findByText("模型 Provider 已保存");
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    await screen.findByText("模型 Provider 已删除");
+
+    expect(mutationBodies).toEqual([
+      {
+        method: "POST",
+        body: {
+          provider_type: "openai_compatible",
+          base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          model_name: "qwen-max",
+        },
+      },
+      {
+        method: "PUT",
+        body: {
+          provider_type: "openai_compatible",
+          base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          model_name: "qwen-max",
+        },
+      },
+      { method: "DELETE" },
+    ]);
+  });
+
   it("失败经验整理开关按服务端状态显示并允许运行中关闭", async () => {
     streamState.isLoading = true;
     let enabled = true;
@@ -711,6 +891,8 @@ describe("研究工作台", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
 
     expect((screen.getByRole("button", { name: "清除记忆" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByLabelText("API Base URL") as HTMLInputElement).disabled).toBe(true);
+    expect(screen.getByText("当前任务结束后才能修改 Provider。")).toBeTruthy();
     expect(screen.getByText("当前任务结束后才能清除记忆。")).toBeTruthy();
     fireEvent.click(screen.getByRole("switch", { name: "详细模式" }));
     expect(screen.getByRole("switch", { name: "详细模式" }).getAttribute("aria-checked")).toBe("true");

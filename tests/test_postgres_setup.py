@@ -98,7 +98,7 @@ def test_packaged_alembic_head_matches_runtime_revision() -> None:
     )
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_current_head() == "0001_current_schema"
+    assert script.get_current_head() == "0002_user_model_provider"
 
 
 def test_runtime_initializers_contain_no_schema_ddl() -> None:

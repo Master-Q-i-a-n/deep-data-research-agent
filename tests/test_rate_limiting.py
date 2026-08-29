@@ -1,6 +1,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -524,6 +525,7 @@ async def test_run_admission_endpoint_returns_structured_active_threads(
         state=SimpleNamespace(agent_client=SimpleNamespace(threads=Threads()))
     )
     monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated)
+    monkeypatch.setattr(webapp, "resolve_provider", AsyncMock())
     async def token_bucket(_user_id: str) -> database.TokenBucketRecord:
         return database.TokenBucketRecord(
             _user_id, 100_000_000, int(time.time() // 3600), 1
@@ -573,6 +575,7 @@ async def test_run_admission_endpoint_returns_token_budget_details(
         state=SimpleNamespace(agent_client=SimpleNamespace(threads=Threads()))
     )
     monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated)
+    monkeypatch.setattr(webapp, "resolve_provider", AsyncMock())
     monkeypatch.setattr(database, "get_token_bucket", token_bucket)
     try:
         with pytest.raises(Exception) as caught:

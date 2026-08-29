@@ -1,8 +1,9 @@
 """Validated request payloads for the custom HTTP API."""
 
+from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 
 class RegisterRequest(BaseModel):
@@ -31,10 +32,19 @@ class AsyncTaskStatusRequest(BaseModel):
     thread_id: str = Field(min_length=1, max_length=64)
 
 
+class ModelProviderRequest(BaseModel):
+    provider_type: Literal["openai_compatible", "deepseek"]
+    base_url: str = Field(min_length=1, max_length=2048)
+    model_name: str = Field(min_length=1, max_length=128)
+    # Omit the key while editing to retain the encrypted value already stored.
+    api_key: SecretStr | None = None
+
+
 __all__ = [
     "AsyncTaskStatusRequest",
     "LoginRequest",
     "MemorySettingsRequest",
+    "ModelProviderRequest",
     "RegisterRequest",
     "RunAdmissionRequest",
 ]

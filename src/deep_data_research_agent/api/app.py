@@ -38,6 +38,7 @@ from deep_data_research_agent.api.schemas import (
     AsyncTaskStatusRequest,
     LoginRequest,
     MemorySettingsRequest,
+    ModelProviderRequest,
     RegisterRequest,
     RunAdmissionRequest,
 )
@@ -64,6 +65,21 @@ from deep_data_research_agent.infrastructure.workspace import (
     workspace_relative_path,
 )
 from deep_data_research_agent.memory.service import MEMORY_QUEUE
+from deep_data_research_agent.providers.models import (
+    clear_model_cache,
+    test_provider_model,
+)
+from deep_data_research_agent.providers.service import (
+    PROVIDER_TYPES,
+    ProviderConfigurationError,
+    ProviderNotConfiguredError,
+    ResolvedProvider,
+    delete_provider,
+    get_public_provider,
+    resolve_provider,
+    save_provider,
+    validate_provider_url,
+)
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
 _PASSWORD_HASHER = PasswordHasher()
@@ -621,6 +637,153 @@ async def _busy_supervisor_thread_ids(
         offset += 100
 
 
+async def _busy_provider_thread_ids(
+    request: Request,
+    authorization: str | None,
+) -> list[str]:
+    """Return busy online-model threads across both deployed graphs."""
+
+    client = request.app.state.agent_client
+    headers = {"Authorization": authorization} if authorization else None
+    thread_ids: list[str] = []
+    for graph_id in ("supervisor", "crawl-worker"):
+        offset = 0
+        while True:
+            batch = await client.threads.search(
+                metadata={"graph_id": graph_id},
+                status="busy",
+                limit=100,
+                offset=offset,
+                select=["thread_id", "status"],
+                headers=headers,
+            )
+            thread_ids.extend(str(thread["thread_id"]) for thread in batch)
+            if len(batch) < 100:
+                break
+            offset += 100
+    return list(dict.fromkeys(thread_ids))
+
+
+def _provider_busy_detail(thread_ids: list[str]) -> dict[str, object]:
+    return {
+        "code": "MODEL_PROVIDER_BUSY",
+        "message": "当前仍有模型任务运行，请等待任务结束后再修改 Provider",
+        "active_thread_ids": thread_ids,
+    }
+
+
+@app.get("/model-provider")
+async def read_model_provider(
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    user_id = await _authenticated_user_id(authorization)
+    provider = await get_public_provider(user_id)
+    return JSONResponse(
+        content={"configured": provider is not None, "provider": provider},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.put("/model-provider")
+async def update_model_provider(
+    payload: ModelProviderRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    user_id = await _authenticated_user_id(authorization)
+    try:
+        async with redis_limits.admission_lock(user_id):
+            busy = await _busy_provider_thread_ids(request, authorization)
+            if busy:
+                raise HTTPException(status_code=409, detail=_provider_busy_detail(busy))
+            record = await save_provider(
+                user_id=user_id,
+                provider_type=payload.provider_type,
+                base_url=payload.base_url,
+                model_name=payload.model_name,
+                api_key=(
+                    payload.api_key.get_secret_value()
+                    if payload.api_key is not None
+                    else None
+                ),
+            )
+            await clear_model_cache(user_id)
+    except HTTPException:
+        raise
+    except ProviderConfigurationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    public = await get_public_provider(user_id)
+    return JSONResponse(
+        content={"configured": True, "provider": public, "version": record.version},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/model-provider/test")
+async def test_model_provider(
+    payload: ModelProviderRequest,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    user_id = await _authenticated_user_id(authorization)
+    try:
+        if payload.provider_type not in PROVIDER_TYPES:
+            raise ProviderConfigurationError("不支持的 Provider 类型")
+        model_name = payload.model_name.strip()
+        if not model_name:
+            raise ProviderConfigurationError("模型名不能为空")
+        base_url = await validate_provider_url(payload.base_url)
+        if payload.api_key is not None:
+            api_key = payload.api_key.get_secret_value().strip()
+        else:
+            api_key = (await resolve_provider(user_id)).api_key
+        if not api_key:
+            raise ProviderConfigurationError("API Key 不能为空")
+        draft = ResolvedProvider(
+            user_id=user_id,
+            provider_type=payload.provider_type,
+            base_url=base_url,
+            model_name=model_name,
+            api_key=api_key,
+            api_key_hint=api_key[-4:],
+            version=0,
+        )
+        started = asyncio.get_running_loop().time()
+        await test_provider_model(draft)
+        latency_ms = round((asyncio.get_running_loop().time() - started) * 1000)
+    except ProviderConfigurationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("模型 Provider 连接测试失败：%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="模型 Provider 连接失败，请检查地址、模型名和 API Key",
+        ) from exc
+    return JSONResponse(
+        content={"ok": True, "latency_ms": latency_ms, "model_name": model_name},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/model-provider")
+async def remove_model_provider(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    user_id = await _authenticated_user_id(authorization)
+    async with redis_limits.admission_lock(user_id):
+        busy = await _busy_provider_thread_ids(request, authorization)
+        if busy:
+            raise HTTPException(status_code=409, detail=_provider_busy_detail(busy))
+        deleted = await delete_provider(user_id)
+        await clear_model_cache(user_id)
+    return JSONResponse(
+        content={"configured": False, "deleted": deleted},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.post("/run-admissions", status_code=201)
 async def create_run_admission(
     payload: RunAdmissionRequest,
@@ -633,6 +796,27 @@ async def create_run_admission(
     thread_id = str(payload.thread_id) if payload.thread_id else None
     if thread_id and await database.get_thread_owner(thread_id) != user_id:
         raise HTTPException(status_code=404, detail="会话不存在")
+
+    try:
+        await resolve_provider(user_id)
+    except ProviderNotConfiguredError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MODEL_PROVIDER_NOT_CONFIGURED",
+                "message": "请先在设置中配置模型 Provider",
+                "active_thread_ids": [],
+            },
+        ) from exc
+    except ProviderConfigurationError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MODEL_PROVIDER_INVALID",
+                "message": str(exc),
+                "active_thread_ids": [],
+            },
+        ) from exc
 
     settings = get_settings()
     try:

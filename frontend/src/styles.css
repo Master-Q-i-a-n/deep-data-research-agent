@@ -979,6 +979,37 @@ code, pre {
   border-radius: 9px;
   background: #f7fafb;
 }
+.settings-section--provider { grid-template-columns: 1fr; align-items: stretch; }
+.provider-settings-form { display: grid; gap: 12px; }
+.provider-settings-form > label { display: grid; gap: 6px; color: var(--muted); font-size: 0.67rem; font-weight: 700; }
+.provider-settings-form input,
+.provider-settings-form select {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 11px;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+  background: #fff;
+  font: inherit;
+}
+.provider-settings-form input:focus,
+.provider-settings-form select:focus { border-color: rgba(54, 89, 217, 0.55); box-shadow: 0 0 0 3px rgba(54, 89, 217, 0.08); }
+.provider-key-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.provider-key-field > button,
+.provider-settings-actions > button {
+  padding: 8px 11px;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7fafb;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+.provider-settings-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.provider-settings-actions > button:nth-child(2) { color: #fff; border-color: var(--cobalt); background: var(--cobalt); }
+.provider-settings-actions > .provider-settings-delete { margin-left: auto; color: #a94343; border-color: rgba(180, 74, 74, 0.28); background: rgba(180, 74, 74, 0.05); }
 .settings-section--danger { grid-template-columns: 1fr; align-items: stretch; }
 .settings-danger-button {
   justify-self: start;
@@ -1009,6 +1040,29 @@ code, pre {
 .settings-hint { color: var(--muted); }
 .settings-status--success { color: #14776d; }
 .settings-status--error { color: var(--danger); }
+.provider-required-card {
+  position: fixed;
+  right: 342px;
+  bottom: 144px;
+  left: 306px;
+  z-index: 6;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: #6f5510;
+  border: 1px solid rgba(190, 139, 28, 0.3);
+  border-radius: 4px 12px 4px 12px;
+  background: rgba(255, 248, 226, 0.96);
+  box-shadow: 0 10px 30px rgba(66, 54, 17, 0.08);
+}
+.provider-required-card > div { display: grid; gap: 3px; }
+.provider-required-card strong { font-size: 0.74rem; }
+.provider-required-card span { font-size: 0.66rem; line-height: 1.45; }
+.provider-required-card button { padding: 8px 11px; flex: 0 0 auto; color: #fff; cursor: pointer; border: 0; border-radius: 8px; background: #9b7416; font-size: 0.68rem; font-weight: 700; }
 .interrupt-card__email-details b { color: var(--muted); font-weight: 600; }
 
 @media (max-width: 900px) {
@@ -1021,6 +1075,7 @@ code, pre {
   .sidebar-foot { display: none; }
   .topbar { min-height: 86px; }
   .composer { right: 0; left: 0; }
+  .provider-required-card { right: 24px; left: 24px; }
   .jump-to-bottom { left: 50%; bottom: 154px; }
   .workspace-shell--compact .jump-to-bottom { left: 50%; }
 }

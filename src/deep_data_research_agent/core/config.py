@@ -64,6 +64,12 @@ class _ReviewerChatDeepSeek(_ThinkingChatDeepSeek):
     _ls_provider_name: ClassVar[str] = "deep-data-reviewer"
 
 
+class _SupervisorChatDeepSeek(_ThinkingChatDeepSeek):
+    """Use the Supervisor harness label with DeepSeek reasoning support."""
+
+    _ls_provider_name: ClassVar[str] = "openai"
+
+
 class Settings(BaseSettings):
     """Settings loaded from process environment or the local ``.env`` file."""
 
@@ -78,6 +84,15 @@ class Settings(BaseSettings):
     openai_model: str = "qwen-plus"
     openai_streaming: bool = False
     openai_timeout_seconds: float = 120.0
+    # Online Agent runs use per-user Provider credentials. These operational
+    # limits remain deployment-owned and never contain user secrets.
+    model_provider_encryption_key_file: Path = Path(".secrets/model_provider_key")
+    model_provider_host_allowlist: str = ""
+    model_provider_timeout_seconds: float = Field(default=120.0, ge=5, le=300)
+    model_provider_test_timeout_seconds: float = Field(default=20.0, ge=3, le=60)
+    model_provider_streaming: bool = False
+    model_provider_cache_size: int = Field(default=128, ge=1, le=1024)
+    model_provider_cache_ttl_seconds: int = Field(default=900, ge=30, le=86400)
     tavily_api_key: str = ""
     tavily_project: str | None = None
 
@@ -223,6 +238,31 @@ def get_settings() -> Settings:
     """Return the process-wide immutable settings object."""
 
     return Settings()
+
+
+def create_graph_placeholder_model(
+    role: Literal["supervisor", "worker", "reviewer"],
+) -> ChatOpenAI:
+    """Build an inert graph-import model without deployment credentials.
+
+    Online calls replace it in ``ProviderModelMiddleware``. A concrete model is
+    still needed while DeepAgents compiles tool schemas, but it must not retain
+    any user's API Key or depend on the legacy ``OPENAI_*`` environment.
+    """
+
+    model_class: type[ChatOpenAI]
+    if role == "worker":
+        model_class = _WorkerChatOpenAI
+    elif role == "reviewer":
+        model_class = _ReviewerChatOpenAI
+    else:
+        model_class = ChatOpenAI
+    return model_class(
+        model="provider-placeholder",
+        api_key="not-configured",
+        base_url="https://provider.invalid/v1",
+        max_retries=0,
+    )
 
 
 @lru_cache(maxsize=2)

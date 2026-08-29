@@ -1,0 +1,7 @@
+# Context windows for exact model IDs exposed through user-configured Providers.
+deepseek-chat:
+  max_input_tokens: 1000000
+deepseek-reasoner:
+  max_input_tokens: 1000000
+deepseek-v4-flash:
+  max_input_tokens: 1000000

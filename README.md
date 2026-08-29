@@ -40,19 +40,31 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
 
 ## 配置
 
-项目依赖已经写入 `pyproject.toml`。复制环境变量模板并填写模型、Tavily 和 LangSmith Key：
+项目依赖已经写入 `pyproject.toml`。复制环境变量模板并填写 Tavily、LangSmith 等平台配置：
 
 ```powershell
 Copy-Item -LiteralPath '.env.example' -Destination '.env'
+New-Item -ItemType Directory -Force -Path '.secrets' | Out-Null
+uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" |
+  Set-Content -Encoding ASCII -NoNewline -LiteralPath '.secrets/model_provider_key'
 ```
 
-国内 OpenAI-compatible 模型需要具备稳定的工具调用能力。第一阶段建议使用非 reasoning 模型，
-并配置：
+登录后在右上角设置中配置模型 Provider、API Base URL、模型名和 API Key。API Key 只提交给
+后端一次，并以部署级密钥加密保存；浏览器只保留当前页面中的草稿，不写入本地存储，也不会
+附加到 Agent run。通用 OpenAI-compatible 模型需要具备稳定的工具调用能力；DeepSeek
+reasoning 模型应明确选择 `DeepSeek` 类型。
+
+环境中的 `OPENAI_*` 仅供本地 CLI 和评测工具使用，在线 Supervisor、Worker、上下文压缩与
+后台记忆都读取当前账户的 Provider。服务端运行参数配置如下：
 
 ```dotenv
-OPENAI_API_KEY=your-model-api-key
-OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-OPENAI_MODEL=qwen-plus
+MODEL_PROVIDER_ENCRYPTION_KEY_FILE=.secrets/model_provider_key
+MODEL_PROVIDER_HOST_ALLOWLIST=
+MODEL_PROVIDER_TIMEOUT_SECONDS=120
+MODEL_PROVIDER_TEST_TIMEOUT_SECONDS=20
+MODEL_PROVIDER_STREAMING=false
+MODEL_PROVIDER_CACHE_SIZE=128
+MODEL_PROVIDER_CACHE_TTL_SECONDS=900
 TAVILY_API_KEY=tvly-your-api-key
 OPEN_SANDBOX_DOMAIN=127.0.0.1:8080
 OPEN_SANDBOX_API_KEY=your-opensandbox-api-key
@@ -99,7 +111,9 @@ RUN_ADMISSION_LOCK_SECONDS=5
 ```
 
 不要提交 `.env`，也不要把 API Key 作为命令行参数传递。`APP_ENV=production` 时
-`RATE_LIMIT_KEY_SECRET` 必须是至少 32 字符的稳定随机值；生产环境会拒绝所有未登录请求。
+`RATE_LIMIT_KEY_SECRET` 必须是至少 32 字符的稳定随机值，并且 Provider 加密密钥文件必须
+存在且是有效的 Fernet key；生产环境会拒绝所有未登录请求。公网 Provider 默认只允许
+HTTPS；内网、保留地址或 HTTP 目标必须由部署方加入 `MODEL_PROVIDER_HOST_ALLOWLIST`。
 
 后端启动前先部署项目专用 Redis。脚本会生成被 Git 忽略的随机 ACL 密码；首次从旧的
 `f10fedb99816` 容器切换时，会先把 `redis-data` 备份到 `.redis-backups/`，再由 Compose

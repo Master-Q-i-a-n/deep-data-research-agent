@@ -10,6 +10,7 @@ from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.infrastructure.mongodb.health import ping_mongodb
 from deep_data_research_agent.infrastructure.redis.client import ping_redis
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.providers.service import check_encryption_ready
 
 Check = Callable[[], Awaitable[None]]
 
@@ -29,7 +30,16 @@ async def readiness_checks() -> dict[str, str]:
     """Run independent core dependency checks concurrently."""
 
     timeout = get_settings().health_check_timeout_seconds
-    names = ("postgres", "redis", "mongodb", "workspace_storage")
+    async def provider_encryption() -> None:
+        await asyncio.to_thread(check_encryption_ready)
+
+    names = (
+        "postgres",
+        "redis",
+        "mongodb",
+        "workspace_storage",
+        "provider_encryption",
+    )
     results = await asyncio.gather(
         _run_check(database.check_database_ready, timeout),
         _run_check(ping_redis, timeout),
@@ -38,6 +48,7 @@ async def readiness_checks() -> dict[str, str]:
             sandbox_manager.SANDBOX_MANAGER.workspace_store.check_ready,
             timeout,
         ),
+        _run_check(provider_encryption, timeout),
     )
     return dict(zip(names, results, strict=True))
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -44,6 +44,24 @@ class AuthSession(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class UserModelProvider(Base):
+    """One encrypted online-model Provider configuration per user."""
+
+    __tablename__ = "user_model_providers"
+
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    api_key_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    api_key_hint: Mapped[str] = mapped_column(String(16), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 class AgentThread(Base):
@@ -128,6 +146,7 @@ __all__ = [
     "EmailDelivery",
     "ModelTokenUsage",
     "User",
+    "UserModelProvider",
     "UserTokenBucket",
     "utcnow",
 ]

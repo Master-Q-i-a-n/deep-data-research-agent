@@ -27,9 +27,7 @@ from deep_data_research_agent.agents.prompts import (
     SUPERVISOR_PROMPT,
 )
 from deep_data_research_agent.core.config import (
-    create_chat_model,
-    create_data_analyst_model,
-    create_reviewer_model,
+    create_graph_placeholder_model,
 )
 from deep_data_research_agent.memory.service import (
     SUPERVISOR_MEMORY_TOOLS,
@@ -38,6 +36,10 @@ from deep_data_research_agent.memory.service import (
     FailureReviewMiddleware,
     MemoryRefreshMiddleware,
     agent_memory_path,
+)
+from deep_data_research_agent.providers.models import (
+    ProviderModelMiddleware,
+    provider_summarization_middleware,
 )
 from deep_data_research_agent.skill_system.storage import (
     public_skill_root,
@@ -51,7 +53,7 @@ register_mvp_profile()
 
 graph = create_deep_agent(
     name="supervisor",
-    model=create_chat_model(),
+    model=create_graph_placeholder_model("supervisor"),
     system_prompt=SUPERVISOR_PROMPT,
     tools=[
         *ASSIGN_SKILL_TOOL,
@@ -61,7 +63,7 @@ graph = create_deep_agent(
     subagents=[
         SubAgent(
             name="data-analyst",
-            model=create_data_analyst_model(),
+            model=create_graph_placeholder_model("worker"),
             description=(
                 "分析本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据。委派时必须标注模式："
                 "quick_answer 用于直接查值、计数或简单统计，只返回经校验的简洁结论且不生成"
@@ -76,7 +78,11 @@ graph = create_deep_agent(
                 f"{user_skill_root('data-analyst')}/",
             ],
             middleware=[
+                ProviderModelMiddleware("data-analyst"),
                 TokenUsageMiddleware(agent_name="data-analyst"),
+                provider_summarization_middleware(
+                    "data-analyst", SUPERVISOR_BACKEND
+                ),
                 # DeepAgents 0.7 makes planning opt-in; keep it for analysis.
                 TodoListMiddleware(),
                 MemoryRefreshMiddleware(
@@ -95,7 +101,7 @@ graph = create_deep_agent(
         ),
         SubAgent(
             name="analysis-reviewer",
-            model=create_reviewer_model(),
+            model=create_graph_placeholder_model("reviewer"),
             description=(
                 "对 data-analyst 已生成的 Markdown 主报告和声明产物进行只读质量复核；"
                 "按独立角色检查数字一致性、方法有效性或结论证据与限制，"
@@ -106,7 +112,11 @@ graph = create_deep_agent(
             # Explicitly avoid inheriting the Supervisor's business tools.
             tools=[],
             middleware=[
+                ProviderModelMiddleware("analysis-reviewer"),
                 TokenUsageMiddleware(agent_name="analysis-reviewer"),
+                provider_summarization_middleware(
+                    "analysis-reviewer", SUPERVISOR_BACKEND
+                ),
                 # after_model hooks run in reverse order: count the model call
                 # before validating or redirecting its final JSON response.
                 ReviewerResultValidationMiddleware(),
@@ -119,7 +129,9 @@ graph = create_deep_agent(
         ),
     ],
     middleware=[
+        ProviderModelMiddleware("supervisor"),
         TokenUsageMiddleware(agent_name="supervisor"),
+        provider_summarization_middleware("supervisor", SUPERVISOR_BACKEND),
         # Reviewer deliberately omits this official Todo middleware.
         TodoListMiddleware(),
         SandboxLifecycleMiddleware(

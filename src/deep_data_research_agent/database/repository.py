@@ -27,6 +27,7 @@ from deep_data_research_agent.database.models import (
     EmailDelivery,
     ModelTokenUsage,
     User,
+    UserModelProvider,
     UserTokenBucket,
 )
 from deep_data_research_agent.database.models import (
@@ -90,6 +91,21 @@ class TokenUsageReservation:
     bucket: TokenBucketRecord
     reserved_tokens: int
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProviderRecord:
+    """Encrypted Provider row; decryption belongs to the Provider service."""
+
+    user_id: str
+    provider_type: str
+    base_url: str
+    model_name: str
+    api_key_ciphertext: str
+    api_key_hint: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class UsernameExistsError(ValueError):
@@ -340,6 +356,89 @@ def _token_bucket_record(bucket: UserTokenBucket) -> TokenBucketRecord:
     )
 
 
+def _model_provider_record(provider: UserModelProvider) -> ModelProviderRecord:
+    return ModelProviderRecord(
+        user_id=provider.user_id,
+        provider_type=provider.provider_type,
+        base_url=provider.base_url,
+        model_name=provider.model_name,
+        api_key_ciphertext=provider.api_key_ciphertext,
+        api_key_hint=provider.api_key_hint,
+        version=int(provider.version),
+        created_at=provider.created_at,
+        updated_at=provider.updated_at,
+    )
+
+
+async def get_model_provider(user_id: str) -> ModelProviderRecord | None:
+    """Return one user's encrypted Provider row without decrypting its key."""
+
+    await ensure_schema()
+    async with session_factory()() as session:
+        provider = await session.get(UserModelProvider, str(user_id))
+    return _model_provider_record(provider) if provider is not None else None
+
+
+async def upsert_model_provider(
+    *,
+    user_id: str,
+    provider_type: str,
+    base_url: str,
+    model_name: str,
+    api_key_ciphertext: str | None,
+    api_key_hint: str | None,
+) -> ModelProviderRecord:
+    """Create or update the user's Provider while optionally retaining its key."""
+
+    await ensure_schema()
+    async with session_factory()() as session, session.begin():
+        provider = await session.get(
+            UserModelProvider,
+            str(user_id),
+            with_for_update=True,
+        )
+        now = _utcnow()
+        if provider is None:
+            if not api_key_ciphertext or api_key_hint is None:
+                raise ValueError("首次配置模型 Provider 时必须填写 API Key")
+            provider = UserModelProvider(
+                user_id=str(user_id),
+                provider_type=provider_type,
+                base_url=base_url,
+                model_name=model_name,
+                api_key_ciphertext=api_key_ciphertext,
+                api_key_hint=api_key_hint,
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(provider)
+        else:
+            provider.provider_type = provider_type
+            provider.base_url = base_url
+            provider.model_name = model_name
+            if api_key_ciphertext is not None:
+                provider.api_key_ciphertext = api_key_ciphertext
+                provider.api_key_hint = api_key_hint or ""
+            provider.version += 1
+            provider.updated_at = now
+        await session.flush()
+        record = _model_provider_record(provider)
+    return record
+
+
+async def delete_model_provider(user_id: str) -> bool:
+    """Delete one user's Provider configuration."""
+
+    await ensure_schema()
+    async with session_factory()() as session:
+        result = await session.execute(
+            delete(UserModelProvider).where(UserModelProvider.user_id == str(user_id))
+        )
+        await session.commit()
+    return bool(result.rowcount)
+
+
 async def _locked_token_bucket(session: AsyncSession, user_id: str) -> UserTokenBucket:
     result = await session.execute(
         select(UserTokenBucket)
@@ -552,6 +651,9 @@ async def delete_user(user_id: str) -> bool:
         await session.execute(delete(AgentThread).where(AgentThread.user_id == normalized))
         await session.execute(delete(ModelTokenUsage).where(ModelTokenUsage.user_id == normalized))
         await session.execute(delete(UserTokenBucket).where(UserTokenBucket.user_id == normalized))
+        await session.execute(
+            delete(UserModelProvider).where(UserModelProvider.user_id == normalized)
+        )
         await session.execute(delete(User).where(User.id == normalized))
         await session.commit()
     return True

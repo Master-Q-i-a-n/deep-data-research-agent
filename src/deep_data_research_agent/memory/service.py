@@ -46,11 +46,12 @@ from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from deep_data_research_agent.admissions.token_usage import metered_model_ainvoke
-from deep_data_research_agent.core.config import create_memory_model, get_settings
+from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.core.identity import user_hash, user_identity
 from deep_data_research_agent.infrastructure.sandbox.manager import (
     thread_id_from_runtime,
 )
+from deep_data_research_agent.providers.models import get_runtime_model
 from deep_data_research_agent.workers.app import publish_memory_job
 
 logger = logging.getLogger(__name__)
@@ -886,7 +887,9 @@ async def _invoke_structured_memory_model(
 ) -> BaseModel:
     """Retry once only when the provider returns invalid structured data."""
 
-    model = create_memory_model().with_structured_output(
+    if not user_id:
+        raise RuntimeError("后台记忆任务缺少用户身份，无法解析模型 Provider")
+    model = (await get_runtime_model(user_id, "memory")).with_structured_output(
         schema,
         method="json_mode",
         include_raw=True,
@@ -895,22 +898,15 @@ async def _invoke_structured_memory_model(
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            if user_id:
-                result = await metered_model_ainvoke(
-                    model,
-                    prompt + repair_note,
-                    user_id=user_id,
-                    agent_name="memory-user",
-                    root_run_id=root_run_id,
-                    thread_id=thread_id,
-                    config={"callbacks": [], "tags": ["memory-internal"]},
-                )
-            else:
-                # Jobs queued before token accounting did not retain billing identity.
-                result = await model.ainvoke(
-                    prompt + repair_note,
-                    config={"callbacks": [], "tags": ["memory-internal"]},
-                )
+            result = await metered_model_ainvoke(
+                model,
+                prompt + repair_note,
+                user_id=user_id,
+                agent_name="memory-user",
+                root_run_id=root_run_id,
+                thread_id=thread_id,
+                config={"callbacks": [], "tags": ["memory-internal"]},
+            )
             parsed = result.get("parsed") if isinstance(result, dict) else None
             if not isinstance(parsed, schema):
                 raise TypeError("记忆模型未返回指定结构")
@@ -1129,7 +1125,9 @@ async def _extract_failure_review_decisions(
 8. 每条 add/merge 必须返回完整 lesson；没有值得保存的经验时返回 {{"decisions": []}}，也兼容仅含一个 discard 决策。"""
 
     messages: list[Any] = [HumanMessage(content=review_prompt)]
-    model = create_memory_model()
+    if not user_id:
+        raise RuntimeError("后台失败回顾缺少用户身份，无法解析模型 Provider")
+    model = await get_runtime_model(user_id, "memory")
     settings = get_settings()
 
     started = time.perf_counter()
@@ -1144,19 +1142,16 @@ async def _extract_failure_review_decisions(
             # ``max_tokens``; extra_body preserves that provider spelling.
             "extra_body": {"max_tokens": settings.failure_review_max_output_tokens},
         }
-        if user_id:
-            response = await metered_model_ainvoke(
-                model,
-                messages,
-                user_id=user_id,
-                agent_name="memory-failure-review",
-                root_run_id=root_run_id,
-                thread_id=thread_id,
-                model_settings={"max_tokens": settings.failure_review_max_output_tokens},
-                **invoke_kwargs,
-            )
-        else:
-            response = await model.ainvoke(messages, **invoke_kwargs)
+        response = await metered_model_ainvoke(
+            model,
+            messages,
+            user_id=user_id,
+            agent_name="memory-failure-review",
+            root_run_id=root_run_id,
+            thread_id=thread_id,
+            model_settings={"max_tokens": settings.failure_review_max_output_tokens},
+            **invoke_kwargs,
+        )
         if not isinstance(response, AIMessage):
             raise TypeError("失败回顾模型未返回 AIMessage")
         try:
@@ -1166,7 +1161,10 @@ async def _extract_failure_review_decisions(
             return decisions, {
                 "actions": actions,
                 "lesson_count": sum(action != "discard" for action in actions),
-                "model": settings.memory_model or settings.openai_model,
+                "model": str(
+                    getattr(model, "model_name", None)
+                    or getattr(model, "model", "unknown")
+                ),
                 "input_tokens": int(usage.get("input_tokens") or 0),
                 "output_tokens": int(usage.get("output_tokens") or 0),
                 "duration_ms": round((time.perf_counter() - started) * 1000),

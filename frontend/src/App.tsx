@@ -115,6 +115,23 @@ type MemorySettingsResponse = {
   cancelled_jobs?: number;
   detail?: string;
 };
+type ModelProviderType = "openai_compatible" | "deepseek";
+type ModelProvider = {
+  provider_type: ModelProviderType;
+  base_url: string;
+  model_name: string;
+  has_api_key: boolean;
+  api_key_hint: string;
+  version: number;
+  updated_at: string;
+};
+type ModelProviderResponse = {
+  configured?: boolean;
+  provider?: ModelProvider | null;
+  deleted?: boolean;
+  detail?: string | LimitDetail;
+};
+type ModelProviderDraft = Pick<ModelProvider, "provider_type" | "base_url" | "model_name">;
 type LimitDetail = {
   code: string;
   message: string;
@@ -218,6 +235,12 @@ function messageText(content: unknown): string {
       return "";
     })
     .join("");
+}
+
+function providerErrorMessage(body: ModelProviderResponse, fallback: string): string {
+  if (typeof body.detail === "string") return body.detail;
+  if (body.detail && typeof body.detail.message === "string") return body.detail.message;
+  return fallback;
 }
 
 function reconcileSubagentStatuses(
@@ -656,6 +679,11 @@ type CompactTurnViewProps = {
   threadId?: string;
   onStop: () => void;
 };
+const DEFAULT_PROVIDER_DRAFT: ModelProviderDraft = {
+  provider_type: "openai_compatible",
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  model_name: "qwen-plus",
+};
 const SIGNED_OUT_USER: AuthUser = {
   id: "",
   username: "未登录",
@@ -936,6 +964,17 @@ export default function App() {
   const [memorySettingsLoading, setMemorySettingsLoading] = useState(false);
   const [memorySettingsUpdating, setMemorySettingsUpdating] = useState(false);
   const [memorySettingsError, setMemorySettingsError] = useState("");
+  const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
+  const [providerDraft, setProviderDraft] = useState<ModelProviderDraft>(DEFAULT_PROVIDER_DRAFT);
+  const [providerApiKey, setProviderApiKey] = useState("");
+  const [providerKeyHint, setProviderKeyHint] = useState("");
+  const [providerKeyVisible, setProviderKeyVisible] = useState(false);
+  const [providerLoading, setProviderLoading] = useState(false);
+  const [providerAction, setProviderAction] = useState<"saving" | "testing" | "deleting" | null>(null);
+  const [providerStatus, setProviderStatus] = useState<{
+    tone: "success" | "error";
+    message: string;
+  } | null>(null);
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const conversationRef = useRef<HTMLElement>(null);
@@ -975,6 +1014,7 @@ export default function App() {
   const runManager = useThreadRunManager(graphClient, assistantId);
   const authReady = authStatus === "ready";
   const workspaceLocked = !authReady;
+  const providerReady = providerConfigured === true;
   const expireAuthentication = useCallback(() => {
     // 保留当前页面数据，只撤销失效凭据并锁定后续服务端操作。
     window.localStorage.removeItem(AUTH_TOKEN_KEY);
@@ -982,10 +1022,18 @@ export default function App() {
     setAuthUser(SIGNED_OUT_USER);
     setAuthStatus("required");
     setAuthError("登录已失效，请重新登录");
+    setProviderConfigured(null);
+    setProviderApiKey("");
   }, []);
 
   const presentRunAdmissionError = useCallback((error: unknown): boolean => {
     if (!(error instanceof LangGraphApiError) || !error.detail) return false;
+    if (error.detail.code === "MODEL_PROVIDER_NOT_CONFIGURED" || error.detail.code === "MODEL_PROVIDER_INVALID") {
+      setProviderConfigured(false);
+      setProviderStatus({ tone: "error", message: error.detail.message });
+      setSettingsOpen(true);
+      return true;
+    }
     const supported = new Set([
       "QUESTION_RATE_LIMITED",
       "THREAD_CONCURRENCY_LIMIT",
@@ -1632,6 +1680,56 @@ export default function App() {
   }, [apiUrl, authHeaders, authReady, authUser.id, expireAuthentication]);
 
   useEffect(() => {
+    if (!authReady) {
+      setProviderConfigured(null);
+      setProviderApiKey("");
+      setProviderKeyHint("");
+      setProviderLoading(false);
+      setProviderStatus(null);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setProviderLoading(true);
+    void (async () => {
+      try {
+        const response = await fetch(`${apiUrl}/model-provider`, {
+          headers: authHeaders,
+          signal: controller.signal,
+        });
+        const body = await response.json() as ModelProviderResponse;
+        if (response.status === 401) {
+          expireAuthentication();
+          return;
+        }
+        if (!response.ok) throw new Error("无法读取模型 Provider 配置");
+        const provider = body.provider;
+        setProviderConfigured(body.configured === true && Boolean(provider));
+        setProviderApiKey("");
+        setProviderKeyHint(provider?.api_key_hint ?? "");
+        if (provider) {
+          setProviderDraft({
+            provider_type: provider.provider_type,
+            base_url: provider.base_url,
+            model_name: provider.model_name,
+          });
+        } else {
+          setProviderDraft(DEFAULT_PROVIDER_DRAFT);
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setProviderConfigured(false);
+        setProviderStatus({
+          tone: "error",
+          message: error instanceof Error ? error.message : "无法读取模型 Provider 配置",
+        });
+      } finally {
+        if (!controller.signal.aborted) setProviderLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [apiUrl, authHeaders, authReady, authUser.id, expireAuthentication]);
+
+  useEffect(() => {
     if (!accountMenuOpen) return undefined;
     const closeOnOutsideClick = (event: MouseEvent) => {
       if (!accountMenuRef.current?.contains(event.target as Node)) {
@@ -1656,14 +1754,14 @@ export default function App() {
     if (!settingsOpen) return undefined;
     settingsCloseButtonRef.current?.focus();
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key !== "Escape" || memoryClearing || memorySettingsUpdating) return;
+      if (event.key !== "Escape" || memoryClearing || memorySettingsUpdating || providerAction) return;
       setSettingsOpen(false);
       setMemoryClearConfirm(false);
       accountMenuButtonRef.current?.focus();
     };
     document.addEventListener("keydown", closeOnEscape);
     return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [memoryClearing, memorySettingsUpdating, settingsOpen]);
+  }, [memoryClearing, memorySettingsUpdating, providerAction, settingsOpen]);
 
   useEffect(() => {
     setPolledTasks({});
@@ -1963,6 +2061,11 @@ export default function App() {
   async function submitText(text: string, mode: SubmitMode = "enqueue") {
     const value = text.trim();
     if (!authReady || !value || !filesReadyForAnalysis || threadAllocating) return;
+    if (!providerReady) {
+      setProviderStatus({ tone: "error", message: "请先配置模型 Provider" });
+      setSettingsOpen(true);
+      return;
+    }
     const uploadedPaths = uploadedFiles
       .filter((file): file is UploadedTableFile & { path: string } => file.status === "ready" && Boolean(file.path))
       .map((file) => `- ${file.path}`);
@@ -2271,10 +2374,126 @@ export default function App() {
   }
 
   function closeSettings() {
-    if (memoryClearing || memorySettingsUpdating) return;
+    if (memoryClearing || memorySettingsUpdating || providerAction) return;
     setSettingsOpen(false);
     setMemoryClearConfirm(false);
     accountMenuButtonRef.current?.focus();
+  }
+
+  function providerRequestBody() {
+    return {
+      ...providerDraft,
+      ...(providerApiKey.trim() ? { api_key: providerApiKey } : {}),
+    };
+  }
+
+  async function testModelProvider() {
+    if (!authReady || providerAction || providerLoading) return;
+    if (!providerConfigured && !providerApiKey.trim()) {
+      setProviderStatus({ tone: "error", message: "首次测试前请填写 API Key" });
+      return;
+    }
+    setProviderAction("testing");
+    setProviderStatus(null);
+    try {
+      const response = await fetch(`${apiUrl}/model-provider/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify(providerRequestBody()),
+      });
+      const body = await response.json() as ModelProviderResponse & { latency_ms?: number };
+      if (response.status === 401) {
+        expireAuthentication();
+        setSettingsOpen(false);
+        return;
+      }
+      if (!response.ok) throw new Error(providerErrorMessage(body, "模型 Provider 连接失败"));
+      setProviderStatus({
+        tone: "success",
+        message: `连接成功${typeof body.latency_ms === "number" ? ` · ${body.latency_ms} ms` : ""}`,
+      });
+    } catch (error) {
+      setProviderStatus({
+        tone: "error",
+        message: error instanceof Error ? error.message : "模型 Provider 连接失败",
+      });
+    } finally {
+      setProviderAction(null);
+    }
+  }
+
+  async function saveModelProvider() {
+    if (!authReady || providerAction || providerLoading || identitySwitchBlocked) return;
+    if (!providerConfigured && !providerApiKey.trim()) {
+      setProviderStatus({ tone: "error", message: "首次保存时必须填写 API Key" });
+      return;
+    }
+    setProviderAction("saving");
+    setProviderStatus(null);
+    try {
+      const response = await fetch(`${apiUrl}/model-provider`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify(providerRequestBody()),
+      });
+      const body = await response.json() as ModelProviderResponse;
+      if (response.status === 401) {
+        expireAuthentication();
+        setSettingsOpen(false);
+        return;
+      }
+      if (!response.ok || !body.provider) {
+        throw new Error(providerErrorMessage(body, "保存模型 Provider 失败"));
+      }
+      setProviderConfigured(true);
+      setProviderDraft({
+        provider_type: body.provider.provider_type,
+        base_url: body.provider.base_url,
+        model_name: body.provider.model_name,
+      });
+      setProviderKeyHint(body.provider.api_key_hint);
+      setProviderApiKey("");
+      setProviderStatus({ tone: "success", message: "模型 Provider 已保存" });
+    } catch (error) {
+      setProviderStatus({
+        tone: "error",
+        message: error instanceof Error ? error.message : "保存模型 Provider 失败",
+      });
+    } finally {
+      setProviderAction(null);
+    }
+  }
+
+  async function deleteModelProvider() {
+    if (!authReady || !providerConfigured || providerAction || identitySwitchBlocked) return;
+    if (!window.confirm("删除当前模型 Provider？删除后将无法发起新任务。")) return;
+    setProviderAction("deleting");
+    setProviderStatus(null);
+    try {
+      const response = await fetch(`${apiUrl}/model-provider`, {
+        method: "DELETE",
+        headers: authHeaders,
+      });
+      const body = await response.json() as ModelProviderResponse;
+      if (response.status === 401) {
+        expireAuthentication();
+        setSettingsOpen(false);
+        return;
+      }
+      if (!response.ok) throw new Error(providerErrorMessage(body, "删除模型 Provider 失败"));
+      setProviderConfigured(false);
+      setProviderDraft(DEFAULT_PROVIDER_DRAFT);
+      setProviderApiKey("");
+      setProviderKeyHint("");
+      setProviderStatus({ tone: "success", message: "模型 Provider 已删除" });
+    } catch (error) {
+      setProviderStatus({
+        tone: "error",
+        message: error instanceof Error ? error.message : "删除模型 Provider 失败",
+      });
+    } finally {
+      setProviderAction(null);
+    }
   }
 
   async function clearUserMemory() {
@@ -2352,7 +2571,7 @@ export default function App() {
         <div className="session-card">
           <div className="session-card__status">
             <span className="status-dot" aria-hidden="true" />
-            <span>{workspaceLocked ? "登录后启用 Supervisor" : stream.isLoading ? "Supervisor 正在回答" : "Supervisor 入口就绪"}</span>
+            <span>{workspaceLocked ? "登录后启用 Supervisor" : !providerReady ? "请先配置模型 Provider" : stream.isLoading ? "Supervisor 正在回答" : "Supervisor 入口就绪"}</span>
           </div>
           <code title={threadId ?? "等待创建"}>{workspaceLocked ? "会话功能已锁定" : threadId ?? "新会话 · 等待首次消息"}</code>
           <button
@@ -2670,6 +2889,16 @@ export default function App() {
           </button>
         ) : null}
 
+        {authReady && providerConfigured === false ? (
+          <section className="provider-required-card" role="status">
+            <div>
+              <strong>尚未配置模型 Provider</strong>
+              <span>填写 API 地址、模型名和 Key 后即可发起研究任务。</span>
+            </div>
+            <button type="button" onClick={openSettings}>前往设置</button>
+          </section>
+        ) : null}
+
         <form className={`composer${showDetails ? "" : " composer--compact"}`} onSubmit={onSubmit}>
           <div className="composer__field">
             <label htmlFor="research-input">
@@ -2677,6 +2906,8 @@ export default function App() {
                 ? "请先处理上方待确认事项"
                 : workspaceLocked
                   ? "登录后可开始研究任务"
+                : !providerReady
+                  ? "配置模型 Provider 后可开始研究任务"
                 : threadAllocating
                   ? "正在创建会话"
                 : stream.isLoading
@@ -2749,8 +2980,8 @@ export default function App() {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onComposerKeyDown}
-              placeholder={workspaceLocked ? "请先登录或注册" : "例如：分析已上传订单表的月度趋势和异常值，并生成图表……"}
-              disabled={workspaceLocked || pendingInterrupt !== null || threadAllocating}
+              placeholder={workspaceLocked ? "请先登录或注册" : !providerReady ? "请先在设置中配置模型 Provider" : "例如：分析已上传订单表的月度趋势和异常值，并生成图表……"}
+              disabled={workspaceLocked || !providerReady || pendingInterrupt !== null || threadAllocating}
             />
             <span>
               {pendingInterrupt
@@ -2764,7 +2995,7 @@ export default function App() {
             <button
               className="send-button"
               type="submit"
-              disabled={workspaceLocked || !input.trim() || pendingInterrupt !== null || !filesReadyForAnalysis || threadAllocating}
+              disabled={workspaceLocked || !providerReady || !input.trim() || pendingInterrupt !== null || !filesReadyForAnalysis || threadAllocating}
               aria-label={stream.isLoading ? "排队发送消息" : "发送分析任务"}
             >
               <span>{stream.isLoading ? "排队发送" : "发送任务"}</span>
@@ -2883,7 +3114,7 @@ export default function App() {
               <button
                 ref={settingsCloseButtonRef}
                 type="button"
-                disabled={memoryClearing || memorySettingsUpdating}
+                disabled={memoryClearing || memorySettingsUpdating || providerAction !== null}
                 onClick={closeSettings}
                 aria-label="关闭设置"
               >×</button>
@@ -2904,6 +3135,100 @@ export default function App() {
               >
                 <i aria-hidden="true"><b /></i>
               </button>
+            </div>
+
+            <div className="settings-section settings-section--provider">
+              <div className="settings-section__copy">
+                <strong>模型 Provider</strong>
+                <span>按当前账户加密保存。API Key 不会写入浏览器存储或任务消息。</span>
+              </div>
+              <div className="provider-settings-form">
+                <label>
+                  Provider 类型
+                  <select
+                    value={providerDraft.provider_type}
+                    disabled={!authReady || providerLoading || providerAction !== null || identitySwitchBlocked}
+                    onChange={(event) => setProviderDraft((current) => ({
+                      ...current,
+                      provider_type: event.target.value as ModelProviderType,
+                    }))}
+                  >
+                    <option value="openai_compatible">OpenAI-compatible</option>
+                    <option value="deepseek">DeepSeek（保留 reasoning）</option>
+                  </select>
+                </label>
+                <label>
+                  API Base URL
+                  <input
+                    type="url"
+                    value={providerDraft.base_url}
+                    disabled={!authReady || providerLoading || providerAction !== null || identitySwitchBlocked}
+                    onChange={(event) => setProviderDraft((current) => ({
+                      ...current,
+                      base_url: event.target.value,
+                    }))}
+                    placeholder="https://api.example.com/v1"
+                  />
+                </label>
+                <label>
+                  模型名
+                  <input
+                    value={providerDraft.model_name}
+                    disabled={!authReady || providerLoading || providerAction !== null || identitySwitchBlocked}
+                    onChange={(event) => setProviderDraft((current) => ({
+                      ...current,
+                      model_name: event.target.value,
+                    }))}
+                    placeholder="qwen-plus"
+                  />
+                </label>
+                <label>
+                  API Key
+                  <span className="provider-key-field">
+                    <input
+                      type={providerKeyVisible ? "text" : "password"}
+                      autoComplete="new-password"
+                      value={providerApiKey}
+                      disabled={!authReady || providerLoading || providerAction !== null || identitySwitchBlocked}
+                      onChange={(event) => setProviderApiKey(event.target.value)}
+                      placeholder={providerConfigured ? `已保存 · 尾号 ${providerKeyHint || "****"}，留空则保留` : "请输入 API Key"}
+                    />
+                    <button
+                      type="button"
+                      disabled={!providerApiKey}
+                      onClick={() => setProviderKeyVisible((current) => !current)}
+                      aria-label={providerKeyVisible ? "隐藏 API Key" : "显示 API Key"}
+                    >{providerKeyVisible ? "隐藏" : "显示"}</button>
+                  </span>
+                </label>
+                <div className="provider-settings-actions">
+                  <button
+                    type="button"
+                    disabled={!authReady || providerLoading || providerAction !== null}
+                    onClick={() => void testModelProvider()}
+                  >{providerAction === "testing" ? "测试中…" : "测试连接"}</button>
+                  <button
+                    type="button"
+                    disabled={!authReady || providerLoading || providerAction !== null || identitySwitchBlocked}
+                    onClick={() => void saveModelProvider()}
+                  >{providerAction === "saving" ? "保存中…" : "保存 Provider"}</button>
+                  {providerConfigured ? (
+                    <button
+                      type="button"
+                      className="provider-settings-delete"
+                      disabled={!authReady || providerAction !== null || identitySwitchBlocked}
+                      onClick={() => void deleteModelProvider()}
+                    >{providerAction === "deleting" ? "删除中…" : "删除"}</button>
+                  ) : null}
+                </div>
+                {providerLoading ? <p className="settings-hint">正在读取 Provider 配置…</p> : null}
+                {identitySwitchBlocked ? <p className="settings-hint">当前任务结束后才能修改 Provider。</p> : null}
+                {providerStatus ? (
+                  <p className={`settings-status settings-status--${providerStatus.tone}`} role="status">
+                    {providerStatus.message}
+                  </p>
+                ) : null}
+              </div>
             </div>
 
             <div className="settings-section">

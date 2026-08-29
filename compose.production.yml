@@ -12,6 +12,7 @@ x-backend-service: &backend-service
     REDIS_URL: redis://redis:6379/0
     REDIS_USERNAME: ddra
     REDIS_PASSWORD_FILE: /run/secrets/redis_password
+    MODEL_PROVIDER_ENCRYPTION_KEY_FILE: /run/secrets/model_provider_key
     CELERY_BROKER_URL: redis://redis:6379/1
     CELERY_REDIS_USERNAME: ddra-celery
     OPEN_SANDBOX_DOMAIN: opensandbox:8080
@@ -22,6 +23,7 @@ x-backend-service: &backend-service
     TZ: Asia/Shanghai
   secrets:
     - redis_password
+    - model_provider_key
   extra_hosts:
     # OpenSandbox bridge 模式返回宿主机动态端口，Linux 容器通过该名称访问。
     - host.docker.internal:host-gateway
@@ -322,6 +324,8 @@ volumes:
 secrets:
   redis_password:
     file: "${REDIS_PASSWORD_FILE_HOST:-./.secrets/redis_password}"
+  model_provider_key:
+    file: "${MODEL_PROVIDER_ENCRYPTION_KEY_FILE_HOST:-./.secrets/model_provider_key}"
   tls_certificate:
     file: "${TLS_CERTIFICATE_FILE_HOST:-./.secrets/tls/server.crt}"
   tls_private_key:

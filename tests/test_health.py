@@ -58,6 +58,7 @@ async def test_readiness_includes_workspace_storage(monkeypatch) -> None:
     monkeypatch.setattr(health.database, "check_database_ready", ready)
     monkeypatch.setattr(health, "ping_redis", ready)
     monkeypatch.setattr(health, "ping_mongodb", ready)
+    monkeypatch.setattr(health, "check_encryption_ready", lambda: None)
     monkeypatch.setattr(
         health.sandbox_manager.SANDBOX_MANAGER.workspace_store,
         "check_ready",
@@ -71,6 +72,7 @@ async def test_readiness_includes_workspace_storage(monkeypatch) -> None:
         "redis": "ok",
         "mongodb": "ok",
         "workspace_storage": "ok",
+        "provider_encryption": "ok",
     }
     assert checked == ["workspace"]
 
