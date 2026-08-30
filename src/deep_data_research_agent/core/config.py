@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
-from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -32,44 +30,6 @@ class _ReviewerChatOpenAI(_WorkerChatOpenAI):
         return params
 
 
-class _ThinkingChatDeepSeek(ChatDeepSeek):
-    """Preserve DeepSeek thinking context across multi-turn tool calls."""
-
-    _ls_provider_name: ClassVar[str] = "deep-data-worker"
-
-    def _get_ls_params(self, *args, **kwargs):
-        params = super()._get_ls_params(*args, **kwargs)
-        params["ls_provider"] = self._ls_provider_name
-        return params
-
-    def _get_request_payload(self, input_, *, stop=None, **kwargs):
-        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        payload_messages = payload.get("messages", [])
-        source_messages = self._convert_input(input_).to_messages()
-        # ChatDeepSeek extracts reasoning_content from responses but currently
-        # does not place it back into multi-turn chat-completion requests.
-        if len(payload_messages) == len(source_messages):
-            for source, target in zip(source_messages, payload_messages, strict=True):
-                if not isinstance(source, AIMessage) or not isinstance(target, dict):
-                    continue
-                reasoning = source.additional_kwargs.get("reasoning_content")
-                if reasoning is not None:
-                    target["reasoning_content"] = reasoning
-        return payload
-
-
-class _ReviewerChatDeepSeek(_ThinkingChatDeepSeek):
-    """Select the Reviewer harness while retaining multi-turn thinking."""
-
-    _ls_provider_name: ClassVar[str] = "deep-data-reviewer"
-
-
-class _SupervisorChatDeepSeek(_ThinkingChatDeepSeek):
-    """Use the Supervisor harness label with DeepSeek reasoning support."""
-
-    _ls_provider_name: ClassVar[str] = "openai"
-
-
 class Settings(BaseSettings):
     """Settings loaded from process environment or the local ``.env`` file."""
 
@@ -90,7 +50,8 @@ class Settings(BaseSettings):
     model_provider_host_allowlist: str = ""
     model_provider_timeout_seconds: float = Field(default=120.0, ge=5, le=300)
     model_provider_test_timeout_seconds: float = Field(default=20.0, ge=3, le=60)
-    model_provider_streaming: bool = False
+    # The UI consumes token and web-search lifecycle events while a run is active.
+    model_provider_streaming: bool = True
     model_provider_cache_size: int = Field(default=128, ge=1, le=1024)
     model_provider_cache_ttl_seconds: int = Field(default=900, ge=30, le=86400)
     tavily_api_key: str = ""
@@ -295,23 +256,9 @@ def create_chat_model(
 
 @lru_cache(maxsize=1)
 def create_data_analyst_model() -> BaseChatModel:
-    """Create a thinking-capable model for multi-turn data analysis."""
+    """Create the CLI/evaluation data-analysis model."""
 
     settings = get_settings()
-    if settings.openai_model.startswith("deepseek"):
-        extra_body: dict[str, object] | None = None
-        if settings.openai_model.startswith("deepseek-v4"):
-            extra_body = {"thinking": {"type": "enabled"}}
-        return _ThinkingChatDeepSeek(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key or "not-configured",
-            base_url=settings.openai_base_url,
-            temperature=0,
-            timeout=settings.openai_timeout_seconds,
-            max_retries=2,
-            streaming=False,
-            extra_body=extra_body,
-        )
     return _WorkerChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key or "not-configured",
@@ -325,23 +272,9 @@ def create_data_analyst_model() -> BaseChatModel:
 
 @lru_cache(maxsize=1)
 def create_reviewer_model() -> BaseChatModel:
-    """Create a thinking-capable model with Reviewer-only tool filtering."""
+    """Create the CLI/evaluation model with Reviewer-only tool filtering."""
 
     settings = get_settings()
-    if settings.openai_model.startswith("deepseek"):
-        extra_body: dict[str, object] | None = None
-        if settings.openai_model.startswith("deepseek-v4"):
-            extra_body = {"thinking": {"type": "enabled"}}
-        return _ReviewerChatDeepSeek(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key or "not-configured",
-            base_url=settings.openai_base_url,
-            temperature=0,
-            timeout=settings.openai_timeout_seconds,
-            max_retries=2,
-            streaming=False,
-            extra_body=extra_body,
-        )
     return _ReviewerChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key or "not-configured",

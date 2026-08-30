@@ -158,8 +158,9 @@ graph = create_deep_agent(
                 AsyncSubAgent(
                     name="crawl-worker",
                     description=(
-                        "使用 Tavily 搜索、爬取或提取公开网页，并返回带 URL 来源的"
-                        "采集结果和初步分析。所有网页任务都应委派给它。"
+                        "使用 Tavily 批量抓取、提取并持久化公开网页，返回带 URL 来源的"
+                        "采集结果和初步分析；适合长时间后台采集，不承接 Supervisor 可用"
+                        "web_search 完成的常规网页检索。"
                     ),
                     graph_id="crawl-worker",
                     # 不设置 url，使用同一部署内的 ASGI transport。

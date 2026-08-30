@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from blockbuster import blockbuster_ctx
 
 from deep_data_research_agent.core.config import Settings
 from deep_data_research_agent.infrastructure import workspace as workspace_module
@@ -48,6 +49,25 @@ async def test_local_workspace_store_contract_and_thread_isolation(tmp_path) -> 
     await store.delete_thread("user-a", "thread-a")
     assert await store.list(target) == []
     assert await store.read(sibling, "output/report.md") == b"sibling"
+
+
+@pytest.mark.asyncio
+async def test_local_workspace_store_does_not_block_event_loop(tmp_path) -> None:
+    """All filesystem syscalls must stay outside LangGraph's ASGI event loop."""
+
+    store = LocalWorkspaceStore(tmp_path)
+    scope = WorkspaceScope("user-a", "thread-a", "supervisor")
+
+    with blockbuster_ctx("deep_data_research_agent"):
+        await store.write_many(scope, [("output/report.md", b"report")])
+        assert len(await store.list(scope)) == 1
+        assert (await store.stat(scope, "output/report.md")).size == 6
+        assert await store.read(scope, "output/report.md") == b"report"
+        metadata, chunks = await store.stream(scope, "output/report.md")
+        assert metadata.size == 6
+        assert b"".join([chunk async for chunk in chunks]) == b"report"
+        await store.delete_file(scope, "output/report.md")
+        await store.delete_thread(scope.user_id, scope.thread_id)
 
 
 def test_workspace_scope_and_path_reject_cross_prefix_values(tmp_path) -> None:

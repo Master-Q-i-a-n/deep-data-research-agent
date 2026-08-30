@@ -30,11 +30,30 @@ type StreamState = {
   async_tasks?: Record<string, AsyncTask>;
 };
 
+type WebSearchSource = { title: string; url: string };
+type WebSearchAction = {
+  type: "search" | "open_page" | "find_in_page";
+  query?: string;
+  queries?: string[];
+  url?: string;
+  pattern?: string;
+};
+export type WebSearchProgressEvent = {
+  type: "web_search_progress";
+  phase: "in_progress" | "searching" | "completed";
+  item_id: string;
+  output_index: number;
+  sequence_number: number;
+  action?: WebSearchAction;
+  sources?: WebSearchSource[];
+};
+
 type Row =
   | { kind: "message"; key: string; role: "human" | "ai"; body: string; report: boolean }
-  | { kind: "tool"; key: string; card: ToolCard };
+  | { kind: "tool"; key: string; card: ToolCard }
+  | { kind: "web_search"; key: string; search: WebSearchProgressEvent };
 
-type CompactActivityKind = "planning" | "streaming" | "tool" | "todo" | "synthesizing" | "complete";
+type CompactActivityKind = "planning" | "streaming" | "tool" | "web_search" | "todo" | "synthesizing" | "complete";
 type CompactActivity = {
   kind: CompactActivityKind;
   text: string;
@@ -115,9 +134,7 @@ type MemorySettingsResponse = {
   cancelled_jobs?: number;
   detail?: string;
 };
-type ModelProviderType = "openai_compatible" | "deepseek";
 type ModelProvider = {
-  provider_type: ModelProviderType;
   base_url: string;
   model_name: string;
   has_api_key: boolean;
@@ -131,7 +148,7 @@ type ModelProviderResponse = {
   deleted?: boolean;
   detail?: string | LimitDetail;
 };
-type ModelProviderDraft = Pick<ModelProvider, "provider_type" | "base_url" | "model_name">;
+type ModelProviderDraft = Pick<ModelProvider, "base_url" | "model_name">;
 type LimitDetail = {
   code: string;
   message: string;
@@ -235,6 +252,141 @@ function messageText(content: unknown): string {
       return "";
     })
     .join("");
+}
+
+function safeHttpUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function annotatedTextMarkdown(text: string, annotations: unknown): string {
+  if (!Array.isArray(annotations) || annotations.length === 0) return text;
+  const characters = Array.from(text);
+  const citations = annotations.flatMap((annotation) => {
+    if (typeof annotation !== "object" || annotation === null) return [];
+    const raw = annotation as Record<string, unknown>;
+    if (raw.type !== "url_citation" && raw.type !== "citation") return [];
+    const url = safeHttpUrl(raw.url);
+    const start = raw.start_index;
+    const end = raw.end_index;
+    if (!url || !Number.isInteger(start) || !Number.isInteger(end)) return [];
+    const startIndex = Number(start);
+    const endIndex = Number(end);
+    if (startIndex < 0 || endIndex <= startIndex || endIndex > characters.length) return [];
+    return [{ startIndex, endIndex, url }];
+  }).sort((left, right) => right.startIndex - left.startIndex);
+
+  let rendered = characters;
+  let previousStart = characters.length;
+  for (const citation of citations) {
+    if (citation.endIndex > previousStart) continue;
+    const label = rendered
+      .slice(citation.startIndex, citation.endIndex)
+      .join("")
+      .replace(/([\\\[\]])/g, "\\$1");
+    rendered.splice(
+      citation.startIndex,
+      citation.endIndex - citation.startIndex,
+      `[${label}](<${citation.url}>)`,
+    );
+    previousStart = citation.startIndex;
+  }
+  return rendered.join("");
+}
+
+export function messageMarkdown(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => {
+    if (typeof part === "string") return part;
+    if (typeof part !== "object" || part === null || !("text" in part)) return "";
+    const raw = part as { text?: unknown; annotations?: unknown };
+    return annotatedTextMarkdown(String(raw.text ?? ""), raw.annotations);
+  }).join("");
+}
+
+function normalizedWebSearchSource(value: unknown): WebSearchSource | null {
+  if (typeof value !== "object" || value === null) return null;
+  const raw = value as Record<string, unknown>;
+  const url = safeHttpUrl(raw.url);
+  if (!url) return null;
+  const title = typeof raw.title === "string" && raw.title.trim()
+    ? raw.title.trim()
+    : new URL(url).hostname;
+  return { title, url };
+}
+
+export function normalizeWebSearchEvent(value: unknown): WebSearchProgressEvent | null {
+  if (typeof value !== "object" || value === null) return null;
+  const raw = value as Record<string, unknown>;
+  const phases = new Set(["in_progress", "searching", "completed"]);
+  if (
+    raw.type !== "web_search_progress"
+    || typeof raw.item_id !== "string"
+    || !raw.item_id
+    || !phases.has(String(raw.phase))
+    || !Number.isInteger(raw.output_index)
+    || !Number.isInteger(raw.sequence_number)
+  ) return null;
+
+  let action: WebSearchAction | undefined;
+  if (typeof raw.action === "object" && raw.action !== null) {
+    const source = raw.action as Record<string, unknown>;
+    if (source.type === "search" || source.type === "open_page" || source.type === "find_in_page") {
+      action = { type: source.type };
+      if (typeof source.query === "string") action.query = source.query;
+      if (Array.isArray(source.queries)) {
+        action.queries = source.queries.filter((item): item is string => typeof item === "string");
+      }
+      if (typeof source.url === "string") action.url = source.url;
+      if (typeof source.pattern === "string") action.pattern = source.pattern;
+    }
+  }
+  const sources: WebSearchSource[] = [];
+  const seen = new Set<string>();
+  if (Array.isArray(raw.sources)) {
+    for (const candidate of raw.sources) {
+      const source = normalizedWebSearchSource(candidate);
+      if (!source || seen.has(source.url)) continue;
+      seen.add(source.url);
+      sources.push(source);
+      if (sources.length >= 20) break;
+    }
+  }
+  return {
+    type: "web_search_progress",
+    phase: raw.phase as WebSearchProgressEvent["phase"],
+    item_id: raw.item_id,
+    output_index: Number(raw.output_index),
+    sequence_number: Number(raw.sequence_number),
+    ...(action ? { action } : {}),
+    ...(sources.length > 0 ? { sources } : {}),
+  };
+}
+
+function persistedWebSearches(content: unknown): WebSearchProgressEvent[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((part, index) => {
+    if (typeof part !== "object" || part === null) return [];
+    const raw = part as Record<string, unknown>;
+    if (raw.type !== "web_search_call" || typeof raw.id !== "string") return [];
+    return [normalizeWebSearchEvent({
+      type: "web_search_progress",
+      phase: "completed",
+      item_id: raw.id,
+      output_index: Number.isInteger(raw.index) ? raw.index : index,
+      sequence_number: Number.MAX_SAFE_INTEGER,
+      action: raw.action,
+      sources: typeof raw.action === "object" && raw.action !== null
+        ? (raw.action as Record<string, unknown>).sources
+        : undefined,
+    })].filter((item): item is WebSearchProgressEvent => item !== null);
+  });
 }
 
 function providerErrorMessage(body: ModelProviderResponse, fallback: string): string {
@@ -413,7 +565,12 @@ export function buildRows(messages: Message[]): Row[] {
 
   for (const message of messages) {
     if (message.type === "human" || message.type === "ai") {
-      const body = messageText(message.content).trim();
+      if (message.type === "ai") {
+        for (const search of persistedWebSearches(message.content)) {
+          rows.push({ kind: "web_search", key: `web-search-${search.item_id}`, search });
+        }
+      }
+      const body = messageMarkdown(message.content).trim();
       const hiddenTaskMonitorMessage = message.type === "human" && message.name === "async-task-monitor";
       if (body && !hiddenTaskMonitorMessage) {
         rows.push({
@@ -464,7 +621,7 @@ export function buildCompactTurns(messages: Message[]): CompactTurnData[] {
         if (current) current.lastEvent = "monitor";
         continue;
       }
-      const userBody = messageText(message.content).trim();
+      const userBody = messageMarkdown(message.content).trim();
       if (!userBody) continue;
       const userKey = message.id ?? `human-${index}`;
       current = {
@@ -482,7 +639,7 @@ export function buildCompactTurns(messages: Message[]): CompactTurnData[] {
     if (!current) continue;
 
     if (message.type === "ai") {
-      const body = messageText(message.content).trim();
+      const body = messageMarkdown(message.content).trim();
       if (body) {
         // 简略历史只保留本轮最后一条非空 AI 回复，不合并中间说明。
         current.assistantKey = message.id ?? `assistant-${current.userKey}-${index}`;
@@ -568,6 +725,7 @@ function compactActivity(
     todos: TodoItem[];
     interrupted: boolean;
     failed: boolean;
+    webSearch?: WebSearchProgressEvent;
   },
 ): CompactActivity {
   if (!options.active) {
@@ -585,6 +743,17 @@ function compactActivity(
   // 带工具调用的 AI 消息已经结束生成，应转而展示工具执行状态。
   if (turn.lastEvent === "ai-text" && turn.assistantBody) {
     return { kind: "streaming", text: turn.assistantBody, statusLabel: "生成中" };
+  }
+  if (options.webSearch) {
+    const query = options.webSearch.action?.query ?? options.webSearch.action?.queries?.[0];
+    if (options.webSearch.phase === "completed") {
+      return { kind: "web_search", text: "网页搜索完成，正在整理结果…", statusLabel: "整理中" };
+    }
+    return {
+      kind: "web_search",
+      text: query ? `正在搜索网页：${query}` : "正在搜索网页…",
+      statusLabel: "搜索中",
+    };
   }
   const pendingTool = [...turn.tools].reverse().find((toolCall) => !toolCall.completed);
   if (pendingTool) {
@@ -612,6 +781,71 @@ function BrandMark() {
     </span>
   );
 }
+
+function webSearchDescription(search: WebSearchProgressEvent): string {
+  const action = search.action;
+  if (action?.type === "search") {
+    return action.query ?? action.queries?.join("；") ?? "正在检索公开网页";
+  }
+  if (action?.type === "open_page") return action.url ?? "正在打开搜索结果";
+  if (action?.type === "find_in_page") {
+    return action.pattern ? `页内查找：${action.pattern}` : action.url ?? "正在查找页面内容";
+  }
+  return search.phase === "completed" ? "网页搜索已完成" : "正在搜索网页";
+}
+
+function webSearchSourceLabel(source: { title: string; url: string }): string {
+  try {
+    return new URL(source.url).hostname.replace(/^www\./, "");
+  } catch {
+    return source.title;
+  }
+}
+
+const WebSearchCard = memo(function WebSearchCard({
+  search,
+  active = false,
+}: {
+  search: WebSearchProgressEvent;
+  active?: boolean;
+}) {
+  const complete = search.phase === "completed";
+  const status = complete ? (active ? "正在整理" : "已完成") : "搜索中";
+  return (
+    <section
+      className={`web-search-card${complete ? " is-complete" : " is-searching"}`}
+      aria-live={active ? "polite" : undefined}
+    >
+      <svg className="web-search-card__icon" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.25" />
+        <path d="M3.75 12h16.5M12 3.75c2.1 2.25 3.15 5 3.15 8.25S14.1 18 12 20.25C9.9 18 8.85 15.25 8.85 12S9.9 6 12 3.75Z" />
+      </svg>
+      <strong>{complete ? "已搜索网页" : "正在搜索网页"}</strong>
+      <div className="web-search-card__content">
+        <span className="web-search-card__description">{webSearchDescription(search)}</span>
+        {search.sources?.length ? (
+          <span className="web-search-card__sources" aria-label="网页搜索来源">
+            <span aria-hidden="true">|</span>
+            {search.sources.map((source, index) => (
+              <span className="web-search-card__source" key={source.url}>
+                {index > 0 ? <span aria-hidden="true"> · </span> : null}
+                <a
+                  href={source.url}
+                  title={source.title}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {webSearchSourceLabel(source)}
+                </a>
+              </span>
+            ))}
+          </span>
+        ) : null}
+      </div>
+      <span className="web-search-card__status">{status}</span>
+    </section>
+  );
+});
 
 type MessageCardProps = {
   messageKey: string;
@@ -652,6 +886,7 @@ const MessageCard = memo(function MessageCard({
                   threadId={threadId}
                 />
               ),
+              a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" />,
             }}
           >
             {body}
@@ -680,7 +915,6 @@ type CompactTurnViewProps = {
   onStop: () => void;
 };
 const DEFAULT_PROVIDER_DRAFT: ModelProviderDraft = {
-  provider_type: "openai_compatible",
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   model_name: "qwen-plus",
 };
@@ -739,6 +973,7 @@ const CompactTurnView = memo(function CompactTurnView({
                     threadId={threadId}
                   />
                 ),
+                a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" />,
               }}
             >
               {turn.assistantBody}
@@ -975,6 +1210,9 @@ export default function App() {
     tone: "success" | "error";
     message: string;
   } | null>(null);
+  const [liveWebSearches, setLiveWebSearches] = useState<Map<string, WebSearchProgressEvent>>(
+    () => new Map(),
+  );
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const conversationRef = useRef<HTMLElement>(null);
@@ -1015,6 +1253,10 @@ export default function App() {
   const authReady = authStatus === "ready";
   const workspaceLocked = !authReady;
   const providerReady = providerConfigured === true;
+  useEffect(() => {
+    // Search progress belongs to one authenticated thread and is never persisted locally.
+    setLiveWebSearches(new Map());
+  }, [authUser.id, threadId]);
   const expireAuthentication = useCallback(() => {
     // 保留当前页面数据，只撤销失效凭据并锁定后续服务端操作。
     window.localStorage.removeItem(AUTH_TOKEN_KEY);
@@ -1221,6 +1463,18 @@ export default function App() {
     }
   }, [apiUrl, authHeaders, authReady, expireAuthentication, threadId]);
 
+  const handleCustomEvent = useCallback((value: unknown) => {
+    const event = normalizeWebSearchEvent(value);
+    if (!event) return;
+    setLiveWebSearches((current) => {
+      const previous = current.get(event.item_id);
+      if (previous && previous.sequence_number >= event.sequence_number) return current;
+      const next = new Map(current);
+      next.set(event.item_id, event);
+      return next;
+    });
+  }, []);
+
   // 当前前端只持有远程图的状态类型，无法把 Python DeepAgent 类型直接传给
   // useStream；使用宽化后的选项仍可启用 SDK 内置的子智能体跟踪能力。
   const streamOptions = {
@@ -1238,13 +1492,16 @@ export default function App() {
     // onFinish 会让 SDK 在运行结束后重新读取主图 thread head，防止子图
     // values 成为最后一个本地快照时把主对话清空。
     onCreated: runManager.recordCreated,
+    onCustomEvent: handleCustomEvent,
     onError: (error: unknown, run: { run_id: string; thread_id: string } | undefined) => {
       setThreadAllocating(false);
+      setLiveWebSearches(new Map());
       runManager.recordError(error, run);
     },
     onFinish: (state: unknown, run: { run_id: string; thread_id: string } | undefined) => {
       void state;
       setThreadAllocating(false);
+      setLiveWebSearches(new Map());
       runManager.recordFinished(run);
     },
     onThreadId: (id: string) => {
@@ -1259,7 +1516,10 @@ export default function App() {
       void loadSessions();
     },
   };
-  const baseStream = useStream<StreamState, { InterruptType: HITLRequest }>(streamOptions);
+  const baseStream = useStream<StreamState, {
+    InterruptType: HITLRequest;
+    CustomEventType: WebSearchProgressEvent;
+  }>(streamOptions);
   const stream = baseStream as typeof baseStream & {
     subagents: Map<string, SubagentTraceStream>;
   };
@@ -1321,6 +1581,17 @@ export default function App() {
     [rows, visibleRowLimit],
   );
   const hiddenRowCount = rows.length - visibleRows.length;
+  const persistedSearchIds = useMemo(
+    () => new Set(rows.flatMap((row) => row.kind === "web_search" ? [row.search.item_id] : [])),
+    [rows],
+  );
+  const visibleLiveWebSearches = useMemo(
+    () => [...liveWebSearches.values()]
+      .filter((search) => !persistedSearchIds.has(search.item_id))
+      .sort((left, right) => left.output_index - right.output_index),
+    [liveWebSearches, persistedSearchIds],
+  );
+  const latestLiveWebSearch = visibleLiveWebSearches.at(-1);
   const lastMessageKey = useMemo(() => {
     for (let index = rows.length - 1; index >= 0; index -= 1) {
       const row = rows[index];
@@ -1349,9 +1620,10 @@ export default function App() {
         todos,
         interrupted: pendingInterrupt !== null,
         failed: Boolean(stream.error),
+        webSearch: latestLiveWebSearch,
       }),
     }));
-  }, [displayedMessages, pendingInterrupt, queuedEntries, showDetails, stream.error, stream.isLoading, todos]);
+  }, [displayedMessages, latestLiveWebSearch, pendingInterrupt, queuedEntries, showDetails, stream.error, stream.isLoading, todos]);
   const activeCompactTurn = stream.isLoading ? compactTurns.at(-1) : undefined;
   const compactFollowKey = activeCompactTurn
     ? `${activeCompactTurn.userKey}:${activeCompactTurn.activity.kind}:${activeCompactTurn.activity.text}`
@@ -1708,7 +1980,6 @@ export default function App() {
         setProviderKeyHint(provider?.api_key_hint ?? "");
         if (provider) {
           setProviderDraft({
-            provider_type: provider.provider_type,
             base_url: provider.base_url,
             model_name: provider.model_name,
           });
@@ -2111,6 +2382,7 @@ export default function App() {
     }
     const multitaskOptions = stream.isLoading ? { multitaskStrategy: mode } : {};
 
+    setLiveWebSearches(new Map());
     void stream.submit(
       { messages: [{ type: "human", content: message }] },
       {
@@ -2152,6 +2424,7 @@ export default function App() {
     try {
       const submissionId = await requestRunAdmission(threadId);
       if (!submissionId) return;
+      setLiveWebSearches(new Map());
       await stream.submit(null, {
         command: { resume: { decisions } },
         metadata: { deep_data_ui: { submission_id: submissionId } },
@@ -2447,7 +2720,6 @@ export default function App() {
       }
       setProviderConfigured(true);
       setProviderDraft({
-        provider_type: body.provider.provider_type,
         base_url: body.provider.base_url,
         model_name: body.provider.model_name,
       });
@@ -2707,6 +2979,8 @@ export default function App() {
                 card={row.card}
                 subagent={row.card.name === "task" ? displayedSubagents.get(row.card.callId) : undefined}
               />
+            ) : row.kind === "web_search" ? (
+              <WebSearchCard key={row.key} search={row.search} active={stream.isLoading} />
             ) : (
               <MessageCard
                 key={row.key}
@@ -2732,6 +3006,14 @@ export default function App() {
                   threadId={threadId}
                   onStop={stopStream}
                 />
+              ))}
+            </div>
+          ) : null}
+
+          {showDetails && visibleLiveWebSearches.length > 0 ? (
+            <div className="web-search-live" aria-label="当前网页搜索">
+              {visibleLiveWebSearches.map((search) => (
+                <WebSearchCard key={search.item_id} search={search} active={stream.isLoading} />
               ))}
             </div>
           ) : null}
@@ -3143,20 +3425,6 @@ export default function App() {
                 <span>按当前账户加密保存。API Key 不会写入浏览器存储或任务消息。</span>
               </div>
               <div className="provider-settings-form">
-                <label>
-                  Provider 类型
-                  <select
-                    value={providerDraft.provider_type}
-                    disabled={!authReady || providerLoading || providerAction !== null || identitySwitchBlocked}
-                    onChange={(event) => setProviderDraft((current) => ({
-                      ...current,
-                      provider_type: event.target.value as ModelProviderType,
-                    }))}
-                  >
-                    <option value="openai_compatible">OpenAI-compatible</option>
-                    <option value="deepseek">DeepSeek（保留 reasoning）</option>
-                  </select>
-                </label>
                 <label>
                   API Base URL
                   <input

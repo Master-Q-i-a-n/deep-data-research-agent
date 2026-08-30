@@ -14,7 +14,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.database import repository as database
 
-PROVIDER_TYPES = frozenset({"openai_compatible", "deepseek"})
+_STORED_PROVIDER_TYPE = "openai_compatible"
 
 
 class ProviderConfigurationError(ValueError):
@@ -28,7 +28,6 @@ class ProviderNotConfiguredError(ProviderConfigurationError):
 @dataclass(frozen=True, slots=True)
 class ResolvedProvider:
     user_id: str
-    provider_type: str
     base_url: str
     model_name: str
     api_key: str
@@ -152,27 +151,21 @@ async def validate_provider_url(value: str) -> str:
     return normalized
 
 
-def _validate_provider_fields(provider_type: str, model_name: str) -> tuple[str, str]:
-    normalized_type = provider_type.strip().lower()
+def _validate_model_name(model_name: str) -> str:
     normalized_model = model_name.strip()
-    if normalized_type not in PROVIDER_TYPES:
-        raise ProviderConfigurationError("不支持的 Provider 类型")
     if not normalized_model or len(normalized_model) > 128:
         raise ProviderConfigurationError("模型名不能为空或过长")
-    return normalized_type, normalized_model
+    return normalized_model
 
 
 async def save_provider(
     *,
     user_id: str,
-    provider_type: str,
     base_url: str,
     model_name: str,
     api_key: str | None,
 ) -> database.ModelProviderRecord:
-    normalized_type, normalized_model = _validate_provider_fields(
-        provider_type, model_name
-    )
+    normalized_model = _validate_model_name(model_name)
     normalized_url = await validate_provider_url(base_url)
     ciphertext: str | None = None
     hint: str | None = None
@@ -180,7 +173,9 @@ async def save_provider(
         ciphertext, hint = encrypt_api_key(api_key)
     return await database.upsert_model_provider(
         user_id=user_id,
-        provider_type=normalized_type,
+        # Keep the legacy column populated until a future schema cleanup. It is
+        # no longer exposed or used for runtime routing.
+        provider_type=_STORED_PROVIDER_TYPE,
         base_url=normalized_url,
         model_name=normalized_model,
         api_key_ciphertext=ciphertext,
@@ -196,7 +191,6 @@ async def resolve_provider(user_id: str) -> ResolvedProvider:
     base_url = await validate_provider_url(record.base_url)
     return ResolvedProvider(
         user_id=record.user_id,
-        provider_type=record.provider_type,
         base_url=base_url,
         model_name=record.model_name,
         api_key=decrypt_api_key(record.api_key_ciphertext),
@@ -210,7 +204,6 @@ async def get_public_provider(user_id: str) -> dict[str, object] | None:
     if record is None:
         return None
     return {
-        "provider_type": record.provider_type,
         "base_url": record.base_url,
         "model_name": record.model_name,
         "has_api_key": True,
@@ -225,7 +218,6 @@ async def delete_provider(user_id: str) -> bool:
 
 
 __all__ = [
-    "PROVIDER_TYPES",
     "ProviderConfigurationError",
     "ProviderNotConfiguredError",
     "ResolvedProvider",

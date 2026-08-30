@@ -3,7 +3,8 @@ param(
     [string]$SandboxDistro = "Debian",
     [string]$SandboxConfig = "~/.sandbox.toml",
     [switch]$SkipRedis,
-    [switch]$SkipFrontend
+    [switch]$SkipFrontend,
+    [switch]$UseOssWorkspace
 )
 
 $ErrorActionPreference = "Stop"
@@ -144,6 +145,11 @@ if ($LASTEXITCODE -ne 0) {
 
 New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 $env:PYTHONUTF8 = "1"
+# The development launcher owns these two mode switches. Explicit environment
+# variables override values left in .env and are inherited by every child process.
+$env:APP_ENV = "development"
+$env:WORKSPACE_STORAGE_BACKEND = if ($UseOssWorkspace) { "oss" } else { "local" }
+Write-Host ("[config]  Workspace storage: {0}" -f $env:WORKSPACE_STORAGE_BACKEND)
 
 if (-not $SkipRedis) {
     $redisHealth = (& $docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' redis 2>$null | Out-String).Trim()

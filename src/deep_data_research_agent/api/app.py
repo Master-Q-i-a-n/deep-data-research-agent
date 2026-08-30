@@ -70,7 +70,6 @@ from deep_data_research_agent.providers.models import (
     test_provider_model,
 )
 from deep_data_research_agent.providers.service import (
-    PROVIDER_TYPES,
     ProviderConfigurationError,
     ProviderNotConfiguredError,
     ResolvedProvider,
@@ -698,7 +697,6 @@ async def update_model_provider(
                 raise HTTPException(status_code=409, detail=_provider_busy_detail(busy))
             record = await save_provider(
                 user_id=user_id,
-                provider_type=payload.provider_type,
                 base_url=payload.base_url,
                 model_name=payload.model_name,
                 api_key=(
@@ -728,8 +726,6 @@ async def test_model_provider(
 ) -> JSONResponse:
     user_id = await _authenticated_user_id(authorization)
     try:
-        if payload.provider_type not in PROVIDER_TYPES:
-            raise ProviderConfigurationError("不支持的 Provider 类型")
         model_name = payload.model_name.strip()
         if not model_name:
             raise ProviderConfigurationError("模型名不能为空")
@@ -742,7 +738,6 @@ async def test_model_provider(
             raise ProviderConfigurationError("API Key 不能为空")
         draft = ResolvedProvider(
             user_id=user_id,
-            provider_type=payload.provider_type,
             base_url=base_url,
             model_name=model_name,
             api_key=api_key,

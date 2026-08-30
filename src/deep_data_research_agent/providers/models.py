@@ -21,10 +21,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.config import get_config
 
 from deep_data_research_agent.core.config import (
-    _ReviewerChatDeepSeek,
     _ReviewerChatOpenAI,
-    _SupervisorChatDeepSeek,
-    _ThinkingChatDeepSeek,
     _WorkerChatOpenAI,
     get_settings,
 )
@@ -32,7 +29,11 @@ from deep_data_research_agent.core.identity import (
     user_identity,
     user_identity_from_config,
 )
-from deep_data_research_agent.providers.model_profiles import model_profile
+from deep_data_research_agent.providers.model_profiles import (
+    model_capabilities,
+    model_profile,
+)
+from deep_data_research_agent.providers.responses import SupervisorResponsesChatOpenAI
 from deep_data_research_agent.providers.service import (
     ResolvedProvider,
     resolve_provider,
@@ -60,19 +61,17 @@ _MODEL_CACHE: OrderedDict[tuple[str, int, ModelRole], _CacheEntry] = OrderedDict
 _MODEL_CACHE_LOCK = asyncio.Lock()
 
 
-def _model_class(provider: ResolvedProvider, role: ModelRole) -> type[BaseChatModel]:
-    if provider.provider_type == "deepseek":
-        if role == "supervisor":
-            return _SupervisorChatDeepSeek
-        if role == "analysis-reviewer":
-            return _ReviewerChatDeepSeek
-        return _ThinkingChatDeepSeek
+def _model_class(role: ModelRole) -> type[BaseChatModel]:
+    """Choose only the local harness class; protocol selection comes from YAML."""
+
     if role == "analysis-reviewer":
         return _ReviewerChatOpenAI
     if role in {"data-analyst", "crawl-worker"}:
         return _WorkerChatOpenAI
-    # Generic OpenAI-compatible Supervisor, memory, and connection tests do
-    # not need a harness-specific subclass.
+    if role == "supervisor":
+        return SupervisorResponsesChatOpenAI
+    # Generic OpenAI-compatible memory and connection tests do not need a
+    # harness-specific subclass.
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI
@@ -94,13 +93,25 @@ def _build_model(
     # a model request into an internal network after URL validation.
     sync_client = httpx.Client(follow_redirects=False, timeout=timeout)
     async_client = httpx.AsyncClient(follow_redirects=False, timeout=timeout)
-    extra_body: dict[str, object] | None = None
-    if provider.provider_type == "deepseek" and provider.model_name.startswith(
-        "deepseek-v4"
-    ):
-        extra_body = {"thinking": {"type": "enabled"}}
-    model_class = _model_class(provider, role)
+    model_class = _model_class(role)
     streaming = role == "supervisor" and settings.model_provider_streaming
+    capabilities = model_capabilities(provider.model_name)
+    model_options: dict[str, Any] = {}
+    if capabilities.supports_responses_api:
+        # Responses-compatible providers differ in supported include values.
+        # Only send values explicitly declared for this exact model.
+        include = [
+            value
+            for value in capabilities.responses_include
+            if value != "web_search_call.action.sources" or role == "supervisor"
+        ]
+        model_options.update(
+            use_responses_api=True,
+            output_version="responses/v1",
+            store=False,
+        )
+        if include:
+            model_options["include"] = include
     model = model_class(
         model=provider.model_name,
         api_key=provider.api_key,
@@ -111,7 +122,7 @@ def _build_model(
         streaming=streaming,
         http_client=sync_client,
         http_async_client=async_client,
-        extra_body=extra_body,
+        **model_options,
     )
     local_profile = model_profile(provider.model_name)
     if local_profile is not None:
@@ -191,7 +202,21 @@ class ProviderModelMiddleware(AgentMiddleware):
 
     async def awrap_model_call(self, request: ModelRequest, handler) -> ModelResponse:
         model = await get_runtime_model(user_identity(request.runtime), self.role)
-        return await handler(request.override(model=model))
+        overrides: dict[str, Any] = {"model": model}
+        capabilities = model_capabilities(model.model_name)
+        if (
+            self.role == "supervisor"
+            and capabilities.supports_responses_api
+            and capabilities.supports_web_search
+        ):
+            tools = list(request.tools)
+            if not any(
+                isinstance(tool, dict) and tool.get("type") == "web_search"
+                for tool in tools
+            ):
+                tools.append({"type": "web_search"})
+            overrides["tools"] = tools
+        return await handler(request.override(**overrides))
 
 
 class ProviderSummaryChatModel(BaseChatModel):

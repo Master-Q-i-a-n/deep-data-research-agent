@@ -14,6 +14,8 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
   只读分析，并返回稳定 JSON 文本契约。
 - ASGI co-deployed `crawl-worker`，拥有独立 thread 和上下文。
 - Tavily Search、Crawl、Extract 三种采集入口。
+- 内置 Supervisor `deep-research` Skill：明确要求深度研究或复杂任务具备多个研究信号时，
+  编排多轮检索、证据补缺与冲突核验；单次搜索和单页摘要不触发，也不新增研究子智能体。
 - Agent 使用 `OpenSandbox + StateBackend + StoreBackend` 混合后端。
 - 每个 Worker thread 独占一个沙箱，成功后导出本地产物快照。
 - 沙箱内可执行仅限数据处理和分析用途的 Python 脚本。
@@ -232,12 +234,19 @@ Windows 临时目录的 `deep-data-research-agent/dev-logs/`，避免日志触�
 脚本会等待 OpenSandbox、LangGraph 和前端端口可用后再报告就绪。按 `Ctrl+C` 会停止本次启动的
 开发进程，但保留 Redis 容器。Alembic 迁移仍需
 在部署或数据库结构变更时单独执行，不会随开发启动自动运行。发行版或配置路径不同时可传入
-`-SandboxDistro` 和 `-SandboxConfig`。
+`-SandboxDistro` 和 `-SandboxConfig`。开发脚本会显式使用 `APP_ENV=development` 和本地工作区
+存储，即使 `.env` 中残留了部署环境的 OSS 选择也不会误连 OSS。
 
 已有外部 Redis 或只需要后端进程时可使用：
 
 ```powershell
 .\scripts\dev.ps1 -SkipRedis -SkipFrontend
+```
+
+仅在需要从本机显式调试 OSS，并且已经配置可用的 OSS 凭据与网络时使用：
+
+```powershell
+.\scripts\dev.ps1 -UseOssWorkspace
 ```
 
 ## OpenSandbox

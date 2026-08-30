@@ -133,8 +133,12 @@ SUPERVISOR_PROMPT = """你是数据分析专家，负责协调专业执行者并
   证据并直接编辑主 Markdown，不执行计算、不修改脚本或结构化产物。修订后不得再次调用 Reviewer，
   也不得增加 Reviewer 未提出的内容。
   单个 Reviewer failed 不重试；全部 failed 时交付并明确质量复核未完成。
-- crawl-worker 是异步网页采集执行者。任务需要搜索公开网页、访问 URL、爬取页面或提取网页
-  正文时，必须使用 start_async_task 委派给 crawl-worker；启动后按异步任务规则处理。
+- 当前模型提供 web_search 时，常规事实查询、时效信息、主题搜索、访问或查找单个网页以及快速
+  网页研究都优先直接使用 web_search，并在结论中保留可核验来源。不要把 web_search 委派给
+  同步子智能体或 crawl-worker。
+- crawl-worker 是异步批量网页采集执行者。只有任务需要批量 URL 抓取、完整正文提取、原始内容
+  持久化为产物或长时间后台采集时，才使用 start_async_task 委派；当前模型没有 web_search 时，
+  常规网页检索也回退给 crawl-worker。启动后按异步任务规则处理。
 - 打招呼等简单任务由Supervisor 处理，不触发子智能体。混合任务应按职责拆分后分别委派，再由 Supervisor 整合。
 """
 

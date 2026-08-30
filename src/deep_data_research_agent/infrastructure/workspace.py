@@ -171,7 +171,9 @@ class LocalWorkspaceStore:
         *,
         prefix: str | PurePosixPath | None = None,
     ) -> list[WorkspaceObject]:
-        root = self.workspace_path(scope).resolve()
+        # Path.resolve() performs filesystem calls on Windows, so keep it off
+        # the ASGI event loop together with the directory traversal below.
+        root = await asyncio.to_thread(self.workspace_path(scope).resolve)
         relative_prefix = workspace_relative_path(prefix) if prefix is not None else None
 
         def collect() -> list[WorkspaceObject]:
@@ -207,7 +209,7 @@ class LocalWorkspaceStore:
         scope: WorkspaceScope,
         path: str | PurePosixPath,
     ) -> WorkspaceObject:
-        relative, target = self._file_path(scope, path)
+        relative, target = await asyncio.to_thread(self._file_path, scope, path)
 
         def stat() -> WorkspaceObject:
             if target.is_symlink() or not target.is_file():
@@ -224,7 +226,7 @@ class LocalWorkspaceStore:
         scope: WorkspaceScope,
         path: str | PurePosixPath,
     ) -> bytes:
-        relative, target = self._file_path(scope, path)
+        relative, target = await asyncio.to_thread(self._file_path, scope, path)
 
         def read() -> bytes:
             if target.is_symlink() or not target.is_file():
@@ -239,7 +241,7 @@ class LocalWorkspaceStore:
         path: str | PurePosixPath,
     ) -> tuple[WorkspaceObject, AsyncIterator[bytes]]:
         metadata = await self.stat(scope, path)
-        _relative, target = self._file_path(scope, path)
+        _relative, target = await asyncio.to_thread(self._file_path, scope, path)
 
         async def chunks() -> AsyncIterator[bytes]:
             async with aiofiles.open(target, "rb") as source:
@@ -253,9 +255,15 @@ class LocalWorkspaceStore:
         scope: WorkspaceScope,
         files: Iterable[tuple[str | PurePosixPath, bytes]],
     ) -> None:
-        normalized = [
-            (self._file_path(scope, path)[1], content) for path, content in files
-        ]
+        pending = list(files)
+
+        def normalize() -> list[tuple[Path, bytes]]:
+            return [
+                (self._file_path(scope, path)[1], content)
+                for path, content in pending
+            ]
+
+        normalized = await asyncio.to_thread(normalize)
 
         def write() -> None:
             for target, content in normalized:
@@ -269,8 +277,8 @@ class LocalWorkspaceStore:
         scope: WorkspaceScope,
         path: str | PurePosixPath,
     ) -> None:
-        _relative, target = self._file_path(scope, path)
-        root = self.workspace_path(scope).resolve()
+        _relative, target = await asyncio.to_thread(self._file_path, scope, path)
+        root = await asyncio.to_thread(self.workspace_path(scope).resolve)
 
         def delete() -> None:
             if target.is_file() or target.is_symlink():
@@ -287,11 +295,15 @@ class LocalWorkspaceStore:
 
     async def delete_thread(self, user_id: str, thread_id: str) -> None:
         scope = WorkspaceScope(user_id=user_id, thread_id=thread_id, component="scope")
-        jobs_root = (self.root / scope.user_id / "jobs").resolve()
-        target = (jobs_root / scope.thread_id).resolve()
-        if not target.is_relative_to(jobs_root):
-            raise ValueError("拒绝删除用户任务目录之外的路径")
-        await asyncio.to_thread(shutil.rmtree, target, True)
+
+        def delete() -> None:
+            jobs_root = (self.root / scope.user_id / "jobs").resolve()
+            target = (jobs_root / scope.thread_id).resolve()
+            if not target.is_relative_to(jobs_root):
+                raise ValueError("拒绝删除用户任务目录之外的路径")
+            shutil.rmtree(target, True)
+
+        await asyncio.to_thread(delete)
 
     async def check_ready(self) -> None:
         await asyncio.to_thread(self.root.mkdir, parents=True, exist_ok=True)

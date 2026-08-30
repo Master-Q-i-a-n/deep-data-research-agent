@@ -1,7 +1,6 @@
 import json
 from types import SimpleNamespace
 
-import openai
 import pytest
 from deepagents import AsyncSubAgent
 from langchain.agents import create_agent
@@ -34,9 +33,7 @@ from deep_data_research_agent.agents.prompts import (
     SUPERVISOR_PROMPT,
 )
 from deep_data_research_agent.core.config import (
-    create_data_analyst_model,
     create_reviewer_model,
-    get_settings,
 )
 
 
@@ -741,62 +738,6 @@ def test_prompts_forbid_unrequested_search_and_optional_reviewer_work() -> None:
     assert "passed 时 issues 必须为空" in ANALYSIS_REVIEWER_PROMPT
     assert "因 LLM 调用上限返回 failed 时也绝不重试" in SUPERVISOR_PROMPT
     assert "不得增加 Reviewer 未提出的内容" in SUPERVISOR_PROMPT
-
-
-def test_deepseek_data_analyst_enables_and_round_trips_thinking() -> None:
-    if not get_settings().openai_model.startswith("deepseek-v4"):
-        pytest.skip("only applies to DeepSeek V4")
-
-    model = create_data_analyst_model()
-    assert model.extra_body == {"thinking": {"type": "enabled"}}
-    payload = model._get_request_payload(
-        [
-            AIMessage(
-                content="",
-                additional_kwargs={"reasoning_content": "继续分析"},
-            )
-        ]
-    )
-    assert payload["messages"][0]["reasoning_content"] == "继续分析"
-
-
-def test_deepseek_reviewer_enables_and_round_trips_thinking() -> None:
-    if not get_settings().openai_model.startswith("deepseek-v4"):
-        pytest.skip("only applies to DeepSeek V4")
-
-    model = create_reviewer_model()
-    assert model.extra_body == {"thinking": {"type": "enabled"}}
-    payload = model._get_request_payload(
-        [
-            AIMessage(
-                content="",
-                additional_kwargs={"reasoning_content": "核验证据"},
-            )
-        ]
-    )
-    assert payload["messages"][0]["reasoning_content"] == "核验证据"
-
-    raw = openai.types.chat.ChatCompletion.model_validate(
-        {
-            "id": "reviewer-response",
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning_content": "继续核验",
-                    },
-                }
-            ],
-            "created": 0,
-            "model": get_settings().openai_model,
-            "object": "chat.completion",
-        }
-    )
-    result = model._create_chat_result(raw)
-    assert result.generations[0].message.additional_kwargs["reasoning_content"] == "继续核验"
 
 
 @pytest.mark.asyncio

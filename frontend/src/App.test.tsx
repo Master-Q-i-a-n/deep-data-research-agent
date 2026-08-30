@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App from "./App";
+import App, { messageMarkdown, normalizeWebSearchEvent } from "./App";
 
 const submit = vi.fn();
 const stop = vi.fn();
@@ -18,7 +18,7 @@ let capturedClientConfig: Record<string, unknown> | null = null;
 type TestMessage = {
   id: string;
   type: string;
-  content: string;
+  content: unknown;
   name?: string;
   status?: string;
   tool_calls?: Array<{ id: string; name: string; args: Record<string, unknown> }>;
@@ -140,7 +140,6 @@ function withDevelopmentAuth(handler: FetchHandler) {
         json: async () => ({
           configured: true,
           provider: {
-            provider_type: "openai_compatible",
             base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
             model_name: "qwen-plus",
             has_api_key: true,
@@ -218,7 +217,6 @@ beforeEach(() => {
         json: async () => ({
           configured: true,
           provider: {
-            provider_type: "openai_compatible",
             base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
             model_name: "qwen-plus",
             has_api_key: true,
@@ -259,6 +257,142 @@ afterEach(() => {
 });
 
 describe("研究工作台", () => {
+  it("将安全的 URL citation 渲染为行内 Markdown 链接", () => {
+    const markdown = messageMarkdown([{
+      type: "text",
+      text: "结果【1】",
+      annotations: [{
+        type: "url_citation",
+        start_index: 2,
+        end_index: 5,
+        title: "OpenAI",
+        url: "https://developers.openai.com/api/docs/guides/tools-web-search",
+      }],
+    }]);
+
+    expect(markdown).toContain("[【1】](<https://developers.openai.com/api/docs/guides/tools-web-search>)");
+    expect(messageMarkdown([{
+      type: "text",
+      text: "不安全引用",
+      annotations: [{ type: "url_citation", start_index: 0, end_index: 5, url: "javascript:alert(1)" }],
+    }])).toBe("不安全引用");
+  });
+
+  it("校验网页搜索自定义事件并过滤重复或危险来源", () => {
+    expect(normalizeWebSearchEvent({
+      type: "web_search_progress",
+      phase: "completed",
+      item_id: "ws-1",
+      output_index: 0,
+      sequence_number: 3,
+      action: { type: "search", query: "Responses API" },
+      sources: [
+        { title: "OpenAI", url: "https://developers.openai.com/" },
+        { title: "重复", url: "https://developers.openai.com/" },
+        { title: "危险", url: "javascript:alert(1)" },
+      ],
+    })?.sources).toEqual([
+      { title: "OpenAI", url: "https://developers.openai.com/" },
+    ]);
+  });
+
+  it("实时显示搜索阶段、查询和来源，且忽略乱序事件", async () => {
+    streamState.isLoading = true;
+    streamState.values.todos = [];
+    streamState.messages = [{ id: "human-search", type: "human", content: "查找最新资料" }];
+    const view = render(<App />);
+    await screen.findByText("默认账户");
+
+    const onCustomEvent = capturedOptions?.onCustomEvent as (event: unknown) => void;
+    await act(async () => onCustomEvent({
+      type: "web_search_progress",
+      phase: "searching",
+      item_id: "ws-live",
+      output_index: 0,
+      sequence_number: 2,
+      action: { type: "search", query: "Responses API 最新文档" },
+    }));
+    expect(screen.getByText("正在搜索网页：Responses API 最新文档")).toBeTruthy();
+
+    await act(async () => onCustomEvent({
+      type: "web_search_progress",
+      phase: "searching",
+      item_id: "ws-live",
+      output_index: 0,
+      sequence_number: 1,
+      action: { type: "search", query: "过期查询" },
+    }));
+    expect(screen.queryByText(/过期查询/)).toBeNull();
+
+    await act(async () => onCustomEvent({
+      type: "web_search_progress",
+      phase: "completed",
+      item_id: "ws-live",
+      output_index: 0,
+      sequence_number: 3,
+      action: { type: "search", query: "Responses API 最新文档" },
+      sources: [{ title: "OpenAI Docs", url: "https://developers.openai.com/" }],
+    }));
+    expect(screen.getByText("网页搜索完成，正在整理结果…")).toBeTruthy();
+
+    enableDetailedMode();
+    expect(screen.getByText("正在整理")).toBeTruthy();
+    const source = screen.getByRole("link", { name: "developers.openai.com" });
+    expect(source.getAttribute("href")).toBe("https://developers.openai.com/");
+    expect(source.getAttribute("target")).toBe("_blank");
+
+    // 单次搜索完成后仍可能在生成答案；整轮运行结束时状态必须随之收敛。
+    streamState.isLoading = false;
+    view.rerender(<App />);
+    expect(screen.getByText("已完成")).toBeTruthy();
+    expect(screen.queryByText("正在整理")).toBeNull();
+  });
+
+  it("从持久化 Responses 内容块恢复搜索卡和可点击行内引用", () => {
+    streamState.values.todos = [];
+    streamState.messages = [
+      { id: "human-history", type: "human", content: "查询资料" },
+      {
+        id: "ai-history",
+        type: "ai",
+        content: [
+          {
+            type: "web_search_call",
+            id: "ws-history",
+            index: 0,
+            status: "completed",
+            action: {
+              type: "search",
+              query: "LangChain Responses",
+              sources: [{ type: "url", url: "https://python.langchain.com/docs/" }],
+            },
+          },
+          {
+            type: "text",
+            text: "参考【1】",
+            annotations: [{
+              type: "url_citation",
+              start_index: 2,
+              end_index: 5,
+              title: "LangChain",
+              url: "https://python.langchain.com/docs/",
+            }],
+          },
+        ],
+      },
+    ];
+    render(<App />);
+    enableDetailedMode();
+
+    expect(screen.getByText("LangChain Responses")).toBeTruthy();
+    const searchRow = screen.getByText("已搜索网页").closest("section");
+    expect(searchRow).not.toBeNull();
+    expect(within(searchRow as HTMLElement).getByText("已完成")).toBeTruthy();
+    expect(within(searchRow as HTMLElement).queryByText("正在整理")).toBeNull();
+    expect(screen.getByRole("link", { name: "python.langchain.com" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "【1】" }).getAttribute("href"))
+      .toBe("https://python.langchain.com/docs/");
+  });
   it("将相对 API 地址解析为 LangGraph SDK 可使用的绝对地址", async () => {
     vi.stubEnv("VITE_LANGGRAPH_API_URL", "/api");
 
@@ -714,7 +848,6 @@ describe("研究工作台", () => {
           json: async () => ({
             configured: true,
             provider: {
-              provider_type: "openai_compatible",
               base_url: "https://models.example.com/v1",
               model_name: "safe-model",
               has_api_key: true,
@@ -744,6 +877,7 @@ describe("研究工作台", () => {
     await screen.findByText("尚未配置模型 Provider");
     expect((screen.getByRole("button", { name: "发送分析任务" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "前往设置" }));
+    expect(screen.queryByLabelText("Provider 类型")).toBeNull();
     fireEvent.change(screen.getByLabelText("API Base URL"), {
       target: { value: "https://models.example.com/v1" },
     });
@@ -757,7 +891,6 @@ describe("研究工作台", () => {
 
     await screen.findByText("模型 Provider 已保存");
     expect(savedBody).toEqual({
-      provider_type: "openai_compatible",
       base_url: "https://models.example.com/v1",
       model_name: "safe-model",
       api_key: secret,
@@ -770,7 +903,6 @@ describe("研究工作台", () => {
   it("已保存 Key 可留空测试、更新和删除", async () => {
     streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
     const provider = {
-      provider_type: "openai_compatible",
       base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
       model_name: "qwen-max",
       has_api_key: true,
@@ -813,7 +945,6 @@ describe("研究工作台", () => {
       {
         method: "POST",
         body: {
-          provider_type: "openai_compatible",
           base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
           model_name: "qwen-max",
         },
@@ -821,7 +952,6 @@ describe("研究工作台", () => {
       {
         method: "PUT",
         body: {
-          provider_type: "openai_compatible",
           base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
           model_name: "qwen-max",
         },
