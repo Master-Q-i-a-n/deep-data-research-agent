@@ -1,8 +1,8 @@
 # Redis 限流运维说明
 
-项目使用 `compose.redis.yaml` 管理独立 Redis 7.4，数据保存在外部卷 `redis-data`。限流和
-Token 桶使用 DB 0；Celery Broker 复用同一容器的 DB 1。两者都不依赖容器 ID、容器 IP，
-也不把 ACL 密码写入 `.env`。
+项目使用 `compose.redis.yaml` 构建并管理 `deep-data-research-agent/redis:7.4`。容器名为
+`ddra-redis`，数据保存在 `ddra-redis-data` 卷。限流和 Token 桶使用 DB 0；Celery Broker
+复用同一容器的 DB 1。两者都不依赖容器 ID、容器 IP，也不把 ACL 密码写入 `.env`。
 
 ## Token 桶一致性
 
@@ -33,16 +33,15 @@ Token 桶使用 DB 0；Celery Broker 复用同一容器的 DB 1。两者都不�
 
 1. 创建 `.secrets/redis_password`（64 位随机十六进制密码，已被 Git 忽略）。
 2. 校验 Compose 配置。
-3. 若检测到旧容器 `f10fedb99816`，先把 `redis-data` 完整备份到
-   `.redis-backups/redis-data-<时间>.tar.gz`，备份成功后才停止并移除旧容器。
-4. 启动 Compose 服务，并验证健康检查、匿名访问拒绝、`ddra` 和 `ddra-celery` 用户认证。
+3. 若检测到本项目旧的 `redis` 容器，直接移除旧容器及 `redis-data` 卷。
+4. 构建项目镜像并启动 `ddra-redis`，验证健康检查、匿名访问拒绝以及 `ddra`、
+   `ddra-celery` 用户认证。
 
-脚本可以重复执行；Compose 已接管容器后不会重复迁移数据卷。不要提交 `.secrets/` 或
-`.redis-backups/`。
+脚本可以重复执行。不要提交 `.secrets/` 或 `.redis-backups/`。
 
 ## 安全与持久化
 
-- 端口只发布到 `127.0.0.1:6379`，不接受外部网络连接。
+- 容器内仍监听 6379，宿主机只发布到 `127.0.0.1:16379`，不接受外部网络连接。
 - `default` 用户关闭；`ddra` 只能访问 `ddra:*`，`ddra-celery` 只能访问
   `ddra-celery:*`。两个ACL用户复用同一密码文件。
 - ACL 只开放 PING、TIME、项目 Lua 脚本及 ZSET、HASH、TTL、锁所需命令。
@@ -57,12 +56,12 @@ Token 桶使用 DB 0；Celery Broker 复用同一容器的 DB 1。两者都不�
 
 ```powershell
 docker compose -f .\compose.redis.yaml config --quiet
-docker inspect redis --format '{{.State.Health.Status}}'
-docker exec redis redis-cli --no-auth-warning PING
-docker exec redis sh -c 'REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli --user ddra --no-auth-warning PING'
-docker exec redis sh -c 'REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli --user ddra-celery --no-auth-warning -n 1 PING'
-docker exec redis sh -c 'grep -E "^(appendonly|appendfsync|maxmemory|maxmemory-policy) " /usr/local/etc/redis/redis.conf'
-docker exec redis sh -c 'test -d /data/appendonlydir && echo "AOF directory OK"'
+docker inspect ddra-redis --format '{{.State.Health.Status}}'
+docker exec ddra-redis redis-cli --no-auth-warning PING
+docker exec ddra-redis sh -c 'REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli --user ddra --no-auth-warning PING'
+docker exec ddra-redis sh -c 'REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli --user ddra-celery --no-auth-warning -n 1 PING'
+docker exec ddra-redis sh -c 'grep -E "^(appendonly|appendfsync|maxmemory|maxmemory-policy) " /usr/local/etc/redis/redis.conf'
+docker exec ddra-redis sh -c 'test -d /data/appendonlydir && echo "AOF directory OK"'
 ```
 
 预期结果依次为：Compose 校验成功、`healthy`、匿名请求返回 `NOAUTH`、两个认证请求返回 `PONG`，
@@ -75,10 +74,10 @@ docker exec redis sh -c 'test -d /data/appendonlydir && echo "AOF directory OK"'
 ```powershell
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 docker run --rm --entrypoint sh `
-  --volume 'redis-data:/source:ro' `
+  --volume 'ddra-redis-data:/source:ro' `
   --volume "${PWD}/.redis-backups:/backup" `
   redis:7.4-alpine `
-  -c "tar -czf /backup/redis-data-$stamp.tar.gz -C /source ."
+  -c "tar -czf /backup/ddra-redis-data-$stamp.tar.gz -C /source ."
 ```
 
 恢复会覆盖当前 Redis 数据，只能在明确选定备份文件并停止服务后操作：
@@ -87,7 +86,7 @@ docker run --rm --entrypoint sh `
 docker compose -f .\compose.redis.yaml down
 # 将 <备份文件名> 替换为 .redis-backups 中已核验的具体文件。
 docker run --rm --entrypoint sh `
-  --volume 'redis-data:/target' `
+  --volume 'ddra-redis-data:/target' `
   --volume "${PWD}/.redis-backups:/backup:ro" `
   redis:7.4-alpine `
   -c 'rm -rf /target/* && tar -xzf /backup/<备份文件名> -C /target'

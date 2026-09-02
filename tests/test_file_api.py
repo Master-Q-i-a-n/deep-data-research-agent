@@ -15,6 +15,8 @@ from deep_data_research_agent.infrastructure.workspace import (
     WorkspaceScope,
 )
 
+TEST_USER_ID = "user-a"
+
 
 class _ThreadClient:
     async def get(self, *, thread_id: str):
@@ -33,7 +35,7 @@ def _request():
 
 def _install_workspace_store(monkeypatch, tmp_path: Path) -> Path:
     store = LocalWorkspaceStore(tmp_path)
-    scope = WorkspaceScope(database.DEFAULT_USER_ID, "thread-a", "supervisor")
+    scope = WorkspaceScope(TEST_USER_ID, "thread-a", "supervisor")
     sandbox_manager.SANDBOX_MANAGER._thread_users.pop("thread-a", None)
     monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
     return store.workspace_path(scope)
@@ -42,9 +44,13 @@ def _install_workspace_store(monkeypatch, tmp_path: Path) -> Path:
 @pytest.fixture
 def owned_thread(monkeypatch):
     async def owner(_thread_id: str) -> str:
-        return database.DEFAULT_USER_ID
+        return TEST_USER_ID
+
+    async def authenticated_user(_authorization: str | None) -> str:
+        return TEST_USER_ID
 
     monkeypatch.setattr(database, "get_thread_owner", owner)
+    monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated_user)
 
 
 def _xlsx_bytes() -> bytes:
@@ -157,7 +163,11 @@ async def test_file_list_hides_foreign_thread(monkeypatch) -> None:
     async def owner(_thread_id: str) -> str:
         return "other-user"
 
+    async def authenticated_user(_authorization: str | None) -> str:
+        return TEST_USER_ID
+
     monkeypatch.setattr(database, "get_thread_owner", owner)
+    monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated_user)
 
     with pytest.raises(HTTPException) as caught:
         await webapp.list_uploaded_files("thread-a", _request(), None)
@@ -174,7 +184,7 @@ async def test_file_api_rejects_crawl_worker_thread(monkeypatch, owned_thread) -
     with pytest.raises(HTTPException) as caught:
         await webapp._require_owned_supervisor_thread(
             "thread-a",
-            database.DEFAULT_USER_ID,
+            TEST_USER_ID,
             SimpleNamespace(threads=WorkerThreads()),
         )
 
@@ -255,5 +265,5 @@ async def test_delete_file_calls_owned_supervisor_sandbox(
     )
 
     assert result == {"status": "deleted", "path": "/workspace/input/orders.csv"}
-    assert ensured == [("thread-a", "supervisor", database.DEFAULT_USER_ID)]
+    assert ensured == [("thread-a", "supervisor", TEST_USER_ID)]
     assert deleted == [("thread-a", "/workspace/input/orders.csv", "supervisor")]

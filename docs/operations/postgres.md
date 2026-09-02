@@ -31,5 +31,5 @@ uv run setup-agent-postgres
 3. 启动 API、Celery worker 和 Beat。
 4. 确认 `/health/ready` 返回 200。
 
-运行进程只校验 Alembic head 和 checkpoint 表可读性，并幂等初始化默认账户/Token 桶数据；
+运行进程只校验 Alembic head 和 checkpoint 表可读性，并幂等初始化已注册用户的 Token 桶数据；
 不会执行任何 DDL。回滚迁移必须人工评估数据影响，不在应用启动或失败恢复中自动 downgrade。

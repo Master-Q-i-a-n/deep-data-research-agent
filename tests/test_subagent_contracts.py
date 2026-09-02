@@ -769,6 +769,7 @@ async def test_async_launch_propagates_evaluation_metadata(monkeypatch) -> None:
         ],
         system_prompt=None,
     )
+    assert "cancel_async_task" not in {item.name for item in middleware.tools}
     tool = next(item for item in middleware.tools if item.name == "start_async_task")
     runtime = ToolRuntime(
         state={},

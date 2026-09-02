@@ -142,7 +142,7 @@ flowchart LR
 
 ## 11. 多用户、安全与 HITL
 
-- 生产身份读取 LangGraph Server 认证用户；开发环境使用显式 `LOCAL_DEV_USER_ID` 回退。
+- 所有环境只读取 LangGraph Server 认证用户，不提供匿名或本地默认身份回退。
 - Agent Server 按 metadata 校验 thread、run、assistant 和 store 权限。
 - 身份字段由服务端 Runtime Context 注入，禁止模型自行生成。
 - URL 访问必须防止 SSRF、内网地址访问和危险重定向。

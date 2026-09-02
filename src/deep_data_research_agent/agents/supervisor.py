@@ -178,7 +178,6 @@ graph = create_deep_agent(
                 "start_async_task",
                 "check_async_task",
                 "update_async_task",
-                "cancel_async_task",
                 "list_async_tasks",
                 "assign_skill",
                 "request_report_download",

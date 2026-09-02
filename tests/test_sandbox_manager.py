@@ -652,7 +652,7 @@ async def test_real_opensandbox_write_execute_and_export(tmp_path) -> None:
     manager = sandbox_manager.SandboxManager(artifact_root=tmp_path)
     thread_id = "integration-thread"
     try:
-        backend = await manager.ensure(thread_id, user_id="local-user")
+        backend = await manager.ensure(thread_id, user_id="user-a")
         await manager.upload_workspace_files(
             thread_id,
             [("/workspace/hello.py", b"print('sandbox-ok')")],
@@ -663,7 +663,7 @@ async def test_real_opensandbox_write_execute_and_export(tmp_path) -> None:
         assert len(await manager.export_workspace(thread_id)) == 1
         assert (
             tmp_path
-            / "local-user"
+            / "user-a"
             / "jobs"
             / thread_id
             / "crawl-worker"

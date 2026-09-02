@@ -152,7 +152,7 @@ $env:WORKSPACE_STORAGE_BACKEND = if ($UseOssWorkspace) { "oss" } else { "local" 
 Write-Host ("[config]  Workspace storage: {0}" -f $env:WORKSPACE_STORAGE_BACKEND)
 
 if (-not $SkipRedis) {
-    $redisHealth = (& $docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' redis 2>$null | Out-String).Trim()
+    $redisHealth = (& $docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' ddra-redis 2>$null | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $redisHealth -ne "healthy") {
         Write-Host "Redis is missing or unhealthy. Running the Compose setup..."
         & (Join-Path $workspaceRoot "scripts/setup/redis.ps1")

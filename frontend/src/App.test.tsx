@@ -120,14 +120,14 @@ type FetchHandler = (
   init?: RequestInit,
 ) => Promise<unknown>;
 
-function withDevelopmentAuth(handler: FetchHandler) {
+function withAuthenticatedUser(handler: FetchHandler) {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     if (url.endsWith("/auth/me")) {
       return {
         ok: true,
         json: async () => ({
-          user: { id: "local-user", username: "默认账户", is_default: true },
+          user: { id: "user-a", username: "Alice" },
         }),
       };
     }
@@ -212,7 +212,7 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string | URL | Request) => {
     const url = String(input);
     if (url.endsWith("/auth/me")) {
-      return { ok: true, json: async () => ({ user: { id: "local-user", username: "默认账户", is_default: true } }) };
+      return { ok: true, json: async () => ({ user: { id: "user-a", username: "Alice" } }) };
     }
     if (url.endsWith("/memories/settings")) {
       return { ok: true, status: 200, json: async () => ({ failure_lesson_saving_enabled: true }) };
@@ -233,6 +233,22 @@ beforeEach(() => {
             version: 1,
             updated_at: "2026-08-28T10:00:00",
           },
+        }),
+      };
+    }
+    if (url.endsWith("/async-tasks/task-123456789/cancel")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          task: {
+            task_id: "task-123456789",
+            thread_id: "task-123456789",
+            run_id: "run-123456789",
+            agent_name: "crawl-worker",
+            status: "cancelled",
+          },
+          cancelled_runs: 1,
         }),
       };
     }
@@ -327,7 +343,7 @@ describe("研究工作台", () => {
       provider_version: 1,
     };
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
     await screen.findByDisplayValue("qwen-plus");
@@ -394,7 +410,7 @@ describe("研究工作台", () => {
     streamState.values.todos = [];
     streamState.messages = [{ id: "human-search", type: "human", content: "查找最新资料" }];
     const view = render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     const onCustomEvent = capturedOptions?.onCustomEvent as (event: unknown) => void;
     await act(async () => onCustomEvent({
@@ -490,14 +506,14 @@ describe("研究工作台", () => {
     vi.stubEnv("VITE_LANGGRAPH_API_URL", "/api");
 
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     expect(capturedClientConfig?.apiUrl).toBe(`${window.location.origin}/api`);
   });
 
   it("新任务取得 thread ID 后立即刷新左侧会话记录", async () => {
     let searchCount = 0;
-    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withAuthenticatedUser(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       if (String(input).endsWith("/threads/search")) {
         searchCount += 1;
         return {
@@ -538,7 +554,7 @@ describe("研究工作台", () => {
       options?.status === "running" ? [activeRun] : []
     ));
     joinStream.mockResolvedValue(undefined);
-    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withAuthenticatedUser(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       if (String(input).endsWith("/threads/search")) {
         return {
           ok: true,
@@ -565,19 +581,20 @@ describe("研究工作台", () => {
     await waitFor(() => expect(joinStream).toHaveBeenCalledWith("run-active"));
   });
 
-  it("未登录时使用默认账户且不发送认证头", async () => {
+  it("恢复登录账户并向 LangGraph SDK 发送认证头", async () => {
+    window.localStorage.setItem("deep-data-auth-token", "token-a");
     render(<App />);
 
-    expect(await screen.findByText("默认账户")).toBeTruthy();
+    expect(await screen.findByText("Alice")).toBeTruthy();
     expectDetailedMode(false);
     expect(screen.queryByLabelText("研究执行状态")).toBeNull();
-    expect(capturedOptions?.defaultHeaders).toEqual({});
+    expect(capturedOptions?.defaultHeaders).toEqual({ Authorization: "Bearer token-a" });
     expect(capturedOptions?.filterSubagentMessages).toBe(true);
     expect(capturedOptions?.onFinish).toEqual(expect.any(Function));
     expect((capturedOptions?.onFinish as ((state: unknown, run: unknown) => void)).length).toBe(2);
   });
 
-  it("生产环境未登录时保留首页并锁定任务功能", async () => {
+  it("未登录时保留首页并锁定任务功能", async () => {
     streamState.messages = [];
     streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
@@ -625,7 +642,7 @@ describe("研究工作台", () => {
         return {
           ok: true,
           status: 200,
-          json: async () => ({ user: { id: "user-a", username: "Alice", is_default: false } }),
+          json: async () => ({ user: { id: "user-a", username: "Alice" } }),
         };
       }
       if (url.endsWith("/auth/me") || url.endsWith("/threads/search")) {
@@ -715,12 +732,11 @@ describe("研究工作台", () => {
     expect(screen.getByText(/最终回答继续流式增长。/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "停止回答" }));
-    await waitFor(() => expect(cancelRun).toHaveBeenCalledWith(
-      "thread-current",
-      "run-active",
-      true,
-      "interrupt",
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/threads/thread-current/cancel-all",
+      expect.objectContaining({ method: "POST" }),
     ));
+    expect(cancelRun).not.toHaveBeenCalled();
     expect(stop).not.toHaveBeenCalled();
 
     enableDetailedMode();
@@ -792,7 +808,7 @@ describe("研究工作台", () => {
     ];
 
     const view = render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     fireEvent.change(screen.getByLabelText("补充要求或纠正方向"), {
       target: { value: "再增加区域对比" },
     });
@@ -831,14 +847,14 @@ describe("研究工作台", () => {
           ok: true,
           json: async () => ({
             token: "token-a",
-            user: { id: "user-a", username: "Alice", is_default: false },
+            user: { id: "user-a", username: "Alice" },
           }),
         };
       }
       if (String(input).endsWith("/auth/me")) {
         return {
           ok: true,
-          json: async () => ({ user: { id: "user-a", username: "Alice", is_default: false } }),
+          json: async () => ({ user: { id: "user-a", username: "Alice" } }),
         };
       }
       return { ok: true, json: async () => [] };
@@ -870,7 +886,7 @@ describe("研究工作台", () => {
         return {
           ok: true,
           status: 200,
-          json: async () => ({ user: { id: "user-a", username: "Alice", is_default: false } }),
+          json: async () => ({ user: { id: "user-a", username: "Alice" } }),
         };
       }
       if (url.endsWith("/memories/user") && init?.method === "DELETE") {
@@ -923,7 +939,7 @@ describe("研究工作台", () => {
         return {
           ok: true,
           status: 200,
-          json: async () => ({ user: { id: "local-user", username: "默认账户", is_default: true } }),
+          json: async () => ({ user: { id: "user-a", username: "Alice" } }),
         };
       }
       if (url.endsWith("/memories/settings")) {
@@ -1008,7 +1024,7 @@ describe("研究工作台", () => {
       updated_at: "2026-08-28T10:00:00",
     };
     const mutationBodies: Array<{ method: string; body?: Record<string, unknown> }> = [];
-    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", withAuthenticatedUser(vi.fn().mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/model-provider/test")) {
         mutationBodies.push({ method: "POST", body: JSON.parse(String(init?.body)) as Record<string, unknown> });
@@ -1035,7 +1051,7 @@ describe("研究工作台", () => {
     })));
     render(<App />);
 
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
     expect((screen.getByLabelText("API Key") as HTMLInputElement).placeholder).toContain("尾号 1234");
@@ -1076,7 +1092,7 @@ describe("研究工作台", () => {
         return {
           ok: true,
           status: 200,
-          json: async () => ({ user: { id: "local-user", username: "默认账户", is_default: true } }),
+          json: async () => ({ user: { id: "user-a", username: "Alice" } }),
         };
       }
       if (url.endsWith("/memories/settings") && init?.method === "PATCH") {
@@ -1099,7 +1115,7 @@ describe("研究工作台", () => {
     vi.stubGlobal("fetch", fetchMock);
     render(<App />);
 
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
     const toggle = await screen.findByRole("switch", { name: "失败经验整理" });
@@ -1122,7 +1138,7 @@ describe("研究工作台", () => {
   it("运行期间设置弹窗允许切换显示但禁止清除记忆", async () => {
     streamState.isLoading = true;
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
@@ -1153,7 +1169,7 @@ describe("研究工作台", () => {
         },
       ]),
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
 
     expect(await screen.findByText("比较三家产品价格")).toBeTruthy();
@@ -1184,7 +1200,7 @@ describe("研究工作台", () => {
         { thread_id: "thread-b", metadata: { title: "会话 B" }, status: "idle" },
       ]),
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "打开会话：会话 B" }));
@@ -1220,7 +1236,7 @@ describe("研究工作台", () => {
         { thread_id: "thread-b", metadata: { title: "任务 B" }, status: "idle" },
       ]),
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
 
     await waitFor(() => expect(joinStream).toHaveBeenCalledTimes(1));
@@ -1249,7 +1265,7 @@ describe("研究工作台", () => {
         }]),
       };
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "删除会话：待删除的采购会话" }));
@@ -1291,7 +1307,7 @@ describe("研究工作台", () => {
         status: "busy",
       }]),
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "删除会话：不可删除的运行会话" }));
@@ -1306,7 +1322,7 @@ describe("研究工作台", () => {
 
   it("展示 DeepAgents 计划、异步任务和工具调用", async () => {
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     enableDetailedMode();
 
     expect(screen.getByText("研究步骤")).toBeTruthy();
@@ -1471,7 +1487,7 @@ describe("研究工作台", () => {
   it("提交自然语言任务到 supervisor", async () => {
     streamState.messages = [];
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     const input = screen.getByLabelText("描述你的网页或文件分析任务");
     fireEvent.change(input, { target: { value: "抓取官网并生成报告" } });
@@ -1509,7 +1525,7 @@ describe("研究工作台", () => {
     [429, "TOKEN_BUDGET_EXHAUSTED", "Token 额度不足，请等待整点补充", "Token 额度不足"],
     [503, "RATE_LIMIT_SERVICE_UNAVAILABLE", "请求保护服务暂不可用，请稍后重试", "暂时无法发起任务"],
   ])("准入返回 %s 时弹窗且保留未发送输入", async (status, code, message, title) => {
-    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withAuthenticatedUser(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       if (String(input).endsWith("/run-admissions")) {
         return {
           ok: false,
@@ -1529,7 +1545,7 @@ describe("研究工作台", () => {
     })));
     streamState.messages = [];
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     const input = screen.getByLabelText("描述你的网页或文件分析任务");
     fireEvent.change(input, { target: { value: "这条消息不能丢" } });
@@ -1542,7 +1558,7 @@ describe("研究工作台", () => {
 
   it("3 个运行会话超限时列出并可跳转到自己的活跃会话", async () => {
     const activeThreadId = "11111111-1111-4111-8111-111111111111";
-    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withAuthenticatedUser(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/run-admissions")) {
         return {
@@ -1574,7 +1590,7 @@ describe("研究工作台", () => {
     })));
     streamState.messages = [];
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     fireEvent.change(screen.getByLabelText("描述你的网页或文件分析任务"), {
       target: { value: "第四个会话" },
@@ -1679,9 +1695,9 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     const file = new File(["id,amount\n001,10\n"], "orders.csv", { type: "text/csv" });
     fireEvent.change(screen.getByLabelText("选择本地表格文件"), {
@@ -1742,7 +1758,7 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
 
     expect(await screen.findByText("history.xlsx")).toBeTruthy();
@@ -1758,7 +1774,7 @@ describe("研究工作台", () => {
   it("配置刷新恢复当前活动流", async () => {
     render(<App />);
 
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     expect(capturedOptions?.reconnectOnMount).toBe(false);
     expect(capturedOptions?.throttle).toBe(false);
   });
@@ -1770,7 +1786,7 @@ describe("研究工作台", () => {
         ? { tasks: [{ ...streamState.values.async_tasks["task-123456789"], status: "running" }] }
         : []),
     }));
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
 
     render(<App />);
@@ -1792,7 +1808,7 @@ describe("研究工作台", () => {
         ? { tasks: [{ ...streamState.values.async_tasks["task-123456789"], status: "success" }] }
         : []),
     }));
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
 
     render(<App />);
@@ -1833,7 +1849,7 @@ describe("研究工作台", () => {
           }
         : []),
     }));
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     window.history.replaceState({}, "", "http://localhost:5174/?thread=parent-thread");
 
     render(<App />);
@@ -1852,7 +1868,7 @@ describe("研究工作台", () => {
     window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-current");
     streamState.isLoading = true;
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     const input = screen.getByLabelText("补充要求或纠正方向") as HTMLTextAreaElement;
     expect(input.disabled).toBe(false);
@@ -1882,7 +1898,7 @@ describe("研究工作台", () => {
   it("可以立即纠正正在运行的 Supervisor", async () => {
     streamState.isLoading = true;
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     fireEvent.change(screen.getByLabelText("补充要求或纠正方向"), {
       target: { value: "停止国外数据，只分析国内数据" },
@@ -1903,7 +1919,7 @@ describe("研究工作台", () => {
 
   it("任务卡通过 Supervisor 检查完整 task id", async () => {
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "检查进度" }));
@@ -1925,7 +1941,7 @@ describe("研究工作台", () => {
   it("任务卡可以立即补充 crawl-worker 要求", async () => {
     streamState.isLoading = true;
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "补充要求" }));
@@ -1950,27 +1966,24 @@ describe("研究工作台", () => {
   });
 
   it("任务卡可以取消 crawl-worker", async () => {
+    window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-current");
     streamState.isLoading = true;
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
     enableDetailedMode();
 
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
 
     expect(window.confirm).toHaveBeenCalled();
-    await waitFor(() => expect(submit).toHaveBeenCalledWith({
-      messages: [{
-        type: "human",
-        content: "请调用 cancel_async_task 取消任务 task-123456789。",
-      }],
-    }, {
-      metadata: { deep_data_ui: { submission_id: expect.any(String) } },
-      multitaskStrategy: "interrupt",
-      optimisticValues: expect.any(Function),
-      streamSubgraphs: true,
-      streamResumable: true,
-      onDisconnect: "continue",
-    }));
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:2024/async-tasks/task-123456789/cancel",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ thread_id: "thread-current" }),
+      }),
+    ));
+    expect(submit).not.toHaveBeenCalled();
+    expect(await screen.findByText("已取消")).toBeTruthy();
   });
 
   it("展示并管理 Supervisor 服务端等待队列", async () => {
@@ -2002,7 +2015,7 @@ describe("研究工作台", () => {
       pendingIds.delete(runId);
     });
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     const input = screen.getByLabelText("补充要求或纠正方向");
     fireEvent.change(input, { target: { value: "报告增加一张对比表" } });
@@ -2029,7 +2042,7 @@ describe("研究工作台", () => {
 
   it("把新 thread id 写入 URL", async () => {
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     act(() => {
       (capturedOptions?.onThreadId as ((id: string) => void) | undefined)?.("thread-abc");
@@ -2085,7 +2098,7 @@ describe("研究工作台", () => {
     Object.defineProperty(window.URL, "createObjectURL", { configurable: true, value: createObjectURL });
     Object.defineProperty(window.URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
-    vi.stubGlobal("fetch", withDevelopmentAuth(vi.fn().mockImplementation(async (input: string | URL | Request) => {
+    vi.stubGlobal("fetch", withAuthenticatedUser(vi.fn().mockImplementation(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes("/artifacts/thread-a/bundle")) {
         return { ok: true, blob: async () => new Blob(["# 报告"]) };
@@ -2243,7 +2256,7 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("final_report.md")).toBeTruthy());
@@ -2272,7 +2285,7 @@ describe("研究工作台", () => {
       }
       return { ok: true, json: async () => [] };
     });
-    vi.stubGlobal("fetch", withDevelopmentAuth(fetchMock));
+    vi.stubGlobal("fetch", withAuthenticatedUser(fetchMock));
     streamState.messages = [
       { id: "human-chart", type: "human", content: "显示图表" },
       { id: "ai-chart", type: "ai", content: "![价格对比](charts/price.png)" },
@@ -2289,7 +2302,7 @@ describe("研究工作台", () => {
 
   it("开始新任务时清空草稿并切换到空 thread", async () => {
     render(<App />);
-    await screen.findByText("默认账户");
+    await screen.findByText("Alice");
 
     const input = screen.getByLabelText("描述你的网页或文件分析任务") as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: "尚未提交的研究任务" } });

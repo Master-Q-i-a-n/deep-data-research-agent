@@ -13,7 +13,7 @@ import unicodedata
 import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated
 from urllib.parse import quote
@@ -35,6 +35,7 @@ from deep_data_research_agent.admissions import redis_limits
 from deep_data_research_agent.api.auth import bearer_token
 from deep_data_research_agent.api.health import readiness_checks
 from deep_data_research_agent.api.schemas import (
+    AsyncTaskCancelRequest,
     AsyncTaskStatusRequest,
     LoginRequest,
     MemorySettingsRequest,
@@ -85,6 +86,7 @@ _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
 _PASSWORD_HASHER = PasswordHasher()
 logger = logging.getLogger(__name__)
 _FAILED_TASK_STATUSES = frozenset({"error", "timeout", "interrupted"})
+_ACTIVE_RUN_STATUSES = frozenset({"pending", "running"})
 _UPLOAD_SUFFIXES = frozenset({".csv", ".tsv", ".xlsx"})
 _UPLOAD_MEDIA_TYPES = {
     ".csv": "text/csv",
@@ -144,13 +146,11 @@ async def _authenticated_user_id(authorization: str | None) -> str:
 
     token = bearer_token(authorization)
     if token is None:
-        if get_settings().app_env == "production":
-            raise HTTPException(
-                status_code=401,
-                detail="请先登录",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return database.DEFAULT_USER_ID
+        raise HTTPException(
+            status_code=401,
+            detail="请先登录",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     user = await database.resolve_login_session(token)
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
@@ -429,7 +429,6 @@ def _user_payload(user: database.UserRecord) -> dict[str, object]:
     return {
         "id": user.id,
         "username": user.username,
-        "is_default": user.is_system,
     }
 
 
@@ -565,19 +564,11 @@ async def current_user(
 ) -> dict[str, object]:
     token = bearer_token(authorization)
     if token is None:
-        if get_settings().app_env == "production":
-            raise HTTPException(
-                status_code=401,
-                detail="请先登录",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return {
-            "user": {
-                "id": database.DEFAULT_USER_ID,
-                "username": "默认账户",
-                "is_default": True,
-            }
-        }
+        raise HTTPException(
+            status_code=401,
+            detail="请先登录",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     user = await database.resolve_login_session(token)
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
@@ -1240,20 +1231,7 @@ async def async_task_status(
 ) -> dict[str, object]:
     """Return live child-run statuses without invoking the Supervisor model."""
 
-    token = bearer_token(authorization)
-    if token is None:
-        if get_settings().app_env == "production":
-            raise HTTPException(
-                status_code=401,
-                detail="请先登录",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        user_id = database.DEFAULT_USER_ID
-    else:
-        user = await database.resolve_login_session(token)
-        if user is None:
-            raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
-        user_id = user.id
+    user_id = await _authenticated_user_id(authorization)
 
     owner = await database.get_thread_owner(payload.thread_id)
     if owner != user_id:
@@ -1261,8 +1239,12 @@ async def async_task_status(
         raise HTTPException(status_code=404, detail="会话不存在")
 
     client = request.app.state.agent_client
+    agent_headers = {"Authorization": authorization} if authorization else None
     try:
-        parent_thread = await client.threads.get(thread_id=payload.thread_id)
+        parent_thread = await client.threads.get(
+            thread_id=payload.thread_id,
+            headers=agent_headers,
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail="暂时无法读取后台任务") from exc
 
@@ -1294,7 +1276,11 @@ async def async_task_status(
                 task["poll_error"] = "任务缺少 run_id"
             return task
         try:
-            run = await client.runs.get(thread_id=child_thread_id, run_id=run_id)
+            run = await client.runs.get(
+                thread_id=child_thread_id,
+                run_id=run_id,
+                headers=agent_headers,
+            )
             live_status = str(run.get("status") or cached_status)
             task["status"] = live_status
             error_summary = _sanitized_task_error(live_status, run.get("error"))
@@ -1311,3 +1297,260 @@ async def async_task_status(
         *(inspect_task(str(task_id), raw_task) for task_id, raw_task in tracked.items())
     )
     return {"tasks": tasks}
+
+
+async def _cancel_active_runs(
+    client,
+    thread_id: str,
+    *,
+    headers: dict[str, str] | None,
+) -> list[str]:
+    """Cancel every queued and running run on one thread and wait for termination."""
+
+    cancelled: list[str] = []
+    # Pending runs must stop first so cancelling the active run cannot promote
+    # another queued request into execution.
+    for status in ("pending", "running"):
+        while True:
+            runs = await client.runs.list(
+                thread_id,
+                status=status,
+                limit=100,
+                headers=headers,
+            )
+            if not runs:
+                break
+            for run in runs:
+                run_id = str(run.get("run_id") or "")
+                if not run_id:
+                    continue
+                try:
+                    await client.runs.cancel(
+                        thread_id,
+                        run_id,
+                        wait=True,
+                        action="interrupt",
+                        headers=headers,
+                    )
+                except Exception:
+                    # A run may finish between the list and cancel requests. Only
+                    # suppress that race when the live status is already terminal.
+                    live = await client.runs.get(
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        headers=headers,
+                    )
+                    if str(live.get("status") or "") in _ACTIVE_RUN_STATUSES:
+                        raise
+                cancelled.append(run_id)
+            if len(runs) < 100:
+                break
+    return cancelled
+
+
+def _tracked_async_tasks(parent_thread: object) -> dict[str, dict[str, object]]:
+    """Read valid async-task records from one Supervisor thread snapshot."""
+
+    if not isinstance(parent_thread, dict):
+        return {}
+    values = parent_thread.get("values")
+    tracked = values.get("async_tasks") if isinstance(values, dict) else None
+    if not isinstance(tracked, dict):
+        return {}
+    return {
+        str(task_id): dict(raw_task)
+        for task_id, raw_task in tracked.items()
+        if isinstance(raw_task, dict)
+    }
+
+
+def _cancelled_task(task_id: str, raw_task: dict[str, object]) -> dict[str, object]:
+    """Build the durable task-state update after a confirmed run cancellation."""
+
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        **raw_task,
+        "task_id": str(raw_task.get("task_id") or task_id),
+        "status": "cancelled",
+        "last_checked_at": now,
+        "last_updated_at": now,
+    }
+
+
+async def _persist_cancelled_tasks(
+    client,
+    parent_thread_id: str,
+    tasks: dict[str, dict[str, object]],
+    *,
+    headers: dict[str, str] | None,
+) -> None:
+    """Persist direct cancellations without asking the Supervisor model to do it."""
+
+    if not tasks:
+        return
+    try:
+        await client.threads.update_state(
+            parent_thread_id,
+            {"async_tasks": tasks},
+            headers=headers,
+        )
+    except Exception:
+        logger.warning(
+            "Cancelled async runs but failed to persist task states for thread %s",
+            parent_thread_id,
+            exc_info=True,
+        )
+
+
+async def _owned_parent_thread(
+    thread_id: str,
+    authorization: str | None,
+    client,
+) -> dict[str, object]:
+    """Return one owned Supervisor thread without exposing foreign identifiers."""
+
+    user_id = await _authenticated_user_id(authorization)
+    if await database.get_thread_owner(thread_id) != user_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    try:
+        headers = {"Authorization": authorization} if authorization else None
+        thread = await client.threads.get(thread_id=thread_id, headers=headers)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    metadata = thread.get("metadata") if isinstance(thread, dict) else None
+    if not isinstance(metadata, dict) or metadata.get("graph_id") != "supervisor":
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return thread
+
+
+@app.post("/async-tasks/{task_id}/cancel")
+async def cancel_async_task_directly(
+    task_id: str,
+    payload: AsyncTaskCancelRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Cancel one owned child run directly, without invoking the Supervisor model."""
+
+    client = request.app.state.agent_client
+    agent_headers = {"Authorization": authorization} if authorization else None
+    parent_thread = await _owned_parent_thread(
+        payload.thread_id,
+        authorization,
+        client,
+    )
+    tracked = _tracked_async_tasks(parent_thread)
+    task = tracked.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="后台任务不存在")
+
+    child_thread_id = str(task.get("thread_id") or task_id)
+    cancelled_runs = await _cancel_active_runs(
+        client,
+        child_thread_id,
+        headers=agent_headers,
+    )
+    if cancelled_runs:
+        task = _cancelled_task(task_id, task)
+        await _persist_cancelled_tasks(
+            client,
+            payload.thread_id,
+            {task_id: task},
+            headers=agent_headers,
+        )
+    else:
+        run_id = str(task.get("run_id") or "")
+        if run_id:
+            live = await client.runs.get(
+                thread_id=child_thread_id,
+                run_id=run_id,
+                headers=agent_headers,
+            )
+            task = {**task, "status": str(live.get("status") or task.get("status") or "error")}
+    return {"task": task, "cancelled_runs": len(cancelled_runs)}
+
+
+@app.post("/threads/{thread_id}/cancel-all")
+async def cancel_thread_execution(
+    thread_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, int | str]:
+    """Cancel a Supervisor run, its queue, and every active async child run."""
+
+    client = request.app.state.agent_client
+    agent_headers = {"Authorization": authorization} if authorization else None
+    parent_thread = await _owned_parent_thread(thread_id, authorization, client)
+    tracked = _tracked_async_tasks(parent_thread)
+    parent_runs = await _cancel_active_runs(
+        client,
+        thread_id,
+        headers=agent_headers,
+    )
+
+    # Re-read after stopping the parent so task records written immediately
+    # before cancellation are included in the cascade.
+    try:
+        latest_parent = await client.threads.get(
+            thread_id=thread_id,
+            headers=agent_headers,
+        )
+        tracked.update(_tracked_async_tasks(latest_parent))
+    except Exception:
+        logger.warning(
+            "Failed to refresh async task state while cancelling thread %s",
+            thread_id,
+            exc_info=True,
+        )
+
+    child_thread_ids = {
+        str(task.get("thread_id") or task_id)
+        for task_id, task in tracked.items()
+        if str(task.get("status") or "running") in _ACTIVE_RUN_STATUSES
+    }
+    # Child threads are independent LangGraph runs. Metadata discovery closes
+    # the short race where a child was created but its ToolMessage checkpoint
+    # was not yet committed to the parent state.
+    offset = 0
+    while True:
+        children = await client.threads.search(
+            metadata={"parent_thread_id": thread_id, "kind": "async-subagent"},
+            status="busy",
+            limit=100,
+            offset=offset,
+            select=["thread_id", "status"],
+            headers=agent_headers,
+        )
+        child_thread_ids.update(str(child["thread_id"]) for child in children)
+        if len(children) < 100:
+            break
+        offset += 100
+
+    child_runs: list[str] = []
+    cancelled_thread_ids: set[str] = set()
+    for child_thread_id in child_thread_ids:
+        cancelled = await _cancel_active_runs(
+            client,
+            child_thread_id,
+            headers=agent_headers,
+        )
+        if cancelled:
+            child_runs.extend(cancelled)
+            cancelled_thread_ids.add(child_thread_id)
+
+    cancelled_tasks = {
+        task_id: _cancelled_task(task_id, task)
+        for task_id, task in tracked.items()
+        if str(task.get("thread_id") or task_id) in cancelled_thread_ids
+    }
+    await _persist_cancelled_tasks(
+        client,
+        thread_id,
+        cancelled_tasks,
+        headers=agent_headers,
+    )
+    return {
+        "status": "cancelled",
+        "cancelled_parent_runs": len(parent_runs),
+        "cancelled_child_runs": len(child_runs),
+    }

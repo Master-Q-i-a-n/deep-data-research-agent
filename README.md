@@ -25,8 +25,7 @@ Supervisor 可在已联网的沙箱中从公开 URL 下载或按需求创建 Ski
 - Supervisor 读取 `skill-manage` 后通过 `assign_skill` 一步分配 Skill，不创建 Skill 子智能体。
 - LangSmith 记录 Agent、模型、工具及沙箱生命周期。
 - React 三栏研究工作台，左侧显示用户会话，中间流式展示对话，右侧集中显示计划和异步任务轨迹。
-- 可选注册登录；账户、会话、Skill 和检查点按用户隔离。开发环境匿名请求使用共享默认账户，
-  生产环境必须登录。
+- 必须注册或登录；账户、会话、Skill 和检查点按用户隔离，所有环境均拒绝匿名业务请求。
 - 账户、thread 归属、邮件投递与 LangGraph checkpoint 统一持久化到 PostgreSQL；Skill 与
   长期记忆继续使用 MongoDB。
 - MongoDB 长期记忆只保留当前用户偏好/行为反馈和每个 Agent 独立的公共失败经验；三个
@@ -72,7 +71,6 @@ OPEN_SANDBOX_DOMAIN=127.0.0.1:8080
 OPEN_SANDBOX_API_KEY=your-opensandbox-api-key
 OPEN_SANDBOX_IMAGE=python:3.13-slim
 APP_ENV=development
-LOCAL_DEV_USER_ID=local-user
 MONGODB_URI=mongodb://127.0.0.1:27017
 MONGODB_MEMORY_COLLECTION=memories
 MONGODB_MEMORY_JOB_COLLECTION=memory_update_jobs
@@ -91,7 +89,7 @@ POSTGRES_POOL_TIMEOUT_SECONDS=30
 LANGGRAPH_STRICT_MSGPACK=true
 AUTH_SESSION_DAYS=7
 RATE_LIMIT_KEY_SECRET=
-REDIS_URL=redis://127.0.0.1:6379/0
+REDIS_URL=redis://127.0.0.1:16379/0
 REDIS_USERNAME=ddra
 REDIS_PASSWORD_FILE=.secrets/redis_password
 REDIS_CONNECT_TIMEOUT_SECONDS=2
@@ -117,9 +115,9 @@ RUN_ADMISSION_LOCK_SECONDS=5
 存在且是有效的 Fernet key；生产环境会拒绝所有未登录请求。HTTPS Provider 可以位于
 公网或私网；HTTP 目标必须由部署方加入 `MODEL_PROVIDER_HOST_ALLOWLIST`。
 
-后端启动前先部署项目专用 Redis。脚本会生成被 Git 忽略的随机 ACL 密码；首次从旧的
-`f10fedb99816` 容器切换时，会先把 `redis-data` 备份到 `.redis-backups/`，再由 Compose
-接管同名数据卷：
+后端启动前先部署项目专用 Redis。脚本会生成被 Git 忽略的随机 ACL 密码，并构建
+`deep-data-research-agent/redis:7.4` 镜像；本地容器、端口和数据卷分别使用
+`ddra-redis`、`127.0.0.1:16379` 和 `ddra-redis-data`：
 
 ```powershell
 .\scripts\setup\redis.ps1
@@ -176,9 +174,9 @@ uv run alembic upgrade head
 负载均衡探针使用无需认证的 `GET /health/live` 和 `GET /health/ready`。前者只检查进程，后者
 并行检查 PostgreSQL 迁移/checkpoint、Redis 与 MongoDB；任何核心依赖失败时返回 503。
 
-动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。开发环境无 Bearer
-Token 时 LangGraph Auth 注入共享身份 `local-user`；生产环境无 Token 返回 401。注册用户使用
-独立 UUID。MongoDB 不配置 TTL 和向量索引，密码使用 Argon2id，登录令牌只以 SHA-256 摘要
+动态 Skill 使用 `langgraph-store-mongodb` 提供的全局 LangGraph Store。所有环境缺少有效 Bearer
+Token 时均返回 401；注册用户使用独立 UUID。MongoDB 不配置 TTL 和向量索引，密码使用
+Argon2id，登录令牌只以 SHA-256 摘要
 写入 PostgreSQL。注册和登录使用 Redis ZSET 滑动窗口；登录按 IP、账户两个维度分别限制
 10 次/60 秒，成功和失败均计数。每个用户最多同时运行 3 个 Supervisor 会话、每分钟最多发起
 20 个顶层 Supervisor run；内部异步子 Agent 通过服务端签名标记排除。Redis 不可用时保护逻辑
@@ -323,9 +321,8 @@ npm run dev
 - 注册、登录、退出登录和刷新后的登录恢复。
 - 用户明确要求时，经确认将 PDF 主报告和完整材料 ZIP 发送到本次提供的单个邮箱。
 
-登录、注册或退出登录后，前端会清除当前 thread 并进入对应身份的新空间。开发环境的默认账户由
-所有未登录浏览器共享，不会在登录时把其会话或 Skill 复制到个人账户；生产环境未登录时保留
-首页，但会锁定会话、上传和任务操作。
+登录、注册或退出登录后，前端会清除当前 thread 并进入对应身份的新空间。未登录时保留首页，
+但会锁定会话、上传和任务操作。
 
 ## 交互方式
 
@@ -335,8 +332,8 @@ npm run dev
 2. Supervisor 返回完整 `task_id`，不会立即循环查询。
 3. 稍后发送“检查任务 `<task_id>`”；成功后 Supervisor 根据 Worker 结果生成最终报告。
 
-Supervisor 支持 DeepAgents 自动提供的 `check_async_task`、`update_async_task`、
-`cancel_async_task` 和 `list_async_tasks`。
+Supervisor 支持 DeepAgents 提供的 `check_async_task`、`update_async_task` 和
+`list_async_tasks`；取消后台任务由前端直接调用后端接口，不经过 LLM。
 
 Skill 流程已简化为一步分配：
 

@@ -106,6 +106,9 @@ class MetadataPropagatingAsyncSubAgentMiddleware(AsyncSubAgentMiddleware):
         self.tools = [
             replacement if tool.name == "start_async_task" else tool
             for tool in self.tools
+            # Cancellation is an explicit UI action backed by the API. Keeping
+            # this tool model-visible would let the LLM cancel work on its own.
+            if tool.name != "cancel_async_task"
         ]
 
     @staticmethod

@@ -18,6 +18,8 @@ from deep_data_research_agent.core.config import Settings
 from deep_data_research_agent.database import repository as database
 from deep_data_research_agent.database.models import Base
 
+TEST_USER_ID = "test-user"
+
 
 @pytest.mark.asyncio
 async def test_token_usage_middleware_supports_runtime_without_config(monkeypatch) -> None:
@@ -105,7 +107,7 @@ async def test_token_usage_middleware_settles_cancelled_call(monkeypatch) -> Non
         messages=[token_usage.AIMessage(content="hello")],
         runtime=Runtime(
             server_info=SimpleNamespace(
-                user=SimpleNamespace(identity=database.DEFAULT_USER_ID)
+                user=SimpleNamespace(identity=TEST_USER_ID)
             )
         ),
     )
@@ -161,6 +163,25 @@ async def isolated_database(monkeypatch):
         await connection.run_sync(Base.metadata.create_all)
     monkeypatch.setattr(database, "_validate_deployed_schema", _noop_schema_check)
     await database.ensure_schema()
+    async with factory() as session:
+        session.add(
+            database.User(
+                id=TEST_USER_ID,
+                username="test-user",
+                username_normalized="test-user",
+                password_hash="hash",
+                is_system=False,
+            )
+        )
+        session.add(
+            database.UserTokenBucket(
+                user_id=TEST_USER_ID,
+                balance_tokens=100_000_000,
+                last_refill_hour=int(time.time() // 3600),
+                version=1,
+            )
+        )
+        await session.commit()
     try:
         yield factory
     finally:
@@ -224,12 +245,7 @@ def test_production_requires_stable_rate_limit_secret() -> None:
 
 
 @pytest.mark.asyncio
-async def test_production_rejects_anonymous_langgraph_request(monkeypatch) -> None:
-    monkeypatch.setattr(
-        auth_module,
-        "get_settings",
-        lambda: SimpleNamespace(app_env="production"),
-    )
+async def test_every_environment_rejects_anonymous_langgraph_request() -> None:
     with pytest.raises(Exception) as caught:
         await auth_module.authenticate_request(_request())
     assert caught.value.status_code == 401
@@ -238,24 +254,14 @@ async def test_production_rejects_anonymous_langgraph_request(monkeypatch) -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/auth/register", "/auth/login", "/auth/logout"])
-async def test_production_keeps_auth_entry_points_public(monkeypatch, path: str) -> None:
-    monkeypatch.setattr(
-        auth_module,
-        "get_settings",
-        lambda: SimpleNamespace(app_env="production"),
-    )
+async def test_auth_entry_points_remain_public(path: str) -> None:
     user = await auth_module.authenticate_request(_request(path=path))
     assert user["identity"] == "public-auth"
     assert user["is_authenticated"] is False
 
 
 @pytest.mark.asyncio
-async def test_production_auth_me_rejects_anonymous_request(monkeypatch) -> None:
-    monkeypatch.setattr(
-        webapp,
-        "get_settings",
-        lambda: SimpleNamespace(app_env="production"),
-    )
+async def test_auth_me_rejects_anonymous_request() -> None:
     with pytest.raises(Exception) as caught:
         await webapp.current_user(None)
     assert caught.value.status_code == 401
@@ -317,13 +323,13 @@ async def test_concurrent_sliding_window_allows_exactly_twenty(redis_service) ->
 async def test_token_bucket_database_refill_reserve_and_idempotent_settlement(
     isolated_database,
 ) -> None:
-    bucket = await database.get_token_bucket(database.DEFAULT_USER_ID)
+    bucket = await database.get_token_bucket(TEST_USER_ID)
     assert bucket.balance_tokens == 100_000_000
 
     call_id = str(uuid4())
     reservation = await database.reserve_model_tokens(
         call_id=call_id,
-        user_id=database.DEFAULT_USER_ID,
+        user_id=TEST_USER_ID,
         root_run_id="run-a",
         thread_id="thread-a",
         agent_name="supervisor",
@@ -349,12 +355,12 @@ async def test_token_bucket_database_refill_reserve_and_idempotent_settlement(
     assert duplicate.balance_tokens == 99_996_000
 
     async with isolated_database() as session:
-        state = await session.get(database.UserTokenBucket, database.DEFAULT_USER_ID)
+        state = await session.get(database.UserTokenBucket, TEST_USER_ID)
         assert state is not None
         state.balance_tokens = -15_000_000
         state.last_refill_hour = int(time.time() // 3600) - 2
         await session.commit()
-    refilled = await database.get_token_bucket(database.DEFAULT_USER_ID)
+    refilled = await database.get_token_bucket(TEST_USER_ID)
     assert refilled.balance_tokens == 5_000_000
 
 
@@ -387,12 +393,12 @@ async def test_metered_direct_model_call_uses_provider_usage(
     result = await token_usage.metered_model_ainvoke(
         Model(),
         "hello",
-        user_id=database.DEFAULT_USER_ID,
+        user_id=TEST_USER_ID,
         agent_name="memory-user",
         config={"tags": ["test"]},
     )
     assert result.content == "ok"
-    bucket = await database.get_token_bucket(database.DEFAULT_USER_ID)
+    bucket = await database.get_token_bucket(TEST_USER_ID)
     assert bucket.balance_tokens == 99_999_900
 
     async with isolated_database() as session:

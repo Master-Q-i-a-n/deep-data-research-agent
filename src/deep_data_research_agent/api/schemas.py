@@ -31,6 +31,12 @@ class AsyncTaskStatusRequest(BaseModel):
     thread_id: str = Field(min_length=1, max_length=64)
 
 
+class AsyncTaskCancelRequest(BaseModel):
+    """Identify the owning Supervisor thread for a direct child-run cancellation."""
+
+    thread_id: str = Field(min_length=1, max_length=64)
+
+
 class ModelProviderRequest(BaseModel):
     base_url: str = Field(min_length=1, max_length=2048)
     model_name: str = Field(min_length=1, max_length=128)
@@ -39,6 +45,7 @@ class ModelProviderRequest(BaseModel):
 
 
 __all__ = [
+    "AsyncTaskCancelRequest",
     "AsyncTaskStatusRequest",
     "LoginRequest",
     "MemorySettingsRequest",

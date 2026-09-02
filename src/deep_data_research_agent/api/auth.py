@@ -9,7 +9,6 @@ from langgraph_sdk import Auth
 from starlette.requests import Request
 
 from deep_data_research_agent.admissions import redis_limits
-from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.database import repository as database
 
 auth = Auth()
@@ -54,12 +53,12 @@ async def authenticated_user(authorization: str | None) -> database.UserRecord:
 
 @auth.authenticate
 async def authenticate_request(request: Request) -> Auth.types.MinimalUserDict:
-    """Authenticate a request or attach the explicitly shared default account."""
+    """Authenticate every request except the explicit credential entry points."""
 
     token = bearer_token(request.headers.get("authorization"))
     if token is None:
-        # Auth-first mode still runs this hook for custom routes. Keep only the
-        # credential entry points public; all other production routes fail shut.
+        # Auth-first mode still runs this hook for custom routes. Only the
+        # credential entry points are public in every environment.
         if request.url.path in {"/auth/register", "/auth/login", "/auth/logout"}:
             return {
                 "identity": "public-auth",
@@ -67,19 +66,11 @@ async def authenticate_request(request: Request) -> Auth.types.MinimalUserDict:
                 "is_authenticated": False,
                 "permissions": ["public-auth"],
             }
-        if get_settings().app_env == "production":
-            raise Auth.exceptions.HTTPException(
-                status_code=401,
-                detail="请先登录",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        await database.ensure_schema()
-        return {
-            "identity": database.DEFAULT_USER_ID,
-            "display_name": "默认账户",
-            "is_authenticated": False,
-            "permissions": ["anonymous"],
-        }
+        raise Auth.exceptions.HTTPException(
+            status_code=401,
+            detail="请先登录",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     user = await database.resolve_login_session(token)
     if user is None:

@@ -471,6 +471,14 @@ async def isolated_database(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_startup_does_not_create_an_anonymous_user(isolated_database) -> None:
+    async with database.session_factory()() as session:
+        users = (await session.execute(database.select(database.User))).scalars().all()
+
+    assert users == []
+
+
+@pytest.mark.asyncio
 async def test_delete_user_removes_dependents_and_rejects_system_account(isolated_database) -> None:
     user = await database.create_user("eval-user", "hash")
     await database.claim_thread("thread-a", user.id)
@@ -480,8 +488,18 @@ async def test_delete_user_removes_dependents_and_rejects_system_account(isolate
     assert await database.delete_user(user.id) is True
     assert await database.get_user_by_id(user.id) is None
     assert await database.list_user_thread_ids(user.id) == []
+    async with database.session_factory()() as session:
+        system_user = database.User(
+            id="system-user",
+            username="system",
+            username_normalized="system",
+            password_hash=None,
+            is_system=True,
+        )
+        session.add(system_user)
+        await session.commit()
     with pytest.raises(ValueError, match="系统账户"):
-        await database.delete_user(database.DEFAULT_USER_ID)
+        await database.delete_user("system-user")
 
 
 @pytest.mark.integration

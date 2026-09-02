@@ -269,7 +269,12 @@ async def test_compiled_supervisor_execute_node_runs_profile_script(
 
     update = await supervisor_graph.nodes["tools"].ainvoke(
         {"messages": [message]},
-        {"configurable": {"thread_id": "thread-profile"}},
+        {
+            "configurable": {
+                "thread_id": "thread-profile",
+                "langgraph_auth_user_id": "user-a",
+            }
+        },
         runtime=runtime,
     )
 

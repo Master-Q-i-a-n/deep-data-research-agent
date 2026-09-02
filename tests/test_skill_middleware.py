@@ -51,7 +51,7 @@ def _runtime(store=None):
     return SimpleNamespace(
         execution_info=SimpleNamespace(thread_id="thread-a"),
         store=store,
-        server_info=None,
+        server_info=SimpleNamespace(user=SimpleNamespace(identity="user-a")),
     )
 
 
@@ -68,8 +68,8 @@ async def test_supervisor_lifecycle_ensures_and_exports(monkeypatch) -> None:
     await middleware.aafter_agent({}, _runtime())
 
     assert manager.calls == [
-        ("ensure", "thread-a", "supervisor", True, "local-user"),
-        ("ensure", "thread-a", "supervisor", True, "local-user"),
+        ("ensure", "thread-a", "supervisor", True, "user-a"),
+        ("ensure", "thread-a", "supervisor", True, "user-a"),
         ("export", "thread-a", "supervisor"),
     ]
 

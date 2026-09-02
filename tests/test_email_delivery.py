@@ -26,8 +26,9 @@ async def isolated_database(monkeypatch):
         await connection.run_sync(Base.metadata.create_all)
     monkeypatch.setattr(database, "_validate_deployed_schema", _noop_schema_check)
     await database.ensure_schema()
+    user = await database.create_user("delivery-user", "hash")
     try:
-        yield
+        yield user.id
     finally:
         await database.close_database()
 
@@ -37,7 +38,7 @@ async def test_email_delivery_insert_is_idempotent(isolated_database) -> None:
     values = {
         "idempotency_key": "a" * 64,
         "thread_id": "thread-a",
-        "user_id": database.DEFAULT_USER_ID,
+        "user_id": isolated_database,
         "recipient": "reader@example.com",
         "subject": "研究报告",
         "pdf_filename": "final_report.pdf",
@@ -60,7 +61,7 @@ async def test_email_delivery_terminal_state_is_persisted(isolated_database) -> 
     await database.begin_email_delivery(
         idempotency_key=key,
         thread_id="thread-a",
-        user_id=database.DEFAULT_USER_ID,
+        user_id=isolated_database,
         recipient="reader@example.com",
         subject="研究报告",
         pdf_filename="final_report.pdf",
@@ -76,7 +77,7 @@ async def test_email_delivery_terminal_state_is_persisted(isolated_database) -> 
     replay, created = await database.begin_email_delivery(
         idempotency_key=key,
         thread_id="thread-a",
-        user_id=database.DEFAULT_USER_ID,
+        user_id=isolated_database,
         recipient="ignored@example.com",
         subject="ignored",
         pdf_filename="ignored.pdf",
@@ -102,7 +103,7 @@ async def test_email_delivery_claim_is_atomic_and_replay_safe(isolated_database)
     await database.begin_email_delivery(
         idempotency_key=key,
         thread_id="thread-a",
-        user_id=database.DEFAULT_USER_ID,
+        user_id=isolated_database,
         recipient="reader@example.com",
         subject="研究报告",
         pdf_filename="final_report.pdf",
@@ -127,7 +128,7 @@ async def test_recovery_never_resends_stale_submitting_delivery(isolated_databas
     await database.begin_email_delivery(
         idempotency_key=key,
         thread_id="thread-a",
-        user_id=database.DEFAULT_USER_ID,
+        user_id=isolated_database,
         recipient="reader@example.com",
         subject="研究报告",
         pdf_filename="final_report.pdf",

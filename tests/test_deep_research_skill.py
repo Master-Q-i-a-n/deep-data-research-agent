@@ -70,11 +70,11 @@ def test_deep_research_uses_project_tools_and_paths() -> None:
         "`start_async_task`",
         "`check_async_task`",
         "`update_async_task`",
-        "`cancel_async_task`",
         "/workspace/research/evidence_ledger.md",
         "/workspace/output/final_report.md",
     ):
         assert required in text
+    assert "`cancel_async_task`" not in text
     for codex_only in (
         "`update_plan`",
         "`request_user_input`",

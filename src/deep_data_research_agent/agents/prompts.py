@@ -30,7 +30,7 @@ ASYNC_SUBAGENT_PROMPT = """你可以使用异步子代理工具管理后台任�
 1. start_async_task 会立即返回完整 task_id；启动后必须把控制权交还用户，不要立刻循环查询。
 2. 对话历史里的任务状态可能已经过期；报告进度前先调用 check_async_task 或 list_async_tasks。
 3. task_id 必须原样使用，不得截断、改写或自行构造。
-4. 用户补充任务要求时使用 update_async_task，用户明确取消时使用 cancel_async_task。
+4. 用户补充任务要求时使用 update_async_task；后台任务取消由界面直接处理，不要自行取消。
 5. 子代理成功后，先读取最新 result 对象，再完成上层分析和报告。
 6. check_async_task 外层 status 只表示远程 run 状态；业务结果以 result.status 为准。
    result.summary 是可直接分析的摘要，result.artifacts 是子任务真实文件清单，
@@ -64,7 +64,6 @@ TOOL_DESCRIPTION_OVERRIDES = {
     "start_async_task": "启动指定类型的异步子代理，立即返回必须完整保留的 task_id。",
     "check_async_task": "使用完整 task_id 查询异步任务的最新状态和结果。",
     "update_async_task": "向正在运行的异步任务发送补充要求。",
-    "cancel_async_task": "使用完整 task_id 取消异步任务。",
     "list_async_tasks": "列出当前会话已启动的异步任务，可按状态筛选。",
 }
 

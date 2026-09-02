@@ -183,8 +183,7 @@ Next run, `MongoSkillsRestoreMiddleware` restores `/active/` entries into `/skil
 and `ReloadableSkillsMiddleware` re-scans skill metadata so the assignment takes effect on existing threads.
 
 `identity.py` derives user identity and skill/memory namespaces from the sha256-authenticated user
-(LangGraph Auth injected), with an explicit `LOCAL_DEV_USER_ID` fallback in development; production
-refuses to operate without an authenticated identity.
+injected by LangGraph Auth. Every environment refuses to operate without an authenticated identity.
 
 ### Long-term memory and admission controls
 

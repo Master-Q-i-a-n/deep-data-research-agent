@@ -134,7 +134,6 @@ type HITLDecision =
 type AuthUser = {
   id: string;
   username: string;
-  is_default: boolean;
 };
 type MemoryClearResponse = {
   status?: string;
@@ -228,12 +227,6 @@ const TASK_FAILURE_LABEL: Partial<Record<AsyncTaskStatus, string>> = {
   timeout: "执行超时",
   interrupted: "执行中断",
 };
-const DEFAULT_USER: AuthUser = {
-  id: "local-user",
-  username: "默认账户",
-  is_default: true,
-};
-
 const EXAMPLES = [
   "抓取 Tavily Python SDK 文档，整理主要接口和适用场景",
   "搜索近一个月数据分析 Agent 的进展，并比较主要方案",
@@ -1005,7 +998,6 @@ const PROVIDER_TYPE_LABELS: Record<ModelProvider["provider_type"], string> = {
 const SIGNED_OUT_USER: AuthUser = {
   id: "",
   username: "未登录",
-  is_default: false,
 };
 
 const CompactTurnView = memo(function CompactTurnView({
@@ -1240,7 +1232,7 @@ export default function App() {
   const [authToken, setAuthToken] = useState<string | null>(
     () => window.localStorage.getItem(AUTH_TOKEN_KEY),
   );
-  const [authUser, setAuthUser] = useState<AuthUser>(DEFAULT_USER);
+  const [authUser, setAuthUser] = useState<AuthUser>(SIGNED_OUT_USER);
   const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
   const [authMode, setAuthMode] = useState<AuthMode | null>(null);
   const [authUsername, setAuthUsername] = useState("");
@@ -1771,12 +1763,6 @@ export default function App() {
     ),
     [dismissedTaskFailures, tasks],
   );
-  const stopStream = useCallback(() => {
-    if (!threadId) return;
-    void runManager.cancelActive(threadId).then(() => loadSessions()).catch((error: unknown) => {
-      setSessionsError(error instanceof Error ? `停止回答失败：${error.message}` : "停止回答失败");
-    });
-  }, [loadSessions, runManager.cancelActive, threadId]);
   const runningTaskCount = tasks.filter(
     (task) => task.status === "running" || task.status === "pending",
   ).length;
@@ -1846,6 +1832,35 @@ export default function App() {
       if (showLoading && !signal?.aborted) setTasksRefreshing(false);
     }
   }, [apiUrl, authHeaders, authReady, expireAuthentication, threadId]);
+
+  const stopStream = useCallback(async () => {
+    if (!threadId) return;
+    setSessionsError("");
+    try {
+      const response = await fetch(
+        `${apiUrl}/threads/${encodeURIComponent(threadId)}/cancel-all`,
+        { method: "POST", headers: authHeaders },
+      );
+      if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
+        throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "服务端未能停止全部运行");
+      }
+      // The endpoint waits for parent, queued, and child runs. Reconcile only
+      // after it returns so the UI cannot promote a stale run back to busy.
+      await runManager.reconcile(threadId);
+      await Promise.all([loadSessions(), refreshTaskStatuses()]);
+    } catch (error) {
+      setSessionsError(error instanceof Error ? `停止回答失败：${error.message}` : "停止回答失败");
+    }
+  }, [
+    apiUrl,
+    authHeaders,
+    expireAuthentication,
+    loadSessions,
+    refreshTaskStatuses,
+    runManager.reconcile,
+    threadId,
+  ]);
 
   const downloadArtifact = useCallback(async (
     artifact: DownloadableArtifact,
@@ -2601,12 +2616,38 @@ export default function App() {
     );
   }
 
-  function cancelTask(taskId: string) {
+  async function cancelTask(taskId: string) {
     const confirmed = window.confirm(
       "确定取消这个后台任务吗？已经完成的请求和文件不会自动删除。",
     );
     if (!confirmed) return;
-    void submitText(`请调用 cancel_async_task 取消任务 ${taskId}。`, "interrupt");
+    if (!threadId) return;
+    setTaskRefreshError("");
+    try {
+      const response = await fetch(
+        `${apiUrl}/async-tasks/${encodeURIComponent(taskId)}/cancel`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({ thread_id: threadId }),
+        },
+      );
+      if (!response.ok) {
+        if (response.status === 401) expireAuthentication();
+        throw new Error(response.status === 401 ? "登录已失效，请重新登录" : "暂时无法取消后台任务");
+      }
+      const payload = await response.json() as { task?: AsyncTask };
+      if (!payload.task?.task_id || !ASYNC_TASK_STATUSES.has(payload.task.status)) {
+        throw new Error("后台任务取消服务返回了无效数据");
+      }
+      const cancelledTask = payload.task;
+      setPolledTasks((current) => ({
+        ...current,
+        [cancelledTask.task_id]: cancelledTask,
+      }));
+    } catch (error) {
+      setTaskRefreshError(error instanceof Error ? error.message : "暂时无法取消后台任务");
+    }
   }
 
   function refreshTasks() {
@@ -3060,9 +3101,9 @@ export default function App() {
 
         <section className="account-card" aria-label="当前账户" ref={accountMenuRef}>
           <div className="account-card__identity">
-            <span aria-hidden="true">{workspaceLocked ? "访" : authUser.is_default ? "访" : authUser.username.slice(0, 1).toUpperCase()}</span>
+            <span aria-hidden="true">{workspaceLocked ? "访" : authUser.username.slice(0, 1).toUpperCase()}</span>
             <div>
-              <small>{authStatus === "checking" ? "正在确认身份" : workspaceLocked ? "需要认证" : authUser.is_default ? "共享身份" : "个人空间"}</small>
+              <small>{authStatus === "checking" ? "正在确认身份" : workspaceLocked ? "需要认证" : "个人空间"}</small>
               <strong>{workspaceLocked ? SIGNED_OUT_USER.username : authUser.username}</strong>
             </div>
             <button
@@ -3083,7 +3124,7 @@ export default function App() {
                 <span aria-hidden="true">⚙</span>
                 设置
               </button>
-              {authReady && !authUser.is_default ? (
+              {authReady ? (
                 <button
                   type="button"
                   role="menuitem"
@@ -3099,7 +3140,7 @@ export default function App() {
               ) : null}
             </div>
           ) : null}
-          {workspaceLocked || authUser.is_default ? (
+          {workspaceLocked ? (
             <div className="account-card__actions">
                 <button type="button" disabled={!workspaceLocked && identitySwitchBlocked} onClick={() => openAuth("login")}>登录</button>
                 <button type="button" disabled={!workspaceLocked && identitySwitchBlocked} onClick={() => openAuth("register")}>注册</button>
@@ -3792,7 +3833,7 @@ export default function App() {
             <p className="auth-dialog__lead">
               {authMode === "login"
                 ? "登录后只加载你的会话、Skill 和研究文件。"
-                : "创建独立的数据空间；默认账户内容不会复制进来。"}
+                : "创建独立的数据空间；会话、Skill 和研究文件均按账户隔离。"}
             </p>
             <form onSubmit={(event) => void submitAuth(event)}>
               <label>

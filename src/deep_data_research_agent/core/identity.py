@@ -5,7 +5,7 @@ from __future__ import annotations
 from hashlib import sha256
 from typing import Any
 
-from deep_data_research_agent.core.config import get_settings
+from langgraph.config import get_config
 
 
 def _server_user_identity(runtime: Any) -> str | None:
@@ -38,14 +38,11 @@ def user_identity_from_config(config: dict[str, Any] | None) -> str:
     if value:
         return value
 
-    settings = get_settings()
-    if settings.app_env == "development" and settings.local_dev_user_id.strip():
-        return settings.local_dev_user_id.strip()
     raise RuntimeError("运行配置未提供经过认证的用户身份")
 
 
 def user_identity(runtime: Any) -> str:
-    """Return a trusted identity, with an explicit local-development fallback."""
+    """Return the authenticated identity supplied by LangGraph Server."""
 
     if identity := _server_user_identity(runtime):
         return identity
@@ -54,14 +51,16 @@ def user_identity(runtime: Any) -> str:
     if runtime_config:
         return user_identity_from_config(runtime_config)
 
-    settings = get_settings()
-    if settings.app_env == "development":
-        local_identity = settings.local_dev_user_id.strip()
-        if local_identity:
-            return local_identity
-        raise RuntimeError("LOCAL_DEV_USER_ID 不能为空")
+    # Some tool-node paths expose the authenticated RunnableConfig through
+    # contextvars instead of attaching it to Runtime.
+    try:
+        active_config = get_config()
+    except RuntimeError:
+        active_config = None
+    if active_config:
+        return user_identity_from_config(active_config)
 
-    raise RuntimeError("生产环境未提供经过认证的用户身份，拒绝访问用户级 Skill")
+    raise RuntimeError("未提供经过认证的用户身份，拒绝访问用户级资源")
 
 
 def user_hash(runtime: Any) -> str:

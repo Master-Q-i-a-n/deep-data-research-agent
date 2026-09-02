@@ -35,7 +35,7 @@ description: 对需要系统性、多轮、多来源检索、交叉核验和完�
    crawl-worker。只有至少两个相互独立的研究线索都需要多页采集时，才分别调用
    `start_async_task`；为每个任务给出不同的问题域、目标来源、证据缺口和停止条件。
    不为同义查询盲目并发，不让 worker 嵌套委派。用 `check_async_task` 获取必要结果，
-   需求变化或任务冗余时使用 `update_async_task` 或 `cancel_async_task`，等待期间继续整理证据。
+   需求变化时使用 `update_async_task`；任务取消由用户在界面直接操作，等待期间继续整理证据。
 4. 在 `/workspace/research/evidence_ledger.md` 维护精简证据账本，记录关键主张、来源标题、
    发布者、日期、URL、置信度、矛盾、缺口和下一条定向查询；对 URL 和同义查询去重。
 5. 第一轮证据合并后再定向补缺，不重新进行宽泛搜索。瞬时超时或限流最多重试一次，

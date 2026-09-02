@@ -38,8 +38,6 @@ from deep_data_research_agent.database.schema import (
     CHECKPOINT_TABLES,
 )
 
-DEFAULT_USER_ID = "local-user"
-DEFAULT_USERNAME = "default"
 logger = logging.getLogger(__name__)
 
 
@@ -212,7 +210,7 @@ async def _validate_deployed_schema(*, include_checkpoints: bool = True) -> None
 
 
 async def ensure_schema() -> None:
-    """Validate deployed schemas and initialize shared rows once per process.
+    """Validate deployed schemas and repair registered-user token buckets once.
 
     The historical name remains temporarily stable for callers, but this
     function deliberately performs no DDL. Schema changes belong to Alembic.
@@ -226,31 +224,9 @@ async def ensure_schema() -> None:
             return
         await _validate_deployed_schema()
         async with session_factory()() as session:
-            # PostgreSQL upserts keep multi-instance startup race-free while
+            # Token-bucket upserts keep multi-instance startup race-free while
             # preserving this initialization as DML-only.
             now = _utcnow()
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO users (
-                        id, username, username_normalized, password_hash,
-                        is_system, created_at
-                    )
-                    VALUES (
-                        :id, :username, :username_normalized, NULL,
-                        :is_system, :created_at
-                    )
-                    ON CONFLICT DO NOTHING
-                    """
-                ),
-                {
-                    "id": DEFAULT_USER_ID,
-                    "username": DEFAULT_USERNAME,
-                    "username_normalized": DEFAULT_USERNAME,
-                    "is_system": True,
-                    "created_at": now,
-                },
-            )
             settings = get_settings()
             await session.execute(
                 text(
@@ -644,7 +620,7 @@ async def delete_user(user_id: str) -> bool:
         user = await session.get(User, normalized)
         if user is None:
             return False
-        if user.is_system or user.id == DEFAULT_USER_ID:
+        if user.is_system:
             raise ValueError("不能删除系统账户")
         await session.execute(delete(AuthSession).where(AuthSession.user_id == normalized))
         await session.execute(delete(EmailDelivery).where(EmailDelivery.user_id == normalized))

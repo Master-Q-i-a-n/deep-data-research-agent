@@ -13,6 +13,8 @@ from deep_data_research_agent.infrastructure.workspace import (
     WorkspaceScope,
 )
 
+TEST_USER_ID = "user-a"
+
 
 @pytest.mark.asyncio
 async def test_artifact_list_and_download_use_owned_workspace(
@@ -20,7 +22,7 @@ async def test_artifact_list_and_download_use_owned_workspace(
     tmp_path: Path,
 ) -> None:
     store = LocalWorkspaceStore(tmp_path)
-    scope = WorkspaceScope(database.DEFAULT_USER_ID, "artifact-thread", "supervisor")
+    scope = WorkspaceScope(TEST_USER_ID, "artifact-thread", "supervisor")
     workspace = store.workspace_path(scope)
     output = workspace / "output"
     charts = output / "charts"
@@ -46,9 +48,13 @@ async def test_artifact_list_and_download_use_owned_workspace(
     (input_root / "orders.csv").write_text("id\n1", encoding="utf-8")
 
     async def owner(_thread_id: str) -> str:
-        return database.DEFAULT_USER_ID
+        return TEST_USER_ID
+
+    async def authenticated_user(_authorization: str | None) -> str:
+        return TEST_USER_ID
 
     monkeypatch.setattr(database, "get_thread_owner", owner)
+    monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated_user)
     monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
 
     listing = await webapp.list_artifacts("artifact-thread", None)
@@ -92,7 +98,11 @@ async def test_artifact_api_hides_other_users_thread(monkeypatch) -> None:
     async def owner(_thread_id: str) -> str:
         return "another-user"
 
+    async def authenticated_user(_authorization: str | None) -> str:
+        return TEST_USER_ID
+
     monkeypatch.setattr(database, "get_thread_owner", owner)
+    monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated_user)
 
     with pytest.raises(HTTPException) as caught:
         await webapp.list_artifacts("private-thread", None)
@@ -103,7 +113,7 @@ async def test_artifact_api_hides_other_users_thread(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_download_path_rejects_traversal(monkeypatch, tmp_path: Path) -> None:
     store = LocalWorkspaceStore(tmp_path)
-    scope = WorkspaceScope(database.DEFAULT_USER_ID, "traversal-thread", "supervisor")
+    scope = WorkspaceScope(TEST_USER_ID, "traversal-thread", "supervisor")
     monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
     with pytest.raises(HTTPException) as caught:
         await webapp._download_object(scope, "/workspace/../secret.md")
@@ -117,7 +127,7 @@ async def test_markdown_bundle_rejects_missing_or_unsafe_images(
     tmp_path: Path,
 ) -> None:
     store = LocalWorkspaceStore(tmp_path)
-    scope = WorkspaceScope(database.DEFAULT_USER_ID, "bundle-thread", "supervisor")
+    scope = WorkspaceScope(TEST_USER_ID, "bundle-thread", "supervisor")
     monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
     report = store.workspace_path(scope) / "output" / "final_report.md"
     report.parent.mkdir(parents=True)

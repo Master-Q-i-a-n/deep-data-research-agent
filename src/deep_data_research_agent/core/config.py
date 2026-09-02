@@ -83,7 +83,6 @@ class Settings(BaseSettings):
     sandbox_delete_tombstone_seconds: int = Field(default=600, ge=60, le=3600)
 
     app_env: Literal["development", "production"] = "development"
-    local_dev_user_id: str = "local-user"
     postgres_uri: str = ""
     postgres_app_pool_size: int = Field(default=5, ge=1, le=50)
     postgres_app_max_overflow: int = Field(default=10, ge=0, le=100)
@@ -92,7 +91,7 @@ class Settings(BaseSettings):
     postgres_pool_timeout_seconds: float = Field(default=30.0, ge=1, le=120)
     auth_session_days: int = Field(default=7, ge=1, le=90)
     rate_limit_key_secret: SecretStr = SecretStr("")
-    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_url: str = "redis://127.0.0.1:16379/0"
     redis_username: str = "ddra"
     redis_password_file: Path = Path(".secrets/redis_password")
     redis_connect_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
@@ -100,7 +99,7 @@ class Settings(BaseSettings):
     redis_max_connections: int = Field(default=20, ge=1, le=200)
     health_check_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     # Celery reuses the Redis service but has its own logical DB and ACL user.
-    celery_broker_url: str = "redis://127.0.0.1:6379/1"
+    celery_broker_url: str = "redis://127.0.0.1:16379/1"
     celery_redis_username: str = "ddra-celery"
     celery_broker_key_prefix: str = "ddra-celery:"
     celery_visibility_timeout_seconds: int = Field(default=300, ge=60, le=3600)
