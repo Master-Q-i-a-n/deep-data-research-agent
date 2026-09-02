@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import uuid4
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage
 from langgraph.config import get_config
 
 from deep_data_research_agent.admissions import redis_limits
@@ -21,39 +19,19 @@ from deep_data_research_agent.core.identity import (
     user_identity_from_config,
 )
 from deep_data_research_agent.database import repository as database
+from deep_data_research_agent.providers.context_usage import (
+    effective_request_messages,
+    estimate_messages_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _message_bytes(value: Any) -> int:
-    if isinstance(value, BaseMessage):
-        value = {"type": value.type, "content": value.content}
-    try:
-        serialized = json.dumps(value, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        serialized = str(value)
-    return len(serialized.encode("utf-8"))
-
-
 def estimate_tokens(model: Any, messages: Sequence[Any]) -> int:
-    """Prefer the model tokenizer and retain a deterministic provider fallback."""
+    """Estimate without calling a Provider-specific tokenizer."""
 
-    try:
-        count = int(model.get_num_tokens_from_messages(list(messages)))
-        if count > 0:
-            return count
-    except (
-        AttributeError,
-        ImportError,
-        LookupError,
-        NotImplementedError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ):
-        # Tokenizers are optional for OpenAI-compatible providers.
-        logger.debug("模型 tokenizer 不可用，改用 UTF-8 长度估算", exc_info=True)
-    return max(1, math.ceil(sum(_message_bytes(item) for item in messages) / 3))
+    del model
+    return estimate_messages_tokens(messages)
 
 
 def _output_reservation(model: Any, model_settings: Mapping[str, Any] | None) -> int:
@@ -125,11 +103,16 @@ async def _reserve(
     agent_name: str,
     model: Any,
     messages: Sequence[Any],
+    tools: Sequence[Any] = (),
     model_settings: Mapping[str, Any] | None,
     root_run_id: str | None,
     thread_id: str | None,
 ) -> database.TokenUsageReservation:
-    estimated_input = await asyncio.to_thread(estimate_tokens, model, messages)
+    estimated_input = await asyncio.to_thread(
+        estimate_messages_tokens,
+        messages,
+        tools=tools,
+    )
     reserved = estimated_input + _output_reservation(model, model_settings)
     reservation = await database.reserve_model_tokens(
         call_id=str(uuid4()),
@@ -137,7 +120,9 @@ async def _reserve(
         root_run_id=root_run_id,
         thread_id=thread_id,
         agent_name=agent_name,
-        model_name=str(getattr(model, "model_name", None) or getattr(model, "model", "unknown")),
+        model_name=str(
+            getattr(model, "model_name", None) or getattr(model, "model", "unknown")
+        ),
         reserved_tokens=reserved,
     )
     await _sync_bucket(user_id, reservation.bucket)
@@ -187,14 +172,16 @@ class TokenUsageMiddleware(AgentMiddleware):
         execution_info = getattr(request.runtime, "execution_info", None)
         root_run_id = root_run_id or getattr(execution_info, "run_id", None)
         thread_id = thread_id or getattr(execution_info, "thread_id", None)
+        effective_messages = effective_request_messages(request)
         messages = ([request.system_message] if request.system_message else []) + list(
-            request.messages
+            effective_messages
         )
         reservation = await _reserve(
             user_id=user_id,
             agent_name=self._agent_name,
             model=request.model,
             messages=messages,
+            tools=request.tools,
             model_settings=request.model_settings,
             root_run_id=root_run_id,
             thread_id=thread_id,
@@ -231,7 +218,12 @@ class TokenUsageMiddleware(AgentMiddleware):
                     request.model,
                     messages,
                 )
-                usage = (estimated_input, usage[1], estimated_input + usage[1], "estimated")
+                usage = (
+                    estimated_input,
+                    usage[1],
+                    estimated_input + usage[1],
+                    "estimated",
+                )
         await _settle(
             reservation,
             user_id=user_id,

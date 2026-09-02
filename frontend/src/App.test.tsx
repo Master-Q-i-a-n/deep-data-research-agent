@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App, { messageMarkdown, normalizeWebSearchEvent } from "./App";
+import App, { messageMarkdown, normalizeContextUsageEvent, normalizeWebSearchEvent } from "./App";
 
 const submit = vi.fn();
 const stop = vi.fn();
@@ -29,6 +29,11 @@ type TestMessage = {
 function createStreamState() {
   return {
     values: {
+      context_usage: undefined as {
+        used_tokens: number;
+        max_input_tokens: number;
+        provider_version: number;
+      } | undefined,
       todos: [
         { content: "拆分网页采集任务", status: "completed" as const },
         { content: "等待 crawl-worker 返回", status: "in_progress" as const },
@@ -294,6 +299,90 @@ describe("研究工作台", () => {
     })?.sources).toEqual([
       { title: "OpenAI", url: "https://developers.openai.com/" },
     ]);
+  });
+
+  it("校验上下文事件，并按 Provider 版本显示圆形占比", async () => {
+    expect(normalizeContextUsageEvent({
+      type: "context_usage",
+      phase: "before_model",
+      used_tokens: 700,
+      max_input_tokens: 1_000,
+      provider_version: 1,
+    })).toMatchObject({ used_tokens: 700, max_input_tokens: 1_000 });
+    expect(normalizeContextUsageEvent({
+      type: "context_usage",
+      phase: "before_model",
+      used_tokens: 1,
+      max_input_tokens: 0,
+      provider_version: 1,
+    })).toBeNull();
+
+    streamState.values.context_usage = {
+      used_tokens: 700,
+      max_input_tokens: 1_000,
+      provider_version: 1,
+    };
+    render(<App />);
+    await screen.findByText("默认账户");
+    fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    await screen.findByDisplayValue("qwen-plus");
+    fireEvent.click(screen.getByRole("button", { name: "关闭设置" }));
+    expect(screen.getByRole("status", {
+      name: "上下文窗口：70% 已用，已用 700 Token，共 1k",
+    }).className).toContain("context-window--warning");
+    const composerIndicator = screen.getByRole("status", {
+      name: "上下文窗口：70% 已用，已用 700 Token，共 1k",
+    });
+    expect(composerIndicator.closest(".composer__field")).not.toBeNull();
+    expect(composerIndicator.closest(".topbar")).toBeNull();
+    const resizeDivider = screen.getByRole("separator", { name: "调整输入框高度" });
+    expect(resizeDivider.getAttribute("aria-valuenow")).toBe("54");
+    fireEvent.keyDown(resizeDivider, { key: "ArrowUp" });
+    expect(resizeDivider.getAttribute("aria-valuenow")).toBe("78");
+    expect(document.querySelector<HTMLElement>(".main-panel")?.style.getPropertyValue(
+      "--composer-input-height",
+    )).toBe("78px");
+    const onCustomEvent = capturedOptions?.onCustomEvent as (event: unknown) => void;
+    await act(async () => onCustomEvent({
+      type: "context_usage",
+      phase: "after_model",
+      used_tokens: 850,
+      max_input_tokens: 1_000,
+      provider_version: 1,
+    }));
+
+    const indicator = screen.getByRole("status", {
+      name: "上下文窗口：85% 已用，已用 850 Token，共 1k",
+    });
+    expect(indicator.className).toContain("context-window--danger");
+
+    const onFinish = capturedOptions?.onFinish as (state: unknown, run: unknown) => void;
+    await act(async () => onFinish({
+      context_usage: {
+        used_tokens: 860,
+        max_input_tokens: 1_000,
+        provider_version: 1,
+      },
+    }, undefined));
+    expect(screen.getByRole("status", {
+      name: "上下文窗口：86% 已用，已用 860 Token，共 1k",
+    })).toBeTruthy();
+
+    const onError = capturedOptions?.onError as (error: unknown, run: unknown) => void;
+    await act(async () => onError(new Error("stream ended"), undefined));
+    expect(screen.getByRole("status", {
+      name: "上下文窗口：86% 已用，已用 860 Token，共 1k",
+    })).toBeTruthy();
+
+    await act(async () => onCustomEvent({
+      type: "context_usage",
+      phase: "after_model",
+      used_tokens: 900,
+      max_input_tokens: 1_000,
+      provider_version: 99,
+    }));
+    expect(screen.queryByLabelText(/90% 已用/)).toBeNull();
   });
 
   it("实时显示搜索阶段、查询和来源，且忽略乱序事件", async () => {
@@ -1490,6 +1579,7 @@ describe("研究工作台", () => {
 
     streamState.messages = [];
     streamState.values = {
+      context_usage: undefined,
       todos: [],
       async_tasks: {} as typeof streamState.values.async_tasks,
     };

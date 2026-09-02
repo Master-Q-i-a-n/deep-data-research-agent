@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, ImgHTMLAttributes, KeyboardEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, CSSProperties, FormEvent, ImgHTMLAttributes, KeyboardEvent, memo, PointerEvent as ReactPointerEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { HumanMessage } from "@langchain/core/messages";
 import { Client } from "@langchain/langgraph-sdk/client";
 import { useStream } from "@langchain/react";
@@ -28,6 +28,17 @@ type StreamState = {
   messages: Message[];
   todos?: TodoItem[];
   async_tasks?: Record<string, AsyncTask>;
+  context_usage?: ContextUsageSnapshot | null;
+};
+
+export type ContextUsageSnapshot = {
+  used_tokens: number;
+  max_input_tokens: number;
+  provider_version: number;
+};
+export type ContextUsageEvent = ContextUsageSnapshot & {
+  type: "context_usage";
+  phase: "before_model" | "after_model";
 };
 
 type WebSearchSource = { title: string; url: string };
@@ -47,6 +58,7 @@ export type WebSearchProgressEvent = {
   action?: WebSearchAction;
   sources?: WebSearchSource[];
 };
+type AppCustomEvent = WebSearchProgressEvent | ContextUsageEvent;
 
 type Row =
   | { kind: "message"; key: string; role: "human" | "ai"; body: string; report: boolean }
@@ -192,6 +204,7 @@ const MAX_UPLOAD_FILES = 5;
 const MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
 const TABLE_FILE_PATTERN = /\.(csv|tsv|xlsx)$/i;
+const COMPOSER_TEXTAREA_MIN_HEIGHT = 54;
 const ASYNC_TASK_STATUSES = new Set<AsyncTaskStatus>([
   "pending",
   "running",
@@ -367,6 +380,68 @@ export function normalizeWebSearchEvent(value: unknown): WebSearchProgressEvent 
     ...(action ? { action } : {}),
     ...(sources.length > 0 ? { sources } : {}),
   };
+}
+
+function normalizeContextUsageSnapshot(value: unknown): ContextUsageSnapshot | null {
+  if (typeof value !== "object" || value === null) return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    !Number.isFinite(raw.used_tokens)
+    || !Number.isFinite(raw.max_input_tokens)
+    || !Number.isInteger(raw.provider_version)
+  ) return null;
+  const usedTokens = Number(raw.used_tokens);
+  const maxInputTokens = Number(raw.max_input_tokens);
+  const providerVersion = Number(raw.provider_version);
+  if (usedTokens < 0 || maxInputTokens <= 0 || providerVersion <= 0) return null;
+  return {
+    used_tokens: Math.round(usedTokens),
+    max_input_tokens: Math.round(maxInputTokens),
+    provider_version: providerVersion,
+  };
+}
+
+export function normalizeContextUsageEvent(value: unknown): ContextUsageEvent | null {
+  if (typeof value !== "object" || value === null) return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    raw.type !== "context_usage"
+    || (raw.phase !== "before_model" && raw.phase !== "after_model")
+  ) return null;
+  const snapshot = normalizeContextUsageSnapshot(raw);
+  return snapshot ? { type: "context_usage", phase: raw.phase, ...snapshot } : null;
+}
+
+function compactTokenCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
+  return String(value);
+}
+
+function ContextWindowIndicator({ usage }: { usage: ContextUsageSnapshot | null }) {
+  if (!usage) return null;
+  const rawPercent = (usage.used_tokens / usage.max_input_tokens) * 100;
+  // Floor the display so warning colors begin only after the real threshold.
+  const percent = Math.max(0, Math.floor(rawPercent));
+  const ringPercent = Math.min(100, rawPercent);
+  const tone = percent >= 85 ? "danger" : percent >= 70 ? "warning" : "normal";
+  const label = `上下文窗口：${percent}% 已用，已用 ${compactTokenCount(usage.used_tokens)} Token，共 ${compactTokenCount(usage.max_input_tokens)}`;
+  return (
+    <span
+      className={`context-window context-window--${tone}`}
+      role="status"
+      tabIndex={0}
+      aria-label={label}
+      style={{ "--context-percent": `${ringPercent}%` } as CSSProperties}
+    >
+      <span className="context-window__ring" aria-hidden="true" />
+      <span className="context-window__tooltip" role="tooltip">
+        <span>上下文窗口：</span>
+        <span>{percent}% 已用</span>
+        <strong>已用 {compactTokenCount(usage.used_tokens)} Token，共 {compactTokenCount(usage.max_input_tokens)}</strong>
+      </span>
+    </span>
+  );
 }
 
 function persistedWebSearches(content: unknown): WebSearchProgressEvent[] {
@@ -1152,6 +1227,7 @@ export default function App() {
     () => new URLSearchParams(window.location.search).get("thread") ?? undefined,
   );
   const [input, setInput] = useState("");
+  const [composerInputHeight, setComposerInputHeight] = useState(COMPOSER_TEXTAREA_MIN_HEIGHT);
   const [authToken, setAuthToken] = useState<string | null>(
     () => window.localStorage.getItem(AUTH_TOKEN_KEY),
   );
@@ -1200,6 +1276,7 @@ export default function App() {
   const [memorySettingsUpdating, setMemorySettingsUpdating] = useState(false);
   const [memorySettingsError, setMemorySettingsError] = useState("");
   const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
+  const [providerVersion, setProviderVersion] = useState<number | null>(null);
   const [providerDraft, setProviderDraft] = useState<ModelProviderDraft>(DEFAULT_PROVIDER_DRAFT);
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerKeyHint, setProviderKeyHint] = useState("");
@@ -1213,6 +1290,7 @@ export default function App() {
   const [liveWebSearches, setLiveWebSearches] = useState<Map<string, WebSearchProgressEvent>>(
     () => new Map(),
   );
+  const [liveContextUsage, setLiveContextUsage] = useState<ContextUsageSnapshot | null>(null);
   const [visibleRowLimit, setVisibleRowLimit] = useState(INITIAL_VISIBLE_ROW_LIMIT);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const conversationRef = useRef<HTMLElement>(null);
@@ -1223,6 +1301,11 @@ export default function App() {
   const approvedSemanticDownloadRef = useRef(false);
   const semanticDownloadBaselineRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const composerResizeRef = useRef<{
+    pointerId: number;
+    startY: number;
+    startHeight: number;
+  } | null>(null);
   const accountMenuRef = useRef<HTMLElement>(null);
   const accountMenuButtonRef = useRef<HTMLButtonElement>(null);
   const settingsCloseButtonRef = useRef<HTMLButtonElement>(null);
@@ -1254,9 +1337,10 @@ export default function App() {
   const workspaceLocked = !authReady;
   const providerReady = providerConfigured === true;
   useEffect(() => {
-    // Search progress belongs to one authenticated thread and is never persisted locally.
+    // Live progress belongs to one authenticated thread and is never persisted locally.
     setLiveWebSearches(new Map());
-  }, [authUser.id, threadId]);
+    setLiveContextUsage(null);
+  }, [authUser.id, providerVersion, threadId]);
   const expireAuthentication = useCallback(() => {
     // 保留当前页面数据，只撤销失效凭据并锁定后续服务端操作。
     window.localStorage.removeItem(AUTH_TOKEN_KEY);
@@ -1265,7 +1349,9 @@ export default function App() {
     setAuthStatus("required");
     setAuthError("登录已失效，请重新登录");
     setProviderConfigured(null);
+    setProviderVersion(null);
     setProviderApiKey("");
+    setLiveContextUsage(null);
   }, []);
 
   const presentRunAdmissionError = useCallback((error: unknown): boolean => {
@@ -1464,16 +1550,25 @@ export default function App() {
   }, [apiUrl, authHeaders, authReady, expireAuthentication, threadId]);
 
   const handleCustomEvent = useCallback((value: unknown) => {
-    const event = normalizeWebSearchEvent(value);
-    if (!event) return;
-    setLiveWebSearches((current) => {
-      const previous = current.get(event.item_id);
-      if (previous && previous.sequence_number >= event.sequence_number) return current;
-      const next = new Map(current);
-      next.set(event.item_id, event);
-      return next;
+    const searchEvent = normalizeWebSearchEvent(value);
+    if (searchEvent) {
+      setLiveWebSearches((current) => {
+        const previous = current.get(searchEvent.item_id);
+        if (previous && previous.sequence_number >= searchEvent.sequence_number) return current;
+        const next = new Map(current);
+        next.set(searchEvent.item_id, searchEvent);
+        return next;
+      });
+      return;
+    }
+    const contextEvent = normalizeContextUsageEvent(value);
+    if (!contextEvent || contextEvent.provider_version !== providerVersion) return;
+    setLiveContextUsage({
+      used_tokens: contextEvent.used_tokens,
+      max_input_tokens: contextEvent.max_input_tokens,
+      provider_version: contextEvent.provider_version,
     });
-  }, []);
+  }, [providerVersion]);
 
   // 当前前端只持有远程图的状态类型，无法把 Python DeepAgent 类型直接传给
   // useStream；使用宽化后的选项仍可启用 SDK 内置的子智能体跟踪能力。
@@ -1496,12 +1591,23 @@ export default function App() {
     onError: (error: unknown, run: { run_id: string; thread_id: string } | undefined) => {
       setThreadAllocating(false);
       setLiveWebSearches(new Map());
+      // Context usage describes the persisted conversation, not one run's
+      // temporary progress. Keep the last event until identity or thread changes.
       runManager.recordError(error, run);
     },
     onFinish: (state: unknown, run: { run_id: string; thread_id: string } | undefined) => {
-      void state;
       setThreadAllocating(false);
       setLiveWebSearches(new Map());
+      const finalUsage = normalizeContextUsageSnapshot(
+        typeof state === "object" && state !== null
+          ? (state as StreamState).context_usage
+          : null,
+      );
+      // Avoid a live-event → stale checkpoint handoff that makes the ring
+      // briefly shrink. The final graph state is authoritative when available.
+      if (finalUsage?.provider_version === providerVersion) {
+        setLiveContextUsage(finalUsage);
+      }
       runManager.recordFinished(run);
     },
     onThreadId: (id: string) => {
@@ -1518,7 +1624,7 @@ export default function App() {
   };
   const baseStream = useStream<StreamState, {
     InterruptType: HITLRequest;
-    CustomEventType: WebSearchProgressEvent;
+    CustomEventType: AppCustomEvent;
   }>(streamOptions);
   const stream = baseStream as typeof baseStream & {
     subagents: Map<string, SubagentTraceStream>;
@@ -1553,6 +1659,12 @@ export default function App() {
     && cachedMainSnapshot.messages.length > 0;
   const displayedMessages = holdMainSnapshot ? cachedMainSnapshot.messages : liveMessages;
   const displayedValues = holdMainSnapshot ? cachedMainSnapshot.values : liveValues;
+  const persistedContextUsage = normalizeContextUsageSnapshot(displayedValues?.context_usage);
+  const contextUsage = liveContextUsage?.provider_version === providerVersion
+    ? liveContextUsage
+    : persistedContextUsage?.provider_version === providerVersion
+      ? persistedContextUsage
+      : null;
 
   useLayoutEffect(() => {
     if (liveMessages.length === 0) return;
@@ -1954,6 +2066,7 @@ export default function App() {
   useEffect(() => {
     if (!authReady) {
       setProviderConfigured(null);
+      setProviderVersion(null);
       setProviderApiKey("");
       setProviderKeyHint("");
       setProviderLoading(false);
@@ -1976,6 +2089,7 @@ export default function App() {
         if (!response.ok) throw new Error("无法读取模型 Provider 配置");
         const provider = body.provider;
         setProviderConfigured(body.configured === true && Boolean(provider));
+        setProviderVersion(provider?.version ?? null);
         setProviderApiKey("");
         setProviderKeyHint(provider?.api_key_hint ?? "");
         if (provider) {
@@ -1989,6 +2103,7 @@ export default function App() {
       } catch (error) {
         if (controller.signal.aborted) return;
         setProviderConfigured(false);
+        setProviderVersion(null);
         setProviderStatus({
           tone: "error",
           message: error instanceof Error ? error.message : "无法读取模型 Provider 配置",
@@ -2480,6 +2595,49 @@ export default function App() {
     void refreshTaskStatuses(undefined, true);
   }
 
+  function composerMaxHeight() {
+    return Math.max(COMPOSER_TEXTAREA_MIN_HEIGHT, Math.min(420, window.innerHeight * 0.5));
+  }
+
+  function startComposerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    composerResizeRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startHeight: composerInputHeight,
+    };
+  }
+
+  function moveComposerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const resize = composerResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    const nextHeight = resize.startHeight + resize.startY - event.clientY;
+    setComposerInputHeight(Math.round(Math.max(
+      COMPOSER_TEXTAREA_MIN_HEIGHT,
+      Math.min(composerMaxHeight(), nextHeight),
+    )));
+  }
+
+  function finishComposerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (composerResizeRef.current?.pointerId !== event.pointerId) return;
+    composerResizeRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function resizeComposerWithKeyboard(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const direction = event.key === "ArrowUp" ? 24 : -24;
+    setComposerInputHeight((current) => Math.max(
+      COMPOSER_TEXTAREA_MIN_HEIGHT,
+      Math.min(composerMaxHeight(), current + direction),
+    ));
+  }
+
   function clearQueuedMessages() {
     if (!threadId) return;
     void runManager.clearPending(threadId).catch((error: unknown) => {
@@ -2719,6 +2877,7 @@ export default function App() {
         throw new Error(providerErrorMessage(body, "保存模型 Provider 失败"));
       }
       setProviderConfigured(true);
+      setProviderVersion(body.provider.version);
       setProviderDraft({
         base_url: body.provider.base_url,
         model_name: body.provider.model_name,
@@ -2754,6 +2913,7 @@ export default function App() {
       }
       if (!response.ok) throw new Error(providerErrorMessage(body, "删除模型 Provider 失败"));
       setProviderConfigured(false);
+      setProviderVersion(null);
       setProviderDraft(DEFAULT_PROVIDER_DRAFT);
       setProviderApiKey("");
       setProviderKeyHint("");
@@ -2927,7 +3087,10 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main-panel">
+      <main
+        className="main-panel"
+        style={{ "--composer-input-height": `${composerInputHeight}px` } as CSSProperties}
+      >
         <header className="topbar">
           <div>
             <p className="eyebrow">DeepAgents · Tavily</p>
@@ -3182,6 +3345,21 @@ export default function App() {
         ) : null}
 
         <form className={`composer${showDetails ? "" : " composer--compact"}`} onSubmit={onSubmit}>
+          <div
+            className="composer__resize-divider"
+            role="separator"
+            aria-label="调整输入框高度"
+            aria-orientation="horizontal"
+            aria-valuemin={COMPOSER_TEXTAREA_MIN_HEIGHT}
+            aria-valuemax={Math.round(composerMaxHeight())}
+            aria-valuenow={Math.round(composerInputHeight)}
+            tabIndex={0}
+            onPointerDown={startComposerResize}
+            onPointerMove={moveComposerResize}
+            onPointerUp={finishComposerResize}
+            onPointerCancel={finishComposerResize}
+            onKeyDown={resizeComposerWithKeyboard}
+          />
           <div className="composer__field">
             <label htmlFor="research-input">
               {pendingInterrupt
@@ -3272,6 +3450,7 @@ export default function App() {
                 ? "Enter 排队发送 · Shift + Enter 换行"
                 : "Enter 发送 · Shift + Enter 换行"}
             </span>
+            <ContextWindowIndicator usage={contextUsage} />
           </div>
           <div className="composer__actions">
             <button

@@ -29,6 +29,7 @@ from deep_data_research_agent.core.identity import (
     user_identity,
     user_identity_from_config,
 )
+from deep_data_research_agent.providers.context_usage import ContextTokenCounter
 from deep_data_research_agent.providers.model_profiles import (
     model_capabilities,
     model_profile,
@@ -129,6 +130,9 @@ def _build_model(
         # Preserve capabilities supplied by a dedicated integration while
         # letting the local registry override values such as context length.
         model.profile = {**(model.profile or {}), **local_profile}
+    # Keep the configuration version beside the cached client. It contains no
+    # secret and lets checkpoint anchors reject usage from an older Provider.
+    object.__setattr__(model, "_deep_data_provider_version", provider.version)
     return model, sync_client, async_client
 
 
@@ -230,7 +234,9 @@ class ProviderSummaryChatModel(BaseChatModel):
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         del messages, stop, run_manager, kwargs
-        raise RuntimeError("Provider summarization only supports asynchronous Agent runs")
+        raise RuntimeError(
+            "Provider summarization only supports asynchronous Agent runs"
+        )
 
     async def _agenerate(
         self,
@@ -254,7 +260,6 @@ class ProviderSummarizationMiddleware(AgentMiddleware):
     def __init__(self, role: ModelRole, backend: Any) -> None:
         self.role = role
         self.backend = backend
-        self._delegates: dict[int | None, AgentMiddleware] = {}
 
     @property
     def name(self) -> str:
@@ -270,18 +275,20 @@ class ProviderSummarizationMiddleware(AgentMiddleware):
         if not isinstance(max_input_tokens, int) or max_input_tokens <= 0:
             max_input_tokens = None
 
-        delegate = self._delegates.get(max_input_tokens)
-        if delegate is None:
-            summary_profile = (
-                {"max_input_tokens": max_input_tokens}
-                if max_input_tokens is not None
-                else None
-            )
-            delegate = create_summarization_middleware(
-                ProviderSummaryChatModel(role=self.role, profile=summary_profile),
-                self.backend,
-            )
-            self._delegates[max_input_tokens] = delegate
+        summary_profile = (
+            {"max_input_tokens": max_input_tokens}
+            if max_input_tokens is not None
+            else None
+        )
+        token_counter = ContextTokenCounter(request)
+        delegate = create_summarization_middleware(
+            ProviderSummaryChatModel(role=self.role, profile=summary_profile),
+            self.backend,
+            token_counter=token_counter,
+        )
+        # The counter uses the historical usage anchor only for this exact
+        # effective request. DeepAgents' cutoff probes remain pure estimates.
+        token_counter.bind(delegate._get_effective_messages(request))
         return delegate
 
     def wrap_model_call(

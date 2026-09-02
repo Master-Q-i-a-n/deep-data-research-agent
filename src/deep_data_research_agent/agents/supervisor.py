@@ -37,6 +37,7 @@ from deep_data_research_agent.memory.service import (
     MemoryRefreshMiddleware,
     agent_memory_path,
 )
+from deep_data_research_agent.providers.context_usage import ContextUsageMiddleware
 from deep_data_research_agent.providers.models import (
     ProviderModelMiddleware,
     provider_summarization_middleware,
@@ -80,9 +81,8 @@ graph = create_deep_agent(
             middleware=[
                 ProviderModelMiddleware("data-analyst"),
                 TokenUsageMiddleware(agent_name="data-analyst"),
-                provider_summarization_middleware(
-                    "data-analyst", SUPERVISOR_BACKEND
-                ),
+                provider_summarization_middleware("data-analyst", SUPERVISOR_BACKEND),
+                ContextUsageMiddleware("data-analyst"),
                 # DeepAgents 0.7 makes planning opt-in; keep it for analysis.
                 TodoListMiddleware(),
                 MemoryRefreshMiddleware(
@@ -117,6 +117,7 @@ graph = create_deep_agent(
                 provider_summarization_middleware(
                     "analysis-reviewer", SUPERVISOR_BACKEND
                 ),
+                ContextUsageMiddleware("analysis-reviewer"),
                 # after_model hooks run in reverse order: count the model call
                 # before validating or redirecting its final JSON response.
                 ReviewerResultValidationMiddleware(),
@@ -132,6 +133,7 @@ graph = create_deep_agent(
         ProviderModelMiddleware("supervisor"),
         TokenUsageMiddleware(agent_name="supervisor"),
         provider_summarization_middleware("supervisor", SUPERVISOR_BACKEND),
+        ContextUsageMiddleware("supervisor"),
         # Reviewer deliberately omits this official Todo middleware.
         TodoListMiddleware(),
         SandboxLifecycleMiddleware(
