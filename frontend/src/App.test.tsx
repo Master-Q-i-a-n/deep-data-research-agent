@@ -145,6 +145,8 @@ function withDevelopmentAuth(handler: FetchHandler) {
         json: async () => ({
           configured: true,
           provider: {
+            provider_name: "dashscope",
+            provider_type: "chat_completions",
             base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
             model_name: "qwen-plus",
             has_api_key: true,
@@ -222,6 +224,8 @@ beforeEach(() => {
         json: async () => ({
           configured: true,
           provider: {
+            provider_name: "dashscope",
+            provider_type: "chat_completions",
             base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
             model_name: "qwen-plus",
             has_api_key: true,
@@ -937,6 +941,8 @@ describe("研究工作台", () => {
           json: async () => ({
             configured: true,
             provider: {
+              provider_name: "openai-compatible",
+              provider_type: "chat_completions",
               base_url: "https://models.example.com/v1",
               model_name: "safe-model",
               has_api_key: true,
@@ -992,6 +998,8 @@ describe("研究工作台", () => {
   it("已保存 Key 可留空测试、更新和删除", async () => {
     streamState.values.async_tasks = {} as typeof streamState.values.async_tasks;
     const provider = {
+      provider_name: "dashscope",
+      provider_type: "chat_completions" as const,
       base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
       model_name: "qwen-max",
       has_api_key: true,
@@ -1004,7 +1012,16 @@ describe("研究工作台", () => {
       const url = String(input);
       if (url.endsWith("/model-provider/test")) {
         mutationBodies.push({ method: "POST", body: JSON.parse(String(init?.body)) as Record<string, unknown> });
-        return { ok: true, status: 200, json: async () => ({ ok: true, latency_ms: 42 }) };
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            provider_name: "dashscope",
+            provider_type: "chat_completions",
+            latency_ms: 42,
+          }),
+        };
       }
       if (url.endsWith("/model-provider") && init?.method === "PUT") {
         mutationBodies.push({ method: "PUT", body: JSON.parse(String(init.body)) as Record<string, unknown> });
@@ -1024,7 +1041,8 @@ describe("研究工作台", () => {
     expect((screen.getByLabelText("API Key") as HTMLInputElement).placeholder).toContain("尾号 1234");
     fireEvent.change(screen.getByLabelText("模型名"), { target: { value: "qwen-max" } });
     fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
-    await screen.findByText("连接成功 · 42 ms");
+    await screen.findByText("连接成功 · Chat Completions · 42 ms");
+    await screen.findByText("已识别：Chat Completions · dashscope");
     fireEvent.click(screen.getByRole("button", { name: "保存 Provider" }));
     await screen.findByText("模型 Provider 已保存");
     fireEvent.click(screen.getByRole("button", { name: "删除" }));

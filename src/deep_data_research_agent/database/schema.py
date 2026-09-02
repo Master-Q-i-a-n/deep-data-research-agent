@@ -1,7 +1,7 @@
 """Application schema revision constants shared by runtime and deployment tools."""
 
 ALEMBIC_BASELINE_REVISION = "0001_current_schema"
-ALEMBIC_HEAD_REVISION = "0002_user_model_provider"
+ALEMBIC_HEAD_REVISION = "0003_model_provider_protocols"
 
 CHECKPOINT_TABLES = (
     "checkpoint_migrations",

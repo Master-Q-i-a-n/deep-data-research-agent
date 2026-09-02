@@ -38,10 +38,7 @@ from deep_data_research_agent.memory.service import (
     agent_memory_path,
 )
 from deep_data_research_agent.providers.context_usage import ContextUsageMiddleware
-from deep_data_research_agent.providers.models import (
-    ProviderModelMiddleware,
-    provider_summarization_middleware,
-)
+from deep_data_research_agent.providers.models import provider_summarization_middleware
 from deep_data_research_agent.skill_system.storage import (
     public_skill_root,
     user_skill_root,
@@ -79,9 +76,8 @@ graph = create_deep_agent(
                 f"{user_skill_root('data-analyst')}/",
             ],
             middleware=[
-                ProviderModelMiddleware("data-analyst"),
-                TokenUsageMiddleware(agent_name="data-analyst"),
                 provider_summarization_middleware("data-analyst", SUPERVISOR_BACKEND),
+                TokenUsageMiddleware(agent_name="data-analyst"),
                 ContextUsageMiddleware("data-analyst"),
                 # DeepAgents 0.7 makes planning opt-in; keep it for analysis.
                 TodoListMiddleware(),
@@ -112,11 +108,10 @@ graph = create_deep_agent(
             # Explicitly avoid inheriting the Supervisor's business tools.
             tools=[],
             middleware=[
-                ProviderModelMiddleware("analysis-reviewer"),
-                TokenUsageMiddleware(agent_name="analysis-reviewer"),
                 provider_summarization_middleware(
                     "analysis-reviewer", SUPERVISOR_BACKEND
                 ),
+                TokenUsageMiddleware(agent_name="analysis-reviewer"),
                 ContextUsageMiddleware("analysis-reviewer"),
                 # after_model hooks run in reverse order: count the model call
                 # before validating or redirecting its final JSON response.
@@ -130,9 +125,8 @@ graph = create_deep_agent(
         ),
     ],
     middleware=[
-        ProviderModelMiddleware("supervisor"),
-        TokenUsageMiddleware(agent_name="supervisor"),
         provider_summarization_middleware("supervisor", SUPERVISOR_BACKEND),
+        TokenUsageMiddleware(agent_name="supervisor"),
         ContextUsageMiddleware("supervisor"),
         # Reviewer deliberately omits this official Todo middleware.
         TodoListMiddleware(),

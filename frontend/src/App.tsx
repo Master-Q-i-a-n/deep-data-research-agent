@@ -147,6 +147,8 @@ type MemorySettingsResponse = {
   detail?: string;
 };
 type ModelProvider = {
+  provider_name: string;
+  provider_type: "responses" | "chat_completions" | "anthropic";
   base_url: string;
   model_name: string;
   has_api_key: boolean;
@@ -157,6 +159,8 @@ type ModelProvider = {
 type ModelProviderResponse = {
   configured?: boolean;
   provider?: ModelProvider | null;
+  provider_name?: string;
+  provider_type?: ModelProvider["provider_type"];
   deleted?: boolean;
   detail?: string | LimitDetail;
 };
@@ -993,6 +997,11 @@ const DEFAULT_PROVIDER_DRAFT: ModelProviderDraft = {
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   model_name: "qwen-plus",
 };
+const PROVIDER_TYPE_LABELS: Record<ModelProvider["provider_type"], string> = {
+  responses: "Responses API",
+  chat_completions: "Chat Completions",
+  anthropic: "Anthropic Native",
+};
 const SIGNED_OUT_USER: AuthUser = {
   id: "",
   username: "未登录",
@@ -1277,6 +1286,7 @@ export default function App() {
   const [memorySettingsError, setMemorySettingsError] = useState("");
   const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
   const [providerVersion, setProviderVersion] = useState<number | null>(null);
+  const [providerIdentity, setProviderIdentity] = useState<Pick<ModelProvider, "provider_name" | "provider_type"> | null>(null);
   const [providerDraft, setProviderDraft] = useState<ModelProviderDraft>(DEFAULT_PROVIDER_DRAFT);
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerKeyHint, setProviderKeyHint] = useState("");
@@ -1350,6 +1360,7 @@ export default function App() {
     setAuthError("登录已失效，请重新登录");
     setProviderConfigured(null);
     setProviderVersion(null);
+    setProviderIdentity(null);
     setProviderApiKey("");
     setLiveContextUsage(null);
   }, []);
@@ -1358,6 +1369,7 @@ export default function App() {
     if (!(error instanceof LangGraphApiError) || !error.detail) return false;
     if (error.detail.code === "MODEL_PROVIDER_NOT_CONFIGURED" || error.detail.code === "MODEL_PROVIDER_INVALID") {
       setProviderConfigured(false);
+      setProviderIdentity(null);
       setProviderStatus({ tone: "error", message: error.detail.message });
       setSettingsOpen(true);
       return true;
@@ -2067,6 +2079,7 @@ export default function App() {
     if (!authReady) {
       setProviderConfigured(null);
       setProviderVersion(null);
+      setProviderIdentity(null);
       setProviderApiKey("");
       setProviderKeyHint("");
       setProviderLoading(false);
@@ -2090,6 +2103,10 @@ export default function App() {
         const provider = body.provider;
         setProviderConfigured(body.configured === true && Boolean(provider));
         setProviderVersion(provider?.version ?? null);
+        setProviderIdentity(provider ? {
+          provider_name: provider.provider_name,
+          provider_type: provider.provider_type,
+        } : null);
         setProviderApiKey("");
         setProviderKeyHint(provider?.api_key_hint ?? "");
         if (provider) {
@@ -2104,6 +2121,7 @@ export default function App() {
         if (controller.signal.aborted) return;
         setProviderConfigured(false);
         setProviderVersion(null);
+        setProviderIdentity(null);
         setProviderStatus({
           tone: "error",
           message: error instanceof Error ? error.message : "无法读取模型 Provider 配置",
@@ -2839,9 +2857,15 @@ export default function App() {
         return;
       }
       if (!response.ok) throw new Error(providerErrorMessage(body, "模型 Provider 连接失败"));
+      if (body.provider_name && body.provider_type) {
+        setProviderIdentity({
+          provider_name: body.provider_name,
+          provider_type: body.provider_type,
+        });
+      }
       setProviderStatus({
         tone: "success",
-        message: `连接成功${typeof body.latency_ms === "number" ? ` · ${body.latency_ms} ms` : ""}`,
+        message: `连接成功${body.provider_type ? ` · ${PROVIDER_TYPE_LABELS[body.provider_type]}` : ""}${typeof body.latency_ms === "number" ? ` · ${body.latency_ms} ms` : ""}`,
       });
     } catch (error) {
       setProviderStatus({
@@ -2878,6 +2902,10 @@ export default function App() {
       }
       setProviderConfigured(true);
       setProviderVersion(body.provider.version);
+      setProviderIdentity({
+        provider_name: body.provider.provider_name,
+        provider_type: body.provider.provider_type,
+      });
       setProviderDraft({
         base_url: body.provider.base_url,
         model_name: body.provider.model_name,
@@ -2914,6 +2942,7 @@ export default function App() {
       if (!response.ok) throw new Error(providerErrorMessage(body, "删除模型 Provider 失败"));
       setProviderConfigured(false);
       setProviderVersion(null);
+      setProviderIdentity(null);
       setProviderDraft(DEFAULT_PROVIDER_DRAFT);
       setProviderApiKey("");
       setProviderKeyHint("");
@@ -3648,6 +3677,11 @@ export default function App() {
                     >{providerKeyVisible ? "隐藏" : "显示"}</button>
                   </span>
                 </label>
+                {providerIdentity ? (
+                  <p className="settings-hint">
+                    已识别：{PROVIDER_TYPE_LABELS[providerIdentity.provider_type]} · {providerIdentity.provider_name}
+                  </p>
+                ) : null}
                 <div className="provider-settings-actions">
                   <button
                     type="button"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -71,6 +72,30 @@ def _provider_settings(key_file: Path, allowlist: str = "") -> SimpleNamespace:
     )
 
 
+def _resolved_provider(
+    base_url: str,
+    model_name: str,
+    *,
+    user_id: str = "user-a",
+    api_key: str = "test-key",
+) -> service.ResolvedProvider:
+    normalized = service.normalize_provider_url(base_url)
+    normalized, provider_name, provider_type, capabilities = (
+        service.resolve_provider_metadata(normalized, model_name)
+    )
+    return service.ResolvedProvider(
+        user_id=user_id,
+        provider_name=provider_name,
+        provider_type=provider_type,
+        base_url=normalized,
+        model_name=model_name,
+        api_key=api_key,
+        api_key_hint=api_key[-4:],
+        version=1,
+        capabilities=capabilities,
+    )
+
+
 def test_production_readiness_requires_valid_encryption_key(
     monkeypatch,
     tmp_path: Path,
@@ -127,6 +152,8 @@ async def test_provider_is_encrypted_scoped_and_can_retain_key(
     assert await database.get_model_provider("user-b") is None
     public = await service.get_public_provider("user-a")
     assert public == {
+        "provider_name": "openai-compatible",
+        "provider_type": "chat_completions",
         "base_url": "https://models.example.com/v1",
         "model_name": "model-one",
         "has_api_key": True,
@@ -146,7 +173,7 @@ async def test_provider_is_encrypted_scoped_and_can_retain_key(
         stored = await session.get(UserModelProvider, "user-a")
         assert stored is not None
         assert stored.api_key_ciphertext == first_ciphertext
-        assert stored.provider_type == "openai_compatible"
+        assert stored.provider_type == "chat_completions"
         assert stored.version == 2
     assert updated.version == 2
     assert (await service.resolve_provider("user-a")).api_key == secret
@@ -170,7 +197,7 @@ def test_provider_url_rejects_unsafe_components(url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_url_requires_public_https_or_allowlist(
+async def test_provider_url_allows_private_https_but_http_requires_allowlist(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -182,8 +209,10 @@ async def test_provider_url_requires_public_https_or_allowlist(
         lambda _host, _port: {ipaddress.ip_address("127.0.0.1")},
     )
 
-    with pytest.raises(service.ProviderConfigurationError, match="白名单"):
+    assert (
         await service.validate_provider_url("https://localhost:9000/v1")
+        == "https://localhost:9000/v1"
+    )
     with pytest.raises(service.ProviderConfigurationError, match="HTTP"):
         await service.validate_provider_url("http://localhost:9000/v1")
 
@@ -198,67 +227,133 @@ async def test_provider_url_requires_public_https_or_allowlist(
 
 
 @pytest.mark.parametrize(
-    "model_name",
-    ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"],
+    ("base_url", "model_name", "provider_name", "provider_type"),
+    [
+        ("https://api.openai.com/v1", "gpt-5.6", "openai", "responses"),
+        (
+            "https://API.OPENAI.COM./v1",
+            "unknown-gpt",
+            "openai",
+            "chat_completions",
+        ),
+        ("https://api.deepseek.com", "deepseek-v4-pro", "deepseek", "responses"),
+        (
+            "https://api.deepseek.com",
+            "unknown-deepseek",
+            "deepseek",
+            "chat_completions",
+        ),
+        (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "qwen-plus",
+            "dashscope",
+            "chat_completions",
+        ),
+        ("https://api.anthropic.com", "claude-sonnet", "anthropic", "anthropic"),
+        (
+            "https://models.example.com/v1",
+            "custom-model",
+            "openai-compatible",
+            "chat_completions",
+        ),
+    ],
 )
-def test_deepseek_v4_profiles_use_responses_without_openai_include(
+def test_provider_registry_resolves_exact_host_and_model_override(
+    base_url: str,
     model_name: str,
+    provider_name: str,
+    provider_type: str,
 ) -> None:
-    profile = model_profiles.model_profile(model_name)
+    resolved = model_profiles.resolve_model_provider(base_url, model_name)
 
-    assert profile == {"max_input_tokens": 1_000_000}
-    capabilities = model_profiles.model_capabilities(model_name)
-    assert capabilities.supports_responses_api is True
-    assert capabilities.supports_web_search is True
-    assert capabilities.responses_include == ()
-    assert model_profiles.model_profile("unknown-model") is None
+    assert resolved.provider_name == provider_name
+    assert resolved.provider_type == provider_type
+    assert resolved.capabilities.supports_tools is True
 
 
-@pytest.mark.parametrize(
-    ("model_name", "max_input_tokens"),
-    [("gpt-5.6", 1_050_000), ("GPT-5.4-mini", 400_000)],
-)
-def test_official_gpt_profiles_enable_responses_and_web_search(
-    model_name: str,
-    max_input_tokens: int,
-) -> None:
-    assert model_profiles.model_profile(model_name) == {
-        "max_input_tokens": max_input_tokens
-    }
-    capabilities = model_profiles.model_capabilities(model_name)
-    assert capabilities.supports_responses_api is True
-    assert capabilities.supports_web_search is True
-    assert capabilities.responses_include == (
+def test_provider_registry_does_not_fuzzy_match_hostname() -> None:
+    resolved = model_profiles.resolve_model_provider(
+        "https://proxy.api.openai.com/v1", "gpt-5.6"
+    )
+
+    assert resolved.provider_name == "openai-compatible"
+    assert resolved.provider_type == "chat_completions"
+
+
+def test_registered_responses_capabilities_are_model_specific() -> None:
+    openai = model_profiles.resolve_model_provider(
+        "https://api.openai.com/v1", "GPT-5.4-mini"
+    )
+    deepseek = model_profiles.resolve_model_provider(
+        "https://api.deepseek.com", "deepseek-v4-flash"
+    )
+
+    assert openai.capabilities.max_input_tokens == 400_000
+    assert openai.capabilities.supports_web_search is True
+    assert openai.capabilities.responses_include == (
         "reasoning.encrypted_content",
         "web_search_call.action.sources",
     )
-
-    unknown = model_profiles.model_capabilities("gpt-unknown-compatible")
-    assert unknown.supports_responses_api is False
-    assert unknown.supports_web_search is False
-    assert unknown.responses_include == ()
+    assert deepseek.capabilities.max_input_tokens == 1_000_000
+    assert deepseek.capabilities.supports_web_search is True
+    assert deepseek.capabilities.responses_include == ()
 
 
-def test_web_search_profile_requires_responses_api(tmp_path: Path) -> None:
+def test_web_search_configuration_requires_responses_protocol(tmp_path: Path) -> None:
     profile_path = tmp_path / "profiles.yaml"
     profile_path.write_text(
-        "custom-model:\n"
-        "  max_input_tokens: 1000\n"
-        "  supports_web_search: true\n",
+        "fallback:\n"
+        "  provider_name: generic\n"
+        "  protocol: chat_completions\n"
+        "  capabilities:\n"
+        "    supports_web_search: true\n"
+        "providers: {}\n",
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="必须同时启用 Responses API"):
-        model_profiles._load_model_profiles(profile_path)
+    with pytest.raises(ValueError, match="Responses 协议"):
+        model_profiles._load_provider_registry(profile_path)
 
+
+def test_anthropic_native_rejects_proxy_and_non_root_url() -> None:
+    with pytest.raises(service.ProviderConfigurationError, match="官方根地址"):
+        service.resolve_provider_metadata(
+            "https://api.anthropic.com/v1", "claude-sonnet"
+        )
+
+    proxy = service.resolve_provider_metadata(
+        "https://anthropic-proxy.example.com", "claude-sonnet"
+    )
+    assert proxy[2] == "chat_completions"
+
+
+def test_models_without_tool_support_are_rejected(monkeypatch) -> None:
+    monkeypatch.setattr(
+        service,
+        "resolve_model_provider",
+        lambda _url, _model: model_profiles.ResolvedModelProvider(
+            "disabled",
+            "chat_completions",
+            model_profiles.ModelProviderCapabilities(supports_tools=False),
+        ),
+    )
+    with pytest.raises(service.ProviderConfigurationError, match="工具调用"):
+        service.resolve_provider_metadata("https://models.example.com", "model")
+
+
+def test_responses_include_requires_responses_protocol(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profiles.yaml"
     profile_path.write_text(
-        "custom-model:\n"
-        "  max_input_tokens: 1000\n"
-        "  responses_include: [reasoning.encrypted_content]\n",
+        "fallback:\n"
+        "  provider_name: generic\n"
+        "  protocol: chat_completions\n"
+        "  capabilities:\n"
+        "    responses_include: [reasoning.encrypted_content]\n"
+        "providers: {}\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="responses_include"):
-        model_profiles._load_model_profiles(profile_path)
+        model_profiles._load_provider_registry(profile_path)
 
 
 @pytest.mark.parametrize(
@@ -278,16 +373,10 @@ def test_responses_capability_configures_every_online_role(
             model_provider_streaming=True,
         ),
     )
-    provider = service.ResolvedProvider(
-        user_id="user-a",
-        base_url="https://api.openai.com/v1",
-        model_name="gpt-5.4",
-        api_key="test-key",
-        api_key_hint="-key",
-        version=1,
-    )
+    provider = _resolved_provider("https://api.openai.com/v1", "gpt-5.4")
 
-    model, sync_client, async_client = provider_models._build_model(provider, role)
+    built = provider_models._build_model(provider, role)
+    model = built.runtime.model
     try:
         assert model.use_responses_api is True
         assert model.output_version == "responses/v1"
@@ -299,11 +388,13 @@ def test_responses_capability_configures_every_online_role(
         else:
             assert "web_search_call.action.sources" not in (model.include or [])
     finally:
-        sync_client.close()
+        assert built.sync_client is not None
+        built.sync_client.close()
         # Construction is synchronous; close the async client in the test loop below.
         import asyncio
 
-        asyncio.run(async_client.aclose())
+        assert built.async_client is not None
+        asyncio.run(built.async_client.aclose())
 
 
 def test_deepseek_responses_does_not_send_unsupported_include(monkeypatch) -> None:
@@ -316,28 +407,26 @@ def test_deepseek_responses_does_not_send_unsupported_include(monkeypatch) -> No
             model_provider_streaming=False,
         ),
     )
-    provider = service.ResolvedProvider(
-        user_id="user-a",
-        base_url="https://api.deepseek.com",
-        model_name="deepseek-v4-flash",
-        api_key="test-key",
-        api_key_hint="-key",
-        version=1,
+    provider = _resolved_provider(
+        "https://api.deepseek.com", "deepseek-v4-flash"
     )
 
-    model, sync_client, async_client = provider_models._build_model(
+    built = provider_models._build_model(
         provider,
         "supervisor",
     )
+    model = built.runtime.model
     try:
         assert model.use_responses_api is True
         assert model.include is None
         assert model.extra_body is None
     finally:
-        sync_client.close()
+        assert built.sync_client is not None
+        built.sync_client.close()
         import asyncio
 
-        asyncio.run(async_client.aclose())
+        assert built.async_client is not None
+        asyncio.run(built.async_client.aclose())
 
 
 @pytest.mark.asyncio
@@ -396,13 +485,8 @@ async def test_deepseek_provider_test_calls_responses_without_include(
             model_provider_streaming=False,
         ),
     )
-    provider = service.ResolvedProvider(
-        user_id="user-a",
-        base_url="https://api.deepseek.com",
-        model_name="deepseek-v4-flash",
-        api_key="test-key",
-        api_key_hint="-key",
-        version=1,
+    provider = _resolved_provider(
+        "https://api.deepseek.com", "deepseek-v4-flash"
     )
 
     message = await provider_models.test_provider_model(provider)
@@ -415,35 +499,33 @@ async def test_deepseek_provider_test_calls_responses_without_include(
     assert "tools" not in payload
 
 
-@pytest.mark.asyncio
-async def test_only_supervisor_receives_builtin_web_search(monkeypatch) -> None:
-    async def runtime_model(_user_id: str, _role: str):
-        return SimpleNamespace(model_name="gpt-5.4")
-
-    monkeypatch.setattr(provider_models, "get_runtime_model", runtime_model)
+def test_only_supervisor_receives_builtin_web_search() -> None:
     runtime = Runtime(
         server_info=SimpleNamespace(user=SimpleNamespace(identity="user-a"))
     )
+    capabilities = model_profiles.resolve_model_provider(
+        "https://api.openai.com/v1", "gpt-5.4"
+    ).capabilities
+    resolved = provider_models.RuntimeModel(
+        model=SimpleNamespace(model_name="gpt-5.4"),
+        provider_name="openai",
+        provider_type="responses",
+        capabilities=capabilities,
+        provider_version=1,
+    )
 
-    async def captured_tools(role: provider_models.ModelRole):
+    def captured_tools(role: provider_models.ModelRole):
         request = provider_models.ModelRequest(
             model=SimpleNamespace(model_name="placeholder"),
             messages=[HumanMessage(content="hello")],
             runtime=runtime,
             tools=[],
         )
+        return provider_models._runtime_tools(request, resolved, role)
 
-        async def handler(resolved_request):
-            return resolved_request.tools
-
-        return await provider_models.ProviderModelMiddleware(role).awrap_model_call(
-            request,
-            handler,
-        )
-
-    assert await captured_tools("supervisor") == [{"type": "web_search"}]
-    assert await captured_tools("data-analyst") == []
-    assert await captured_tools("crawl-worker") == []
+    assert captured_tools("supervisor") == [{"type": "web_search"}]
+    assert captured_tools("data-analyst") == []
+    assert captured_tools("crawl-worker") == []
 
 
 def test_web_search_events_are_normalized_and_sources_are_safe() -> None:
@@ -634,6 +716,78 @@ async def test_provider_get_is_no_store_and_never_returns_ciphertext(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_provider_save_resolves_and_persists_without_model_call(monkeypatch) -> None:
+    saved: dict[str, object] = {}
+
+    async def authenticated(_authorization: str | None) -> str:
+        return "user-a"
+
+    @asynccontextmanager
+    async def admission_lock(_user_id: str):
+        yield
+
+    async def not_busy(_request, _authorization):
+        return []
+
+    async def save(**kwargs):
+        saved.update(kwargs)
+        return SimpleNamespace(version=2)
+
+    async def public(_user_id: str):
+        return {
+            "provider_name": "openai",
+            "provider_type": "responses",
+            "base_url": "https://api.openai.com/v1",
+            "model_name": "gpt-5.4",
+            "has_api_key": True,
+            "api_key_hint": "cret",
+            "version": 2,
+            "updated_at": "2026-09-02T00:00:00",
+        }
+
+    async def no_model_call(_provider):
+        raise AssertionError("保存接口不应调用上游模型")
+
+    async def clear_cache(_user_id: str):
+        return None
+
+    monkeypatch.setattr(webapp, "_authenticated_user_id", authenticated)
+    monkeypatch.setattr(webapp.redis_limits, "admission_lock", admission_lock)
+    monkeypatch.setattr(webapp, "_busy_provider_thread_ids", not_busy)
+    monkeypatch.setattr(webapp, "save_provider", save)
+    monkeypatch.setattr(webapp, "get_public_provider", public)
+    monkeypatch.setattr(webapp, "clear_model_cache", clear_cache)
+    monkeypatch.setattr(webapp, "test_provider_model", no_model_call)
+    request = Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": "/model-provider",
+            "headers": [],
+            "client": ("127.0.0.1", 50000),
+        }
+    )
+
+    response = await webapp.update_model_provider(
+        webapp.ModelProviderRequest(
+            base_url="https://api.openai.com/v1",
+            model_name="gpt-5.4",
+            api_key="sk-save-secret",
+        ),
+        request,
+        None,
+    )
+
+    assert response.status_code == 200
+    assert saved == {
+        "user_id": "user-a",
+        "base_url": "https://api.openai.com/v1",
+        "model_name": "gpt-5.4",
+        "api_key": "sk-save-secret",
+    }
+
+
+@pytest.mark.asyncio
 async def test_run_admission_rejects_missing_provider_before_redis(monkeypatch) -> None:
     async def authenticated(_authorization: str | None) -> str:
         return "user-a"
@@ -668,9 +822,20 @@ async def test_provider_middleware_precedes_token_metering(monkeypatch) -> None:
     """The metering layer must observe the resolved model, not the placeholder."""
 
     captured: dict[str, object] = {}
+    capabilities = model_profiles.FALLBACK_PROVIDER.capabilities
 
     async def runtime_model(_user_id: str, _role: str):
-        return SimpleNamespace(model_name="actual-user-model")
+        return provider_models.RuntimeModel(
+            model=SimpleNamespace(model_name="actual-user-model"),
+            provider_name="openai-compatible",
+            provider_type="chat_completions",
+            capabilities=capabilities,
+            provider_version=1,
+        )
+
+    class PassThroughSummarizer:
+        async def awrap_model_call(self, request, handler):
+            return await handler(request)
 
     async def reserve(**kwargs):
         captured.update(kwargs)
@@ -680,6 +845,11 @@ async def test_provider_middleware_precedes_token_metering(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(provider_models, "get_runtime_model", runtime_model)
+    monkeypatch.setattr(
+        provider_models.ProviderSummarizationMiddleware,
+        "_delegate",
+        lambda _self, _request: PassThroughSummarizer(),
+    )
     monkeypatch.setattr(token_usage, "_reserve", reserve)
     monkeypatch.setattr(token_usage, "_settle", settle)
     monkeypatch.setattr(token_usage, "get_config", dict)
@@ -710,7 +880,9 @@ async def test_provider_middleware_precedes_token_metering(monkeypatch) -> None:
             agent_name="supervisor"
         ).awrap_model_call(resolved_request, final_handler)
 
-    await provider_models.ProviderModelMiddleware("supervisor").awrap_model_call(
+    await provider_models.ProviderSummarizationMiddleware(
+        "supervisor", StateBackend()
+    ).awrap_model_call(
         request,
         metered_handler,
     )
@@ -738,19 +910,25 @@ async def test_runtime_model_cache_is_bounded_and_user_evictable(monkeypatch) ->
             closed.append(f"async:{self.user_id}")
 
     async def resolved(user_id: str) -> service.ResolvedProvider:
-        return service.ResolvedProvider(
+        return _resolved_provider(
+            "https://models.example.com/v1",
+            "model-one",
             user_id=user_id,
-            base_url="https://models.example.com/v1",
-            model_name="model-one",
             api_key=f"secret-{user_id}",
-            api_key_hint=user_id[-4:],
-            version=1,
         )
 
     def built(provider: service.ResolvedProvider, _role: str):
-        return SimpleNamespace(model_name=provider.model_name), SyncClient(
-            provider.user_id
-        ), AsyncClient(provider.user_id)
+        return provider_models._BuiltModel(
+            runtime=provider_models.RuntimeModel(
+                model=SimpleNamespace(model_name=provider.model_name),
+                provider_name=provider.provider_name,
+                provider_type=provider.provider_type,
+                capabilities=provider.capabilities,
+                provider_version=provider.version,
+            ),
+            sync_client=SyncClient(provider.user_id),
+            async_client=AsyncClient(provider.user_id),
+        )
 
     monkeypatch.setattr(provider_models, "resolve_provider", resolved)
     monkeypatch.setattr(provider_models, "_build_model", built)
@@ -815,13 +993,10 @@ async def test_provider_adapters_make_minimal_mock_call_without_serializing_key(
         ),
     )
     secret = "sk-mock-provider-secret"
-    provider = service.ResolvedProvider(
-        user_id="user-a",
-        base_url="https://models.example.com/v1",
-        model_name="mock-model",
+    provider = _resolved_provider(
+        "https://models.example.com/v1",
+        "mock-model",
         api_key=secret,
-        api_key_hint="cret",
-        version=1,
     )
 
     message = await provider_models.test_provider_model(provider)
@@ -831,10 +1006,83 @@ async def test_provider_adapters_make_minimal_mock_call_without_serializing_key(
     assert route.calls[0].request.headers["authorization"] == f"Bearer {secret}"
     # LangSmith serializes model metadata, not the upstream HTTP request. The
     # model's secret field must remain masked in both representations.
-    model, sync_client, async_client = provider_models._build_model(provider, "test")
+    built = provider_models._build_model(provider, "test")
+    model = built.runtime.model
     try:
         assert secret not in repr(model)
         assert secret not in json.dumps(model.to_json(), default=str)
     finally:
-        sync_client.close()
-        await async_client.aclose()
+        assert built.sync_client is not None
+        built.sync_client.close()
+        assert built.async_client is not None
+        await built.async_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_native_calls_official_messages_endpoint(
+    monkeypatch,
+    respx_mock,
+) -> None:
+    route = respx_mock.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "msg-test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "OK"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+    )
+    monkeypatch.setattr(
+        provider_models,
+        "get_settings",
+        lambda: SimpleNamespace(
+            model_provider_test_timeout_seconds=5,
+            model_provider_timeout_seconds=20,
+            model_provider_streaming=False,
+        ),
+    )
+    secret = "sk-ant-test-secret"
+    provider = _resolved_provider(
+        "https://api.anthropic.com",
+        "claude-sonnet-4-5",
+        api_key=secret,
+    )
+
+    message = await provider_models.test_provider_model(provider)
+
+    assert message.text == "OK"
+    assert route.called
+    request = route.calls[0].request
+    assert request.headers["x-api-key"] == secret
+    assert request.headers["anthropic-version"]
+    assert "/responses" not in request.url.path
+    assert "/chat/completions" not in request.url.path
+
+
+@pytest.mark.parametrize(
+    ("role", "harness"),
+    [
+        ("supervisor", "openai"),
+        ("data-analyst", "deep-data-worker"),
+        ("crawl-worker", "deep-data-worker"),
+        ("analysis-reviewer", "deep-data-reviewer"),
+    ],
+)
+def test_anthropic_roles_keep_application_harness(
+    role: provider_models.ModelRole,
+    harness: str,
+) -> None:
+    model_class = provider_models._anthropic_model_class(role)
+    model = model_class(
+        model="claude-sonnet-4-5",
+        api_key="sk-test",
+        base_url="https://api.anthropic.com",
+    )
+
+    assert model._get_ls_params()["ls_provider"] == harness

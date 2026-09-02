@@ -206,7 +206,7 @@ def create_graph_placeholder_model(
 ) -> ChatOpenAI:
     """Build an inert graph-import model without deployment credentials.
 
-    Online calls replace it in ``ProviderModelMiddleware``. A concrete model is
+    Online calls replace it in ``ProviderSummarizationMiddleware``. A concrete model is
     still needed while DeepAgents compiles tool schemas, but it must not retain
     any user's API Key or depend on the legacy ``OPENAI_*`` environment.
     """

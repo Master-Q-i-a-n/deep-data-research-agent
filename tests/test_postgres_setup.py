@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import inspect as python_inspect
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from dotenv import dotenv_values
 
@@ -98,7 +102,56 @@ def test_packaged_alembic_head_matches_runtime_revision() -> None:
     )
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_current_head() == "0002_user_model_provider"
+    assert script.get_current_head() == "0003_model_provider_protocols"
+
+
+def test_provider_protocol_migration_preserves_registered_responses_models(
+    monkeypatch,
+) -> None:
+    migration = importlib.import_module(
+        "deep_data_research_agent.database.migrations.versions."
+        "0003_model_provider_protocols"
+    )
+    engine = sa.create_engine("sqlite://")
+    metadata = sa.MetaData()
+    providers = sa.Table(
+        "user_model_providers",
+        metadata,
+        sa.Column("user_id", sa.String(), primary_key=True),
+        sa.Column("provider_type", sa.String(), nullable=False),
+        sa.Column("model_name", sa.String(), nullable=False),
+    )
+    with engine.begin() as connection:
+        metadata.create_all(connection)
+        connection.execute(
+            providers.insert(),
+            [
+                {
+                    "user_id": "responses",
+                    "provider_type": "openai_compatible",
+                    "model_name": "DeepSeek-V4-Flash",
+                },
+                {
+                    "user_id": "chat",
+                    "provider_type": "openai_compatible",
+                    "model_name": "qwen-plus",
+                },
+            ],
+        )
+        operations = Operations(MigrationContext.configure(connection))
+        monkeypatch.setattr(migration, "op", operations)
+
+        migration.upgrade()
+
+        rows = dict(
+            connection.execute(
+                sa.select(providers.c.user_id, providers.c.provider_type)
+            ).all()
+        )
+    assert rows == {
+        "responses": "responses",
+        "chat": "chat_completions",
+    }
 
 
 def test_runtime_initializers_contain_no_schema_ddl() -> None:

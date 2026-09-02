@@ -76,6 +76,7 @@ from deep_data_research_agent.providers.service import (
     delete_provider,
     get_public_provider,
     resolve_provider,
+    resolve_provider_metadata,
     save_provider,
     validate_provider_url,
 )
@@ -730,6 +731,9 @@ async def test_model_provider(
         if not model_name:
             raise ProviderConfigurationError("模型名不能为空")
         base_url = await validate_provider_url(payload.base_url)
+        base_url, provider_name, provider_type, capabilities = (
+            resolve_provider_metadata(base_url, model_name)
+        )
         if payload.api_key is not None:
             api_key = payload.api_key.get_secret_value().strip()
         else:
@@ -738,11 +742,14 @@ async def test_model_provider(
             raise ProviderConfigurationError("API Key 不能为空")
         draft = ResolvedProvider(
             user_id=user_id,
+            provider_name=provider_name,
+            provider_type=provider_type,
             base_url=base_url,
             model_name=model_name,
             api_key=api_key,
             api_key_hint=api_key[-4:],
             version=0,
+            capabilities=capabilities,
         )
         started = asyncio.get_running_loop().time()
         await test_provider_model(draft)
@@ -756,7 +763,13 @@ async def test_model_provider(
             detail="模型 Provider 连接失败，请检查地址、模型名和 API Key",
         ) from exc
     return JSONResponse(
-        content={"ok": True, "latency_ms": latency_ms, "model_name": model_name},
+        content={
+            "ok": True,
+            "latency_ms": latency_ms,
+            "model_name": model_name,
+            "provider_name": provider_name,
+            "provider_type": provider_type,
+        },
         headers={"Cache-Control": "no-store"},
     )
 

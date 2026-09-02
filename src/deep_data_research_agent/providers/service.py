@@ -13,8 +13,11 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.database import repository as database
-
-_STORED_PROVIDER_TYPE = "openai_compatible"
+from deep_data_research_agent.providers.model_profiles import (
+    ModelProviderCapabilities,
+    ProviderType,
+    resolve_model_provider,
+)
 
 
 class ProviderConfigurationError(ValueError):
@@ -28,11 +31,14 @@ class ProviderNotConfiguredError(ProviderConfigurationError):
 @dataclass(frozen=True, slots=True)
 class ResolvedProvider:
     user_id: str
+    provider_name: str
+    provider_type: ProviderType
     base_url: str
     model_name: str
     api_key: str
     api_key_hint: str
     version: int
+    capabilities: ModelProviderCapabilities
 
 
 def _fernet(path: Path | None = None) -> Fernet:
@@ -130,7 +136,7 @@ def _resolve_addresses(hostname: str, port: int) -> set[ipaddress.IPv4Address | 
 
 
 async def validate_provider_url(value: str) -> str:
-    """Enforce public HTTPS unless the deployment explicitly allows the target."""
+    """Resolve the target and require HTTPS unless HTTP is explicitly allowed."""
 
     normalized = normalize_provider_url(value)
     parsed = urlsplit(normalized)
@@ -139,15 +145,13 @@ async def validate_provider_url(value: str) -> str:
     host_allowed = hostname in hosts
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     addresses = await asyncio.to_thread(_resolve_addresses, hostname, port)
-    addresses_public = all(address.is_global for address in addresses)
     addresses_allowlisted = bool(networks) and all(
         any(address in network for network in networks) for address in addresses
     )
     target_allowlisted = host_allowed or addresses_allowlisted
     if parsed.scheme != "https" and not target_allowlisted:
         raise ProviderConfigurationError("HTTP Provider 地址必须加入部署白名单")
-    if not addresses_public and not target_allowlisted:
-        raise ProviderConfigurationError("私网或保留地址必须加入部署白名单")
+    # HTTPS providers may intentionally live on private or reserved networks.
     return normalized
 
 
@@ -156,6 +160,37 @@ def _validate_model_name(model_name: str) -> str:
     if not normalized_model or len(normalized_model) > 128:
         raise ProviderConfigurationError("模型名不能为空或过长")
     return normalized_model
+
+
+def resolve_provider_metadata(
+    base_url: str,
+    model_name: str,
+) -> tuple[str, str, ProviderType, ModelProviderCapabilities]:
+    """Normalize and resolve one URL without probing an upstream model."""
+
+    base_url = normalize_provider_url(base_url)
+    model_name = _validate_model_name(model_name)
+    resolved = resolve_model_provider(base_url, model_name)
+    if resolved.provider_name == "anthropic":
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "api.anthropic.com"
+            or parsed.port is not None
+            or parsed.path not in {"", "/"}
+        ):
+            raise ProviderConfigurationError(
+                "Anthropic Native 仅支持 https://api.anthropic.com 官方根地址"
+            )
+        base_url = "https://api.anthropic.com"
+    if not resolved.capabilities.supports_tools:
+        raise ProviderConfigurationError("当前模型未配置工具调用能力，无法用于 DeepAgent")
+    return (
+        base_url,
+        resolved.provider_name,
+        resolved.provider_type,
+        resolved.capabilities,
+    )
 
 
 async def save_provider(
@@ -167,15 +202,16 @@ async def save_provider(
 ) -> database.ModelProviderRecord:
     normalized_model = _validate_model_name(model_name)
     normalized_url = await validate_provider_url(base_url)
+    normalized_url, _, provider_type, _ = resolve_provider_metadata(
+        normalized_url, normalized_model
+    )
     ciphertext: str | None = None
     hint: str | None = None
     if api_key is not None:
         ciphertext, hint = encrypt_api_key(api_key)
     return await database.upsert_model_provider(
         user_id=user_id,
-        # Keep the legacy column populated until a future schema cleanup. It is
-        # no longer exposed or used for runtime routing.
-        provider_type=_STORED_PROVIDER_TYPE,
+        provider_type=provider_type,
         base_url=normalized_url,
         model_name=normalized_model,
         api_key_ciphertext=ciphertext,
@@ -189,13 +225,19 @@ async def resolve_provider(user_id: str) -> ResolvedProvider:
         raise ProviderNotConfiguredError("请先配置模型 Provider")
     # Revalidate at use time so changed DNS cannot silently bypass save-time checks.
     base_url = await validate_provider_url(record.base_url)
+    base_url, provider_name, provider_type, capabilities = resolve_provider_metadata(
+        base_url, record.model_name
+    )
     return ResolvedProvider(
         user_id=record.user_id,
+        provider_name=provider_name,
+        provider_type=provider_type,
         base_url=base_url,
         model_name=record.model_name,
         api_key=decrypt_api_key(record.api_key_ciphertext),
         api_key_hint=record.api_key_hint,
         version=record.version,
+        capabilities=capabilities,
     )
 
 
@@ -203,8 +245,13 @@ async def get_public_provider(user_id: str) -> dict[str, object] | None:
     record = await database.get_model_provider(user_id)
     if record is None:
         return None
+    base_url, provider_name, provider_type, _ = resolve_provider_metadata(
+        record.base_url, record.model_name
+    )
     return {
-        "base_url": record.base_url,
+        "provider_name": provider_name,
+        "provider_type": provider_type,
+        "base_url": base_url,
         "model_name": record.model_name,
         "has_api_key": True,
         "api_key_hint": record.api_key_hint,
@@ -227,6 +274,7 @@ __all__ = [
     "get_public_provider",
     "normalize_provider_url",
     "resolve_provider",
+    "resolve_provider_metadata",
     "save_provider",
     "validate_provider_url",
 ]

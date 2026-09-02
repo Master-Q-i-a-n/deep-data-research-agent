@@ -51,7 +51,11 @@ from deep_data_research_agent.core.identity import user_hash, user_identity
 from deep_data_research_agent.infrastructure.sandbox.manager import (
     thread_id_from_runtime,
 )
-from deep_data_research_agent.providers.models import get_runtime_model
+from deep_data_research_agent.providers.models import (
+    direct_output_limit_kwargs,
+    get_runtime_model,
+    structured_output_model,
+)
 from deep_data_research_agent.workers.app import publish_memory_job
 
 logger = logging.getLogger(__name__)
@@ -889,11 +893,8 @@ async def _invoke_structured_memory_model(
 
     if not user_id:
         raise RuntimeError("后台记忆任务缺少用户身份，无法解析模型 Provider")
-    model = (await get_runtime_model(user_id, "memory")).with_structured_output(
-        schema,
-        method="json_mode",
-        include_raw=True,
-    )
+    runtime_model = await get_runtime_model(user_id, "memory")
+    model = structured_output_model(runtime_model, schema, include_raw=True)
     repair_note = ""
     last_error: Exception | None = None
     for attempt in range(2):
@@ -1127,7 +1128,8 @@ async def _extract_failure_review_decisions(
     messages: list[Any] = [HumanMessage(content=review_prompt)]
     if not user_id:
         raise RuntimeError("后台失败回顾缺少用户身份，无法解析模型 Provider")
-    model = await get_runtime_model(user_id, "memory")
+    runtime_model = await get_runtime_model(user_id, "memory")
+    model = runtime_model.model
     settings = get_settings()
 
     started = time.perf_counter()
@@ -1138,9 +1140,10 @@ async def _extract_failure_review_decisions(
                 "callbacks": [],
                 "tags": ["memory-internal", "failure-review", agent_name],
             },
-            # DeepSeek's OpenAI-compatible API names this parameter
-            # ``max_tokens``; extra_body preserves that provider spelling.
-            "extra_body": {"max_tokens": settings.failure_review_max_output_tokens},
+            **direct_output_limit_kwargs(
+                runtime_model,
+                settings.failure_review_max_output_tokens,
+            ),
         }
         response = await metered_model_ainvoke(
             model,
@@ -1149,7 +1152,9 @@ async def _extract_failure_review_decisions(
             agent_name="memory-failure-review",
             root_run_id=root_run_id,
             thread_id=thread_id,
-            model_settings={"max_tokens": settings.failure_review_max_output_tokens},
+            model_settings={
+                "max_output_tokens": settings.failure_review_max_output_tokens
+            },
             **invoke_kwargs,
         )
         if not isinstance(response, AIMessage):

@@ -26,6 +26,14 @@ async def _invoke_without_metering(model, input_, *, config=None, **kwargs):
     return await model.ainvoke(input_, config=config, **kwargs)
 
 
+def _provider_runtime(model, *, method="json_mode"):
+    return SimpleNamespace(
+        model=model,
+        provider_type="chat_completions",
+        capabilities=SimpleNamespace(structured_output_method=method),
+    )
+
+
 def test_memory_timeout_and_review_output_defaults_are_independent() -> None:
     settings = Settings(_env_file=None)
 
@@ -540,7 +548,7 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
             )
 
     async def runtime_model(_user_id, _role):
-        return Model()
+        return _provider_runtime(Model())
 
     monkeypatch.setattr(memory, "get_runtime_model", runtime_model)
     monkeypatch.setattr(memory, "metered_model_ainvoke", _invoke_without_metering)
@@ -607,7 +615,7 @@ async def test_failure_reviewer_rejects_tool_calls_and_never_executes_them(
             return responses.pop(0)
 
     async def runtime_model(_user_id, _role):
-        return Model()
+        return _provider_runtime(Model())
 
     monkeypatch.setattr(memory, "get_runtime_model", runtime_model)
     monkeypatch.setattr(memory, "metered_model_ainvoke", _invoke_without_metering)
@@ -747,7 +755,7 @@ async def test_structured_model_repairs_once_and_detaches_callbacks(monkeypatch)
             return StructuredModel()
 
     async def runtime_model(_user_id, _role):
-        return Model()
+        return _provider_runtime(Model())
 
     monkeypatch.setattr(memory, "get_runtime_model", runtime_model)
     monkeypatch.setattr(memory, "metered_model_ainvoke", _invoke_without_metering)

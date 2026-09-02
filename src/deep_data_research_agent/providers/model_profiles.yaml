@@ -1,53 +1,89 @@
-# Context windows for exact model IDs exposed through user-configured Providers.
-gpt-5.6:
-  max_input_tokens: 1050000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-gpt-5.6-sol:
-  max_input_tokens: 1050000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-gpt-5.6-terra:
-  max_input_tokens: 1050000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-gpt-5.6-luna:
-  max_input_tokens: 1050000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-gpt-5.5:
-  max_input_tokens: 1050000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-gpt-5.4:
-  max_input_tokens: 1050000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-gpt-5.4-mini:
-  max_input_tokens: 400000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-gpt-5.4-nano:
-  max_input_tokens: 400000
-  supports_responses_api: true
-  supports_web_search: true
-  responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
-deepseek-v4-flash:
-  max_input_tokens: 1000000
-  supports_responses_api: true
-  supports_web_search: true
-deepseek-v4-pro:
-  max_input_tokens: 1000000
-  supports_responses_api: true
-  supports_web_search: true
-deepseek-v4-flash-vision-exp:
-  max_input_tokens: 1000000
-  supports_responses_api: true
-  supports_web_search: true
+fallback:
+  provider_name: openai-compatible
+  protocol: chat_completions
+  capabilities:
+    supports_tools: true
+    supports_streaming: true
+    structured_output_method: json_mode
+    supports_forced_tool_choice: false
+    supports_reasoning_replay: false
+    supports_web_search: false
+    responses_include: []
+
+providers:
+  openai:
+    hosts: [api.openai.com]
+    protocol: chat_completions
+    capabilities:
+      supports_tools: true
+      supports_streaming: true
+      structured_output_method: json_mode
+      supports_forced_tool_choice: true
+      supports_reasoning_replay: false
+      supports_web_search: false
+      responses_include: []
+    models:
+      gpt-5.6: &openai_responses_large
+        protocol: responses
+        max_input_tokens: 1050000
+        structured_output_method: json_mode
+        supports_reasoning_replay: true
+        supports_web_search: true
+        responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
+      gpt-5.6-sol: *openai_responses_large
+      gpt-5.6-terra: *openai_responses_large
+      gpt-5.6-luna: *openai_responses_large
+      gpt-5.5: *openai_responses_large
+      gpt-5.4: *openai_responses_large
+      gpt-5.4-mini: &openai_responses_small
+        protocol: responses
+        max_input_tokens: 400000
+        structured_output_method: json_mode
+        supports_reasoning_replay: true
+        supports_web_search: true
+        responses_include: [reasoning.encrypted_content, web_search_call.action.sources]
+      gpt-5.4-nano: *openai_responses_small
+
+  deepseek:
+    hosts: [api.deepseek.com]
+    protocol: chat_completions
+    capabilities:
+      supports_tools: true
+      supports_streaming: true
+      structured_output_method: json_mode
+      supports_forced_tool_choice: false
+      supports_reasoning_replay: false
+      supports_web_search: false
+      responses_include: []
+    models:
+      deepseek-v4-flash: &deepseek_responses
+        protocol: responses
+        max_input_tokens: 1000000
+        structured_output_method: json_mode
+        supports_web_search: true
+      deepseek-v4-pro: *deepseek_responses
+      deepseek-v4-flash-vision-exp: *deepseek_responses
+
+  dashscope:
+    hosts: [dashscope.aliyuncs.com]
+    protocol: chat_completions
+    capabilities:
+      supports_tools: true
+      supports_streaming: true
+      structured_output_method: json_mode
+      supports_forced_tool_choice: false
+      supports_reasoning_replay: false
+      supports_web_search: false
+      responses_include: []
+
+  anthropic:
+    hosts: [api.anthropic.com]
+    protocol: anthropic
+    capabilities:
+      supports_tools: true
+      supports_streaming: true
+      structured_output_method: function_calling
+      supports_forced_tool_choice: true
+      supports_reasoning_replay: false
+      supports_web_search: false
+      responses_include: []

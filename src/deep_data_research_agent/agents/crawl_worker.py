@@ -39,10 +39,7 @@ from deep_data_research_agent.memory.service import (
     agent_memory_path,
 )
 from deep_data_research_agent.providers.context_usage import ContextUsageMiddleware
-from deep_data_research_agent.providers.models import (
-    ProviderModelMiddleware,
-    provider_summarization_middleware,
-)
+from deep_data_research_agent.providers.models import provider_summarization_middleware
 from deep_data_research_agent.skill_system.storage import (
     public_skill_root,
     user_skill_root,
@@ -113,9 +110,8 @@ crawl_agent = create_deep_agent(
     tools=[*CRAWL_TOOLS],
     system_prompt=CRAWL_WORKER_PROMPT,
     middleware=[
-        ProviderModelMiddleware("crawl-worker"),
-        TokenUsageMiddleware(agent_name="crawl-worker"),
         provider_summarization_middleware("crawl-worker", WORKER_BACKEND),
+        TokenUsageMiddleware(agent_name="crawl-worker"),
         ContextUsageMiddleware("crawl-worker"),
         # Preserve the crawl worker's short planning step after the 0.7 upgrade.
         TodoListMiddleware(),

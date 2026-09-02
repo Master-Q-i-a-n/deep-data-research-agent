@@ -114,8 +114,8 @@ RUN_ADMISSION_LOCK_SECONDS=5
 
 不要提交 `.env`，也不要把 API Key 作为命令行参数传递。`APP_ENV=production` 时
 `RATE_LIMIT_KEY_SECRET` 必须是至少 32 字符的稳定随机值，并且 Provider 加密密钥文件必须
-存在且是有效的 Fernet key；生产环境会拒绝所有未登录请求。公网 Provider 默认只允许
-HTTPS；内网、保留地址或 HTTP 目标必须由部署方加入 `MODEL_PROVIDER_HOST_ALLOWLIST`。
+存在且是有效的 Fernet key；生产环境会拒绝所有未登录请求。HTTPS Provider 可以位于
+公网或私网；HTTP 目标必须由部署方加入 `MODEL_PROVIDER_HOST_ALLOWLIST`。
 
 后端启动前先部署项目专用 Redis。脚本会生成被 Git 忽略的随机 ACL 密码；首次从旧的
 `f10fedb99816` 容器切换时，会先把 `redis-data` 备份到 `.redis-backups/`，再由 Compose
