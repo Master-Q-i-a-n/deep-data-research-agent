@@ -6,27 +6,19 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class _WorkerChatOpenAI(ChatOpenAI):
-    """Select the worker-specific DeepAgents harness without changing API calls."""
+class HarnessChatOpenAI(ChatOpenAI):
+    """Select an opaque DeepAgents harness without knowing its business meaning."""
+
+    harness_provider: str = "openai"
 
     def _get_ls_params(self, *args, **kwargs):
         params = super()._get_ls_params(*args, **kwargs)
-        params["ls_provider"] = "deep-data-worker"
-        return params
-
-
-class _ReviewerChatOpenAI(_WorkerChatOpenAI):
-    """Select a read-only harness profile for the analysis reviewer."""
-
-    def _get_ls_params(self, *args, **kwargs):
-        params = super()._get_ls_params(*args, **kwargs)
-        params["ls_provider"] = "deep-data-reviewer"
+        params["ls_provider"] = self.harness_provider
         return params
 
 
@@ -201,7 +193,7 @@ def get_settings() -> Settings:
 
 
 def create_graph_placeholder_model(
-    role: Literal["supervisor", "worker", "reviewer"],
+    harness_provider: str,
 ) -> ChatOpenAI:
     """Build an inert graph-import model without deployment credentials.
 
@@ -210,25 +202,20 @@ def create_graph_placeholder_model(
     any user's API Key or depend on the legacy ``OPENAI_*`` environment.
     """
 
-    model_class: type[ChatOpenAI]
-    if role == "worker":
-        model_class = _WorkerChatOpenAI
-    elif role == "reviewer":
-        model_class = _ReviewerChatOpenAI
-    else:
-        model_class = ChatOpenAI
-    return model_class(
+    return HarnessChatOpenAI(
         model="provider-placeholder",
         api_key="not-configured",
         base_url="https://provider.invalid/v1",
         max_retries=0,
+        harness_provider=harness_provider,
     )
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=8)
 def create_chat_model(
     *,
-    worker: bool = False,
+    harness_provider: str = "openai",
+    streaming: bool | None = None,
 ) -> ChatOpenAI:
     """Create the MVP's OpenAI-compatible chat model.
 
@@ -238,65 +225,13 @@ def create_chat_model(
     """
 
     settings = get_settings()
-    if worker:
-        model_class = _WorkerChatOpenAI
-    else:
-        model_class = ChatOpenAI
-    return model_class(
+    return HarnessChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key or "not-configured",
         base_url=settings.openai_base_url,
         temperature=0,
         timeout=settings.openai_timeout_seconds,
         max_retries=2,
-        streaming=False if worker else settings.openai_streaming,
-    )
-
-
-@lru_cache(maxsize=1)
-def create_data_analyst_model() -> BaseChatModel:
-    """Create the CLI/evaluation data-analysis model."""
-
-    settings = get_settings()
-    return _WorkerChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key or "not-configured",
-        base_url=settings.openai_base_url,
-        temperature=0,
-        timeout=settings.openai_timeout_seconds,
-        max_retries=2,
-        streaming=False,
-    )
-
-
-@lru_cache(maxsize=1)
-def create_reviewer_model() -> BaseChatModel:
-    """Create the CLI/evaluation model with Reviewer-only tool filtering."""
-
-    settings = get_settings()
-    return _ReviewerChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key or "not-configured",
-        base_url=settings.openai_base_url,
-        temperature=0,
-        timeout=settings.openai_timeout_seconds,
-        max_retries=2,
-        streaming=False,
-    )
-
-
-@lru_cache(maxsize=1)
-def create_memory_model() -> ChatOpenAI:
-    """Create the non-streaming background consolidation model."""
-
-    settings = get_settings()
-    return ChatOpenAI(
-        model=settings.memory_model or settings.openai_model,
-        api_key=settings.openai_api_key or "not-configured",
-        base_url=settings.openai_base_url,
-        temperature=0,
-        timeout=settings.memory_model_timeout_seconds,
-        # Consolidation jobs have their own durable retry policy.
-        max_retries=0,
-        streaming=False,
+        streaming=settings.openai_streaming if streaming is None else streaming,
+        harness_provider=harness_provider,
     )

@@ -35,6 +35,7 @@ from langsmith import Client as LangSmithClient
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from pymongo import MongoClient
 
+from deep_data_research_agent.agents.model_profile import DATA_ANALYST_MODEL_PROFILE
 from deep_data_research_agent.core.config import create_chat_model, get_settings
 from deep_data_research_agent.database import repository as database
 
@@ -758,7 +759,10 @@ async def _judge_case(case: EvalCase, result: dict[str, Any], case_dir: Path, ru
         f"工具轨迹：{json.dumps(tool_trace, ensure_ascii=False, default=_json_default)[:60000]}\n"
         f"报告：{report_text[:80000]}"
     )
-    model = create_chat_model(worker=True).with_config(
+    model = create_chat_model(
+        harness_provider=DATA_ANALYST_MODEL_PROFILE.harness_provider,
+        streaming=False,
+    ).with_config(
         tags=["eval-judge"],
         metadata={"eval_run_id": run_id, "eval_case_id": case.id, "kind": "eval-judge"},
     )

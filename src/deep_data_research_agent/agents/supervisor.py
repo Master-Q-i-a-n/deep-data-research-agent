@@ -19,7 +19,12 @@ from deep_data_research_agent.agents.middleware.skills import (
     SandboxLifecycleMiddleware,
     SkillToolErrorMiddleware,
 )
-from deep_data_research_agent.agents.model_profile import register_mvp_profile
+from deep_data_research_agent.agents.model_profile import (
+    ANALYSIS_REVIEWER_MODEL_PROFILE,
+    DATA_ANALYST_MODEL_PROFILE,
+    SUPERVISOR_MODEL_PROFILE,
+    register_mvp_profile,
+)
 from deep_data_research_agent.agents.prompts import (
     ANALYSIS_REVIEWER_PROMPT,
     ASYNC_SUBAGENT_PROMPT,
@@ -38,7 +43,7 @@ from deep_data_research_agent.memory.service import (
     agent_memory_path,
 )
 from deep_data_research_agent.providers.context_usage import ContextUsageMiddleware
-from deep_data_research_agent.providers.models import provider_summarization_middleware
+from deep_data_research_agent.providers.models import ProviderSummarizationMiddleware
 from deep_data_research_agent.skill_system.storage import (
     public_skill_root,
     user_skill_root,
@@ -51,7 +56,9 @@ register_mvp_profile()
 
 graph = create_deep_agent(
     name="supervisor",
-    model=create_graph_placeholder_model("supervisor"),
+    model=create_graph_placeholder_model(
+        SUPERVISOR_MODEL_PROFILE.harness_provider
+    ),
     system_prompt=SUPERVISOR_PROMPT,
     tools=[
         *ASSIGN_SKILL_TOOL,
@@ -61,7 +68,9 @@ graph = create_deep_agent(
     subagents=[
         SubAgent(
             name="data-analyst",
-            model=create_graph_placeholder_model("worker"),
+            model=create_graph_placeholder_model(
+                DATA_ANALYST_MODEL_PROFILE.harness_provider
+            ),
             description=(
                 "分析本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据。委派时必须标注模式："
                 "quick_answer 用于直接查值、计数或简单统计，只返回经校验的简洁结论且不生成"
@@ -76,9 +85,12 @@ graph = create_deep_agent(
                 f"{user_skill_root('data-analyst')}/",
             ],
             middleware=[
-                provider_summarization_middleware("data-analyst", SUPERVISOR_BACKEND),
+                ProviderSummarizationMiddleware(
+                    DATA_ANALYST_MODEL_PROFILE,
+                    SUPERVISOR_BACKEND,
+                ),
                 TokenUsageMiddleware(agent_name="data-analyst"),
-                ContextUsageMiddleware("data-analyst"),
+                ContextUsageMiddleware(),
                 # DeepAgents 0.7 makes planning opt-in; keep it for analysis.
                 TodoListMiddleware(),
                 MemoryRefreshMiddleware(
@@ -97,7 +109,9 @@ graph = create_deep_agent(
         ),
         SubAgent(
             name="analysis-reviewer",
-            model=create_graph_placeholder_model("reviewer"),
+            model=create_graph_placeholder_model(
+                ANALYSIS_REVIEWER_MODEL_PROFILE.harness_provider
+            ),
             description=(
                 "对 data-analyst 已生成的 Markdown 主报告和声明产物进行只读质量复核；"
                 "按独立角色检查数字一致性、方法有效性或结论证据与限制，"
@@ -108,11 +122,12 @@ graph = create_deep_agent(
             # Explicitly avoid inheriting the Supervisor's business tools.
             tools=[],
             middleware=[
-                provider_summarization_middleware(
-                    "analysis-reviewer", SUPERVISOR_BACKEND
+                ProviderSummarizationMiddleware(
+                    ANALYSIS_REVIEWER_MODEL_PROFILE,
+                    SUPERVISOR_BACKEND,
                 ),
                 TokenUsageMiddleware(agent_name="analysis-reviewer"),
-                ContextUsageMiddleware("analysis-reviewer"),
+                ContextUsageMiddleware(),
                 # after_model hooks run in reverse order: count the model call
                 # before validating or redirecting its final JSON response.
                 ReviewerResultValidationMiddleware(),
@@ -125,9 +140,12 @@ graph = create_deep_agent(
         ),
     ],
     middleware=[
-        provider_summarization_middleware("supervisor", SUPERVISOR_BACKEND),
+        ProviderSummarizationMiddleware(
+            SUPERVISOR_MODEL_PROFILE,
+            SUPERVISOR_BACKEND,
+        ),
         TokenUsageMiddleware(agent_name="supervisor"),
-        ContextUsageMiddleware("supervisor"),
+        ContextUsageMiddleware(publish_updates=True),
         # Reviewer deliberately omits this official Todo middleware.
         TodoListMiddleware(),
         SandboxLifecycleMiddleware(

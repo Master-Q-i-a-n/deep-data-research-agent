@@ -98,16 +98,18 @@ LangGraph Store (MongoDB), a PostgreSQL checkpointer, custom auth, and an API ap
 
 `config.py` builds `ChatOpenAI` (default `qwen-plus`, temperature 0) from `.env` for CLI/evals, and the
 **placeholder** models (`create_graph_placeholder_model`, API key `"not-configured"`) that graphs import
-with. Online runs replace the placeholder in `ProviderModelMiddleware` (`providers/models.py`) with a
-per-user model resolved from `providers/service.py` — encrypted provider settings, LRU-cached (TTL 900s),
-host allowlist, `follow_redirects=False`. `SupervisorResponsesChatOpenAI` (providers/responses.py) uses
+with. Online runs replace the placeholder in `ProviderSummarizationMiddleware` (`providers/models.py`)
+with a per-user model resolved from `providers/service.py` — encrypted provider settings, LRU-cached
+(TTL 900s), host allowlist, `follow_redirects=False`. Agent and memory callers pass a generic
+`ModelExecutionProfile`; the Provider layer does not branch on Agent names. `ResponsesWebSearchChatOpenAI`
+(providers/responses.py) uses
 the Responses API when `model_profiles.yaml` declares it, and only requests `include` values declared
-for that exact model. `_WorkerChatOpenAI` / `_ReviewerChatOpenAI` are identical to ChatOpenAI except for
-the LangSmith harness profile (`deep-data-worker` / `deep-data-reviewer`).
+for that exact model. Execution profiles pass an opaque `harness_provider`; unified OpenAI and
+Anthropic adapters forward it to DeepAgents without branching on application roles.
 
-Every middleware that touches models is ordered as: `ProviderModelMiddleware` → `TokenUsageMiddleware` →
-`provider_summarization_middleware` → `ContextUsageMiddleware`. The last two are the memory layer:
-summarization runs in the provider module (`providers/models.py`), and `ContextUsageMiddleware`
+Every middleware that touches models is ordered as: `ProviderSummarizationMiddleware` →
+`TokenUsageMiddleware` → `ContextUsageMiddleware`. The first middleware injects the runtime model and
+delegates request-aware summarization. `ContextUsageMiddleware`
 (`providers/context_usage.py`) anchors token counts to a replayable-prefix fingerprint so the frontend
 gets cheap `context_usage` stream events without re-tokenizing the whole history. `TokenUsageMiddleware`
 (`admissions/token_usage.py`) reserves before the call and settles after: PostgreSQL ledger is
@@ -118,16 +120,15 @@ admitted is never stopped. Direct background model calls go through `metered_mod
 
 In `supervisor.py` (and `crawl_worker.py`), order is significant — `after_model` hooks run in reverse:
 
-1. `ProviderModelMiddleware` — per-user model (token counter and summary assume a real model here).
+1. `ProviderSummarizationMiddleware` — inject the per-user model and compact long history.
 2. `TokenUsageMiddleware` — account model calls in the PostgreSQL token ledger.
-3. `provider_summarization_middleware` — compact long history before estimating/calling.
-4. `ContextUsageMiddleware` — stream context usage to the frontend, persist anchor.
-5. `TodoListMiddleware` — DeepAgents' `write_todos` planning (omitted for analysis-reviewer).
-6. `SandboxLifecycleMiddleware` — ensure supervisor sandbox before, export after (supervisor only).
-7. `MemoryRefreshMiddleware` — refresh per-run memory files from MongoDB.
-8. `MongoSkillsRestoreMiddleware` — restore public + user Skills from MongoDB to the sandbox.
-9. `SkillToolErrorMiddleware` — converts expected Skill tool failures into recoverable `ToolMessage`s.
-10. `MetadataPropagatingAsyncSubAgentMiddleware` — `start_async_task` with metadata propagation, task registry in `async_tasks` state.
+3. `ContextUsageMiddleware` — stream context usage to the frontend, persist anchor.
+4. `TodoListMiddleware` — DeepAgents' `write_todos` planning (omitted for analysis-reviewer).
+5. `SandboxLifecycleMiddleware` — ensure supervisor sandbox before, export after (supervisor only).
+6. `MemoryRefreshMiddleware` — refresh per-run memory files from MongoDB.
+7. `MongoSkillsRestoreMiddleware` — restore public + user Skills from MongoDB to the sandbox.
+8. `SkillToolErrorMiddleware` — converts expected Skill tool failures into recoverable `ToolMessage`s.
+9. `MetadataPropagatingAsyncSubAgentMiddleware` — `start_async_task` with metadata propagation, task registry in `async_tasks` state.
 11. `AsyncTaskBridgeMiddleware` — normalizes `check_async_task` nested JSON for the supervisor.
 12. `ReloadableSkillsMiddleware` — strips cached `skills_metadata` on every run so new Skill assignments take effect on existing threads.
 13. `FailureReviewMiddleware` — enqueues automatic failure-review jobs (tool-pair evidence only).

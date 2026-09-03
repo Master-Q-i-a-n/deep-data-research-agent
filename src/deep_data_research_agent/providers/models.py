@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 from deepagents.middleware.summarization import (
@@ -20,31 +20,19 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 
-from deep_data_research_agent.core.config import (
-    _ReviewerChatOpenAI,
-    _WorkerChatOpenAI,
-    get_settings,
-)
+from deep_data_research_agent.core.config import HarnessChatOpenAI, get_settings
 from deep_data_research_agent.core.identity import user_identity
+from deep_data_research_agent.core.model_execution import ModelExecutionProfile
 from deep_data_research_agent.providers.context_usage import ContextTokenCounter
 from deep_data_research_agent.providers.model_profiles import (
     ModelProviderCapabilities,
     ProviderType,
 )
-from deep_data_research_agent.providers.responses import SupervisorResponsesChatOpenAI
+from deep_data_research_agent.providers.responses import ResponsesWebSearchChatOpenAI
 from deep_data_research_agent.providers.service import (
     ResolvedProvider,
     resolve_provider,
 )
-
-ModelRole = Literal[
-    "supervisor",
-    "data-analyst",
-    "analysis-reviewer",
-    "crawl-worker",
-    "memory",
-    "test",
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,59 +59,40 @@ class _CacheEntry:
     expires_at: float
 
 
-_MODEL_CACHE: OrderedDict[tuple[str, int, ModelRole], _CacheEntry] = OrderedDict()
+_MODEL_CACHE: OrderedDict[
+    tuple[str, int, ModelExecutionProfile], _CacheEntry
+] = OrderedDict()
 _MODEL_CACHE_LOCK = asyncio.Lock()
 
 
-class _SupervisorChatAnthropic(ChatAnthropic):
-    """Use the application's Supervisor harness for Anthropic Native."""
+class _HarnessChatAnthropic(ChatAnthropic):
+    """Select an opaque DeepAgents harness for Anthropic Native."""
+
+    harness_provider: str = "openai"
 
     def _get_ls_params(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         params = super()._get_ls_params(*args, **kwargs)
-        params["ls_provider"] = "openai"
+        params["ls_provider"] = self.harness_provider
         return params
 
 
-class _WorkerChatAnthropic(ChatAnthropic):
-    """Use the restricted worker harness for Anthropic Native."""
+class _HarnessResponsesWebSearchChatOpenAI(ResponsesWebSearchChatOpenAI):
+    """Add an opaque DeepAgents harness to the Responses search adapter."""
+
+    harness_provider: str = "openai"
 
     def _get_ls_params(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         params = super()._get_ls_params(*args, **kwargs)
-        params["ls_provider"] = "deep-data-worker"
+        params["ls_provider"] = self.harness_provider
         return params
 
 
-class _ReviewerChatAnthropic(_WorkerChatAnthropic):
-    """Use the read-only reviewer harness for Anthropic Native."""
+def _openai_model_class(profile: ModelExecutionProfile) -> type[ChatOpenAI]:
+    """Select only the protocol extension required by the execution profile."""
 
-    def _get_ls_params(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        params = super()._get_ls_params(*args, **kwargs)
-        params["ls_provider"] = "deep-data-reviewer"
-        return params
-
-
-def _openai_model_class(role: ModelRole) -> type[ChatOpenAI]:
-    """Choose a role-specific harness class independently of wire protocol."""
-
-    if role == "analysis-reviewer":
-        return _ReviewerChatOpenAI
-    if role in {"data-analyst", "crawl-worker"}:
-        return _WorkerChatOpenAI
-    if role == "supervisor":
-        return SupervisorResponsesChatOpenAI
-    return ChatOpenAI
-
-
-def _anthropic_model_class(role: ModelRole) -> type[ChatAnthropic]:
-    """Choose the same business Harness independently of model protocol."""
-
-    if role == "analysis-reviewer":
-        return _ReviewerChatAnthropic
-    if role in {"data-analyst", "crawl-worker"}:
-        return _WorkerChatAnthropic
-    if role == "supervisor":
-        return _SupervisorChatAnthropic
-    return ChatAnthropic
+    if profile.enable_hosted_web_search:
+        return _HarnessResponsesWebSearchChatOpenAI
+    return HarnessChatOpenAI
 
 
 def _attach_runtime_metadata(model: BaseChatModel, provider: ResolvedProvider) -> None:
@@ -140,7 +109,7 @@ def _attach_runtime_metadata(model: BaseChatModel, provider: ResolvedProvider) -
 
 def _build_openai_model(
     provider: ResolvedProvider,
-    role: ModelRole,
+    profile: ModelExecutionProfile,
     *,
     timeout: float,
     test_timeout: bool,
@@ -149,7 +118,7 @@ def _build_openai_model(
     sync_client = httpx.Client(follow_redirects=False, timeout=timeout)
     async_client = httpx.AsyncClient(follow_redirects=False, timeout=timeout)
     streaming = (
-        role == "supervisor"
+        profile.enable_streaming
         and get_settings().model_provider_streaming
         and provider.capabilities.supports_streaming
     )
@@ -160,22 +129,24 @@ def _build_openai_model(
         include = [
             value
             for value in provider.capabilities.responses_include
-            if value != "web_search_call.action.sources" or role == "supervisor"
+            if value != "web_search_call.action.sources"
+            or profile.enable_hosted_web_search
         ]
         options.update(output_version="responses/v1", store=False)
         if include:
             options["include"] = include
 
-    model = _openai_model_class(role)(
+    model = _openai_model_class(profile)(
         model=provider.model_name,
         api_key=provider.api_key,
         base_url=provider.base_url,
         temperature=0,
         timeout=timeout,
-        max_retries=0 if test_timeout or role == "memory" else 2,
+        max_retries=0 if test_timeout else profile.max_retries,
         streaming=streaming,
         http_client=sync_client,
         http_async_client=async_client,
+        harness_provider=profile.harness_provider,
         **options,
     )
     _attach_runtime_metadata(model, provider)
@@ -194,25 +165,26 @@ def _build_openai_model(
 
 def _build_anthropic_model(
     provider: ResolvedProvider,
-    role: ModelRole,
+    profile: ModelExecutionProfile,
     *,
     timeout: float,
     test_timeout: bool,
 ) -> _BuiltModel:
     streaming = (
-        role == "supervisor"
+        profile.enable_streaming
         and get_settings().model_provider_streaming
         and provider.capabilities.supports_streaming
     )
-    model = _anthropic_model_class(role)(
+    model = _HarnessChatAnthropic(
         model=provider.model_name,
         api_key=provider.api_key,
         # Anthropic Native is restricted to the official endpoint in service.py.
         base_url=provider.base_url,
         temperature=0,
         timeout=timeout,
-        max_retries=0 if test_timeout or role == "memory" else 2,
+        max_retries=0 if test_timeout else profile.max_retries,
         streaming=streaming,
+        harness_provider=profile.harness_provider,
     )
     _attach_runtime_metadata(model, provider)
     return _BuiltModel(
@@ -228,7 +200,7 @@ def _build_anthropic_model(
 
 def _build_model(
     provider: ResolvedProvider,
-    role: ModelRole,
+    profile: ModelExecutionProfile,
     *,
     test_timeout: bool = False,
 ) -> _BuiltModel:
@@ -240,10 +212,10 @@ def _build_model(
     )
     if provider.provider_type == "anthropic":
         return _build_anthropic_model(
-            provider, role, timeout=timeout, test_timeout=test_timeout
+            provider, profile, timeout=timeout, test_timeout=test_timeout
         )
     return _build_openai_model(
-        provider, role, timeout=timeout, test_timeout=test_timeout
+        provider, profile, timeout=timeout, test_timeout=test_timeout
     )
 
 
@@ -255,11 +227,14 @@ async def _close_entries(entries: list[_CacheEntry]) -> None:
             await entry.built.async_client.aclose()
 
 
-async def get_runtime_model(user_id: str, role: ModelRole) -> RuntimeModel:
-    """Resolve and cache one role-specific model without caching by API Key."""
+async def get_runtime_model(
+    user_id: str,
+    profile: ModelExecutionProfile,
+) -> RuntimeModel:
+    """Resolve and cache one execution-specific model without caching by API Key."""
 
     provider = await resolve_provider(user_id)
-    key = (provider.user_id, provider.version, role)
+    key = (provider.user_id, provider.version, profile)
     now = time.monotonic()
     evicted: list[_CacheEntry] = []
     async with _MODEL_CACHE_LOCK:
@@ -271,7 +246,7 @@ async def get_runtime_model(user_id: str, role: ModelRole) -> RuntimeModel:
             _MODEL_CACHE.move_to_end(key)
             runtime = entry.built.runtime
         else:
-            built = _build_model(provider, role)
+            built = _build_model(provider, profile)
             runtime = built.runtime
             _MODEL_CACHE[key] = _CacheEntry(
                 built=built,
@@ -298,7 +273,11 @@ async def clear_model_cache(user_id: str) -> None:
 async def test_provider_model(provider: ResolvedProvider) -> AIMessage:
     """Perform one minimal call through only the configured protocol."""
 
-    built = _build_model(provider, "test", test_timeout=True)
+    built = _build_model(
+        provider,
+        ModelExecutionProfile(name="provider-test", max_retries=0),
+        test_timeout=True,
+    )
     try:
         return await built.runtime.model.ainvoke("Return exactly: OK")
     finally:
@@ -311,11 +290,11 @@ async def test_provider_model(provider: ResolvedProvider) -> AIMessage:
 def _runtime_tools(
     request: ModelRequest,
     runtime: RuntimeModel,
-    role: ModelRole,
+    profile: ModelExecutionProfile,
 ) -> list[Any]:
     tools = list(request.tools)
     if (
-        role == "supervisor"
+        profile.enable_hosted_web_search
         and runtime.provider_type == "responses"
         and runtime.capabilities.supports_web_search
         and not any(
@@ -332,8 +311,8 @@ class ProviderSummarizationMiddleware(AgentMiddleware):
 
     state_schema = SummarizationState
 
-    def __init__(self, role: ModelRole, backend: Any) -> None:
-        self.role = role
+    def __init__(self, profile: ModelExecutionProfile, backend: Any) -> None:
+        self.profile = profile
         self.backend = backend
 
     @property
@@ -366,21 +345,17 @@ class ProviderSummarizationMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        runtime = await get_runtime_model(user_identity(request.runtime), self.role)
+        runtime = await get_runtime_model(
+            user_identity(request.runtime),
+            self.profile,
+        )
         effective_request = request.override(
             model=runtime.model,
-            tools=_runtime_tools(request, runtime, self.role),
+            tools=_runtime_tools(request, runtime, self.profile),
         )
         return await self._delegate(effective_request).awrap_model_call(
             effective_request, handler
         )
-
-
-def provider_summarization_middleware(role: ModelRole, backend: Any) -> AgentMiddleware:
-    """Build the request-aware runtime model and summarization middleware."""
-
-    return ProviderSummarizationMiddleware(role, backend)
-
 
 def structured_output_model(
     runtime: RuntimeModel,
@@ -415,13 +390,12 @@ def direct_output_limit_kwargs(
 
 
 __all__ = [
-    "ModelRole",
+    "ModelExecutionProfile",
     "ProviderSummarizationMiddleware",
     "RuntimeModel",
     "clear_model_cache",
     "direct_output_limit_kwargs",
     "get_runtime_model",
-    "provider_summarization_middleware",
     "structured_output_model",
     "test_provider_model",
 ]

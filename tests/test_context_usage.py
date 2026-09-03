@@ -84,7 +84,7 @@ async def test_context_usage_persists_real_usage_anchor_and_estimates_delta(
         return ModelResponse(result=[answer])
 
     response = await context_usage.ContextUsageMiddleware(
-        "supervisor"
+        publish_updates=True
     ).awrap_model_call(
         request,
         handler,
@@ -140,7 +140,7 @@ async def test_hosted_search_anchors_only_replayable_context_then_recalibrates(
         return ModelResponse(result=[search_answer])
 
     search_response = await context_usage.ContextUsageMiddleware(
-        "supervisor"
+        publish_updates=True
     ).awrap_model_call(search_request, search_handler)
     search_update = search_response.command.update
     stable_after_search = used_before + 7_517
@@ -185,7 +185,7 @@ async def test_hosted_search_anchors_only_replayable_context_then_recalibrates(
         return ModelResponse(result=[ordinary_answer])
 
     ordinary_response = await context_usage.ContextUsageMiddleware(
-        "supervisor"
+        publish_updates=True
     ).awrap_model_call(next_request, ordinary_handler)
     ordinary_update = ordinary_response.command.update
     assert ordinary_update["context_usage"]["used_tokens"] == 43_858

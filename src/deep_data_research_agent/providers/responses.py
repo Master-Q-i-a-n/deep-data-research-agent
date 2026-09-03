@@ -1,4 +1,4 @@
-"""OpenAI Responses streaming extensions used only by the main Supervisor."""
+"""OpenAI Responses streaming extensions for hosted Web Search."""
 
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ def _stream_writer():
         return None
 
 
-class SupervisorResponsesChatOpenAI(ChatOpenAI):
+class ResponsesWebSearchChatOpenAI(ChatOpenAI):
     """Expose Responses Web Search lifecycle events without changing LC chunks."""
 
     async def _astream_responses(
@@ -184,4 +184,4 @@ class SupervisorResponsesChatOpenAI(ChatOpenAI):
             openai_base._handle_openai_api_error(exc)
 
 
-__all__ = ["SupervisorResponsesChatOpenAI", "normalize_web_search_event"]
+__all__ = ["ResponsesWebSearchChatOpenAI", "normalize_web_search_event"]

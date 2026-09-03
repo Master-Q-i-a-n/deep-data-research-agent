@@ -375,18 +375,18 @@ def _usage_event(snapshot: ContextUsageSnapshot, phase: str) -> dict[str, Any]:
 
 
 class ContextUsageMiddleware(AgentMiddleware):
-    """Persist a replayable-context anchor and stream Supervisor context usage."""
+    """Persist a replayable-context anchor and optionally publish usage updates."""
 
     state_schema = ContextUsageState
 
-    def __init__(self, role: str) -> None:
-        self.role = role
+    def __init__(self, *, publish_updates: bool = False) -> None:
+        self.publish_updates = publish_updates
 
     async def awrap_model_call(self, request: ModelRequest, handler) -> ModelResponse:
         used_before = estimate_request_tokens(request, request.messages)
         limit = model_context_limit(request.model)
         version = provider_version(request.model)
-        writer = _stream_writer() if self.role == "supervisor" else None
+        writer = _stream_writer() if self.publish_updates else None
         if writer is not None and limit is not None:
             writer(
                 _usage_event(
@@ -451,7 +451,7 @@ class ContextUsageMiddleware(AgentMiddleware):
                     current_tokens=used_after,
                 )
 
-        if self.role == "supervisor":
+        if self.publish_updates:
             snapshot = (
                 ContextUsageSnapshot(
                     used_tokens=max(1, used_after),

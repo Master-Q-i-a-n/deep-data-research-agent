@@ -27,7 +27,10 @@ from deep_data_research_agent.agents.middleware.skills import (
     MongoSkillsRestoreMiddleware,
     ReloadableSkillsMiddleware,
 )
-from deep_data_research_agent.agents.model_profile import register_mvp_profile
+from deep_data_research_agent.agents.model_profile import (
+    CRAWL_WORKER_MODEL_PROFILE,
+    register_mvp_profile,
+)
 from deep_data_research_agent.agents.prompts import CRAWL_WORKER_PROMPT
 from deep_data_research_agent.core.config import create_graph_placeholder_model
 from deep_data_research_agent.core.identity import user_identity_from_config
@@ -39,7 +42,7 @@ from deep_data_research_agent.memory.service import (
     agent_memory_path,
 )
 from deep_data_research_agent.providers.context_usage import ContextUsageMiddleware
-from deep_data_research_agent.providers.models import provider_summarization_middleware
+from deep_data_research_agent.providers.models import ProviderSummarizationMiddleware
 from deep_data_research_agent.skill_system.storage import (
     public_skill_root,
     user_skill_root,
@@ -106,13 +109,13 @@ class CrawlWorkerState(DeepAgentState):
 
 crawl_agent = create_deep_agent(
     name="crawl-worker-agent",
-    model=create_graph_placeholder_model("worker"),
+    model=create_graph_placeholder_model(CRAWL_WORKER_MODEL_PROFILE.harness_provider),
     tools=[*CRAWL_TOOLS],
     system_prompt=CRAWL_WORKER_PROMPT,
     middleware=[
-        provider_summarization_middleware("crawl-worker", WORKER_BACKEND),
+        ProviderSummarizationMiddleware(CRAWL_WORKER_MODEL_PROFILE, WORKER_BACKEND),
         TokenUsageMiddleware(agent_name="crawl-worker"),
-        ContextUsageMiddleware("crawl-worker"),
+        ContextUsageMiddleware(),
         # Preserve the crawl worker's short planning step after the 0.7 upgrade.
         TodoListMiddleware(),
         SubagentModelCallLimitMiddleware(

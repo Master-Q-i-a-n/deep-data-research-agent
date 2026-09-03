@@ -27,14 +27,15 @@ from deep_data_research_agent.agents.contracts import (
     reviewer_tool_budget,
 )
 from deep_data_research_agent.agents.crawl_worker import CrawlTaskResult
+from deep_data_research_agent.agents.model_profile import (
+    ANALYSIS_REVIEWER_MODEL_PROFILE,
+)
 from deep_data_research_agent.agents.prompts import (
     ANALYSIS_REVIEWER_PROMPT,
     DATA_ANALYST_PROMPT,
     SUPERVISOR_PROMPT,
 )
-from deep_data_research_agent.core.config import (
-    create_reviewer_model,
-)
+from deep_data_research_agent.core.config import create_chat_model
 
 
 def test_data_analyst_contract_enforces_text_and_collection_bounds() -> None:
@@ -594,7 +595,10 @@ def test_reviewer_guard_only_exposes_execute_to_numeric_role() -> None:
 
     def visible(role: str):
         request = ModelRequest(
-            model=create_reviewer_model(),
+            model=create_chat_model(
+                harness_provider=ANALYSIS_REVIEWER_MODEL_PROFILE.harness_provider,
+                streaming=False,
+            ),
             messages=[],
             tools=tools,
             state={"messages": [HumanMessage(content=f"审查角色：{role}")]},
@@ -617,7 +621,10 @@ def test_reviewer_guard_only_exposes_execute_to_numeric_role() -> None:
     ]
 
     retry_request = ModelRequest(
-        model=create_reviewer_model(),
+        model=create_chat_model(
+            harness_provider=ANALYSIS_REVIEWER_MODEL_PROFILE.harness_provider,
+            streaming=False,
+        ),
         messages=[],
         tools=tools,
         state={

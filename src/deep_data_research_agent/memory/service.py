@@ -48,6 +48,7 @@ from pymongo.errors import DuplicateKeyError
 from deep_data_research_agent.admissions.token_usage import metered_model_ainvoke
 from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.core.identity import user_hash, user_identity
+from deep_data_research_agent.core.model_execution import ModelExecutionProfile
 from deep_data_research_agent.infrastructure.sandbox.manager import (
     thread_id_from_runtime,
 )
@@ -59,6 +60,11 @@ from deep_data_research_agent.providers.models import (
 from deep_data_research_agent.workers.app import publish_memory_job
 
 logger = logging.getLogger(__name__)
+
+_MEMORY_MODEL_PROFILE = ModelExecutionProfile(
+    name="memory-consolidation",
+    max_retries=0,
+)
 
 AgentName = Literal["supervisor", "data-analyst", "crawl-worker"]
 MemoryJobKind = Literal["user_memory", "failure_lesson", "failure_review"]
@@ -893,7 +899,7 @@ async def _invoke_structured_memory_model(
 
     if not user_id:
         raise RuntimeError("后台记忆任务缺少用户身份，无法解析模型 Provider")
-    runtime_model = await get_runtime_model(user_id, "memory")
+    runtime_model = await get_runtime_model(user_id, _MEMORY_MODEL_PROFILE)
     model = structured_output_model(runtime_model, schema, include_raw=True)
     repair_note = ""
     last_error: Exception | None = None
@@ -1128,7 +1134,7 @@ async def _extract_failure_review_decisions(
     messages: list[Any] = [HumanMessage(content=review_prompt)]
     if not user_id:
         raise RuntimeError("后台失败回顾缺少用户身份，无法解析模型 Provider")
-    runtime_model = await get_runtime_model(user_id, "memory")
+    runtime_model = await get_runtime_model(user_id, _MEMORY_MODEL_PROFILE)
     model = runtime_model.model
     settings = get_settings()
 

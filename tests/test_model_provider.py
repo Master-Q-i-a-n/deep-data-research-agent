@@ -357,11 +357,27 @@ def test_responses_include_requires_responses_protocol(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "role",
-    ["supervisor", "data-analyst", "analysis-reviewer", "crawl-worker", "memory", "test"],
+    "profile",
+    [
+        provider_models.ModelExecutionProfile(
+            name="interactive",
+            enable_streaming=True,
+            enable_hosted_web_search=True,
+        ),
+        provider_models.ModelExecutionProfile(
+            name="background",
+            harness_provider="deep-data-worker",
+        ),
+        provider_models.ModelExecutionProfile(
+            name="readonly",
+            harness_provider="deep-data-reviewer",
+        ),
+        provider_models.ModelExecutionProfile(name="memory", max_retries=0),
+        provider_models.ModelExecutionProfile(name="default"),
+    ],
 )
-def test_responses_capability_configures_every_online_role(
-    role: provider_models.ModelRole,
+def test_responses_capability_honors_execution_profile(
+    profile: provider_models.ModelExecutionProfile,
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -375,15 +391,16 @@ def test_responses_capability_configures_every_online_role(
     )
     provider = _resolved_provider("https://api.openai.com/v1", "gpt-5.4")
 
-    built = provider_models._build_model(provider, role)
+    built = provider_models._build_model(provider, profile)
     model = built.runtime.model
     try:
         assert model.use_responses_api is True
         assert model.output_version == "responses/v1"
         assert model.store is False
-        assert model.streaming is (role == "supervisor")
+        assert model.streaming is profile.enable_streaming
+        assert model._get_ls_params()["ls_provider"] == profile.harness_provider
         assert "reasoning.encrypted_content" in (model.include or [])
-        if role == "supervisor":
+        if profile.enable_hosted_web_search:
             assert "web_search_call.action.sources" in (model.include or [])
         else:
             assert "web_search_call.action.sources" not in (model.include or [])
@@ -413,7 +430,10 @@ def test_deepseek_responses_does_not_send_unsupported_include(monkeypatch) -> No
 
     built = provider_models._build_model(
         provider,
-        "supervisor",
+        provider_models.ModelExecutionProfile(
+            name="interactive",
+            enable_hosted_web_search=True,
+        ),
     )
     model = built.runtime.model
     try:
@@ -499,7 +519,7 @@ async def test_deepseek_provider_test_calls_responses_without_include(
     assert "tools" not in payload
 
 
-def test_only_supervisor_receives_builtin_web_search() -> None:
+def test_only_enabled_profile_receives_builtin_web_search() -> None:
     runtime = Runtime(
         server_info=SimpleNamespace(user=SimpleNamespace(identity="user-a"))
     )
@@ -514,18 +534,22 @@ def test_only_supervisor_receives_builtin_web_search() -> None:
         provider_version=1,
     )
 
-    def captured_tools(role: provider_models.ModelRole):
+    def captured_tools(profile: provider_models.ModelExecutionProfile):
         request = provider_models.ModelRequest(
             model=SimpleNamespace(model_name="placeholder"),
             messages=[HumanMessage(content="hello")],
             runtime=runtime,
             tools=[],
         )
-        return provider_models._runtime_tools(request, resolved, role)
+        return provider_models._runtime_tools(request, resolved, profile)
 
-    assert captured_tools("supervisor") == [{"type": "web_search"}]
-    assert captured_tools("data-analyst") == []
-    assert captured_tools("crawl-worker") == []
+    enabled = provider_models.ModelExecutionProfile(
+        name="search-enabled",
+        enable_hosted_web_search=True,
+    )
+    disabled = provider_models.ModelExecutionProfile(name="search-disabled")
+    assert captured_tools(enabled) == [{"type": "web_search"}]
+    assert captured_tools(disabled) == []
 
 
 def test_web_search_events_are_normalized_and_sources_are_safe() -> None:
@@ -620,7 +644,7 @@ async def test_supervisor_responses_stream_preserves_langchain_chunks(
             captured_payload.update(payload)
             return FakeContextManager()
 
-    model = provider_responses.SupervisorResponsesChatOpenAI(
+    model = provider_responses.ResponsesWebSearchChatOpenAI(
         model="gpt-5.4",
         api_key="test-key",
         use_responses_api=True,
@@ -679,7 +703,7 @@ def test_provider_summarizer_uses_runtime_model_profile() -> None:
         ),
     )
     middleware = provider_models.ProviderSummarizationMiddleware(
-        "supervisor",
+        provider_models.ModelExecutionProfile(name="interactive"),
         StateBackend(),
     )
 
@@ -824,7 +848,7 @@ async def test_provider_middleware_precedes_token_metering(monkeypatch) -> None:
     captured: dict[str, object] = {}
     capabilities = model_profiles.FALLBACK_PROVIDER.capabilities
 
-    async def runtime_model(_user_id: str, _role: str):
+    async def runtime_model(_user_id: str, _profile):
         return provider_models.RuntimeModel(
             model=SimpleNamespace(model_name="actual-user-model"),
             provider_name="openai-compatible",
@@ -881,7 +905,8 @@ async def test_provider_middleware_precedes_token_metering(monkeypatch) -> None:
         ).awrap_model_call(resolved_request, final_handler)
 
     await provider_models.ProviderSummarizationMiddleware(
-        "supervisor", StateBackend()
+        provider_models.ModelExecutionProfile(name="interactive"),
+        StateBackend(),
     ).awrap_model_call(
         request,
         metered_handler,
@@ -917,7 +942,7 @@ async def test_runtime_model_cache_is_bounded_and_user_evictable(monkeypatch) ->
             api_key=f"secret-{user_id}",
         )
 
-    def built(provider: service.ResolvedProvider, _role: str):
+    def built(provider: service.ResolvedProvider, _profile):
         return provider_models._BuiltModel(
             runtime=provider_models.RuntimeModel(
                 model=SimpleNamespace(model_name=provider.model_name),
@@ -942,8 +967,9 @@ async def test_runtime_model_cache_is_bounded_and_user_evictable(monkeypatch) ->
     )
     provider_models._MODEL_CACHE.clear()
 
-    await provider_models.get_runtime_model("user-a", "supervisor")
-    await provider_models.get_runtime_model("user-b", "supervisor")
+    profile = provider_models.ModelExecutionProfile(name="interactive")
+    await provider_models.get_runtime_model("user-a", profile)
+    await provider_models.get_runtime_model("user-b", profile)
     assert len(provider_models._MODEL_CACHE) == 1
     assert closed == ["sync:user-a", "async:user-a"]
 
@@ -1006,7 +1032,10 @@ async def test_provider_adapters_make_minimal_mock_call_without_serializing_key(
     assert route.calls[0].request.headers["authorization"] == f"Bearer {secret}"
     # LangSmith serializes model metadata, not the upstream HTTP request. The
     # model's secret field must remain masked in both representations.
-    built = provider_models._build_model(provider, "test")
+    built = provider_models._build_model(
+        provider,
+        provider_models.ModelExecutionProfile(name="provider-test"),
+    )
     model = built.runtime.model
     try:
         assert secret not in repr(model)
@@ -1066,23 +1095,22 @@ async def test_anthropic_native_calls_official_messages_endpoint(
 
 
 @pytest.mark.parametrize(
-    ("role", "harness"),
+    "harness_provider",
     [
-        ("supervisor", "openai"),
-        ("data-analyst", "deep-data-worker"),
-        ("crawl-worker", "deep-data-worker"),
-        ("analysis-reviewer", "deep-data-reviewer"),
+        "openai",
+        "deep-data-worker",
+        "deep-data-reviewer",
+        "custom-harness",
     ],
 )
-def test_anthropic_roles_keep_application_harness(
-    role: provider_models.ModelRole,
-    harness: str,
+def test_anthropic_adapter_preserves_opaque_harness_provider(
+    harness_provider: str,
 ) -> None:
-    model_class = provider_models._anthropic_model_class(role)
-    model = model_class(
+    model = provider_models._HarnessChatAnthropic(
         model="claude-sonnet-4-5",
         api_key="sk-test",
         base_url="https://api.anthropic.com",
+        harness_provider=harness_provider,
     )
 
-    assert model._get_ls_params()["ls_provider"] == harness
+    assert model._get_ls_params()["ls_provider"] == harness_provider

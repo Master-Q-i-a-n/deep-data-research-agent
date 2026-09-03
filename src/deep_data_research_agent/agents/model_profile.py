@@ -10,6 +10,25 @@ from deep_data_research_agent.agents.prompts import (
     BASE_AGENT_PROMPT,
     TOOL_DESCRIPTION_OVERRIDES,
 )
+from deep_data_research_agent.core.model_execution import ModelExecutionProfile
+
+SUPERVISOR_MODEL_PROFILE = ModelExecutionProfile(
+    name="supervisor",
+    enable_streaming=True,
+    enable_hosted_web_search=True,
+)
+DATA_ANALYST_MODEL_PROFILE = ModelExecutionProfile(
+    name="data-analyst",
+    harness_provider="deep-data-worker",
+)
+ANALYSIS_REVIEWER_MODEL_PROFILE = ModelExecutionProfile(
+    name="analysis-reviewer",
+    harness_provider="deep-data-reviewer",
+)
+CRAWL_WORKER_MODEL_PROFILE = ModelExecutionProfile(
+    name="crawl-worker",
+    harness_provider="deep-data-worker",
+)
 
 DEFAULT_EXCLUDED_TOOLS = frozenset({"delete"})
 REVIEWER_EXCLUDED_TOOLS = frozenset(
