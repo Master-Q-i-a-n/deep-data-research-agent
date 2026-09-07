@@ -23,6 +23,10 @@ from langchain_openai import ChatOpenAI
 from deep_data_research_agent.core.config import HarnessChatOpenAI, get_settings
 from deep_data_research_agent.core.identity import user_identity
 from deep_data_research_agent.core.model_execution import ModelExecutionProfile
+from deep_data_research_agent.core.review_capture import (
+    capture_request,
+    capture_response,
+)
 from deep_data_research_agent.providers.context_usage import ContextTokenCounter
 from deep_data_research_agent.providers.model_profiles import (
     ModelProviderCapabilities,
@@ -116,7 +120,10 @@ def _build_openai_model(
 ) -> _BuiltModel:
     # Explicit clients keep redirects disabled for user-supplied compatible URLs.
     sync_client = httpx.Client(follow_redirects=False, timeout=timeout)
-    async_client = httpx.AsyncClient(follow_redirects=False, timeout=timeout)
+    async_client = httpx.AsyncClient(
+        follow_redirects=False, timeout=timeout,
+        event_hooks={"request": [capture_request], "response": [capture_response]},
+    )
     streaming = (
         profile.enable_streaming
         and get_settings().model_provider_streaming

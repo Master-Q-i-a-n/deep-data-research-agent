@@ -14,6 +14,8 @@ from langchain_openai import ChatOpenAI
 from langchain_openai.chat_models import base as openai_base
 from langgraph.config import get_stream_writer
 
+from deep_data_research_agent.core.review_capture import ReviewCaptureMixin
+
 _WEB_SEARCH_PHASES = {
     "response.web_search_call.in_progress": "in_progress",
     "response.web_search_call.searching": "searching",
@@ -108,7 +110,7 @@ def _stream_writer():
         return None
 
 
-class ResponsesWebSearchChatOpenAI(ChatOpenAI):
+class ResponsesWebSearchChatOpenAI(ReviewCaptureMixin, ChatOpenAI):
     """Expose Responses Web Search lifecycle events without changing LC chunks."""
 
     async def _astream_responses(

@@ -10,8 +10,10 @@ from langchain_openai import ChatOpenAI
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from deep_data_research_agent.core.review_capture import ReviewCaptureMixin
 
-class HarnessChatOpenAI(ChatOpenAI):
+
+class HarnessChatOpenAI(ReviewCaptureMixin, ChatOpenAI):
     """Select an opaque DeepAgents harness without knowing its business meaning."""
 
     harness_provider: str = "openai"
@@ -135,8 +137,9 @@ class Settings(BaseSettings):
     memory_model_timeout_seconds: float = Field(default=60.0, ge=5, le=300)
     memory_job_timeout_seconds: float = Field(default=75.0, ge=10, le=600)
     failure_review_max_output_tokens: int = Field(default=4096, ge=512, le=8192)
+    # 兼容原环境变量名；现在也约束完整请求快照的临时 Mongo 载荷。
     failure_review_bundle_max_bytes: int = Field(
-        default=256 * 1024,
+        default=2 * 1024 * 1024,
         ge=1024,
         le=2 * 1024 * 1024,
     )
@@ -171,15 +174,20 @@ class Settings(BaseSettings):
                 "OSS_PREFIX": self.oss_prefix,
                 "OSS_ECS_RAM_ROLE": self.oss_ecs_ram_role,
             }
-            missing = [name for name, value in required_oss.items() if not value.strip()]
+            missing = [
+                name for name, value in required_oss.items() if not value.strip()
+            ]
             if missing:
                 raise ValueError(f"OSS 工作区存储缺少配置：{'、'.join(missing)}")
-        if not self.celery_broker_key_prefix or self.celery_broker_key_prefix.startswith(
-            "ddra:"
+        if (
+            not self.celery_broker_key_prefix
+            or self.celery_broker_key_prefix.startswith("ddra:")
         ):
             raise ValueError("CELERY_BROKER_KEY_PREFIX 必须与应用 ddra:* 键空间隔离")
         if self.memory_job_timeout_seconds <= self.memory_model_timeout_seconds:
-            raise ValueError("MEMORY_JOB_TIMEOUT_SECONDS 必须大于 MEMORY_MODEL_TIMEOUT_SECONDS")
+            raise ValueError(
+                "MEMORY_JOB_TIMEOUT_SECONDS 必须大于 MEMORY_MODEL_TIMEOUT_SECONDS"
+            )
         if self.sandbox_lock_lease_seconds <= self.sandbox_lock_renew_seconds * 2:
             raise ValueError("SANDBOX_LOCK_LEASE_SECONDS 必须大于两倍续租间隔")
         return self
