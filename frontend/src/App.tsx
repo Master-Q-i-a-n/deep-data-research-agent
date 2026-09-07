@@ -5,6 +5,7 @@ import { useStream } from "@langchain/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useThreadRunManager } from "./features/chat/useThreadRunManager";
+import SkillManagement from "./features/skills/SkillManagement";
 import SessionHistory, { type ConversationThread } from "./features/threads/SessionHistory";
 import SubagentPlanPanel from "./features/tasks/SubagentPlanPanel";
 import TodoPanel, { type TodoItem } from "./features/tasks/TodoPanel";
@@ -1266,6 +1267,7 @@ export default function App() {
   const [showDetails, setShowDetails] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
   const [memoryClearConfirm, setMemoryClearConfirm] = useState(false);
   const [memoryClearing, setMemoryClearing] = useState(false);
   const [memoryStatus, setMemoryStatus] = useState<{
@@ -2857,6 +2859,7 @@ export default function App() {
   }
 
   function openSettings() {
+    setSkillsOpen(false);
     setAccountMenuOpen(false);
     setMemoryClearConfirm(false);
     setMemoryStatus(null);
@@ -3640,7 +3643,7 @@ export default function App() {
             <header>
               <div>
                 <p className="eyebrow">个人工作台</p>
-                <h2 id="settings-title">设置</h2>
+                <h2 id="settings-title">{skillsOpen ? "Skill 管理" : "设置"}</h2>
               </div>
               <button
                 ref={settingsCloseButtonRef}
@@ -3651,6 +3654,14 @@ export default function App() {
               >×</button>
             </header>
 
+            {skillsOpen ? (authReady && authToken ? <SkillManagement
+              key={authToken} apiUrl={apiUrl} token={authToken}
+              onBack={() => setSkillsOpen(false)} onExpired={expireAuthentication}
+            /> : <p>登录后才能管理私有 Skill。<button type="button" onClick={() => setSkillsOpen(false)}>返回设置</button></p>) : <>
+            <div className="settings-section">
+              <div className="settings-section__copy"><strong>Skill 管理</strong><span>查看并删除已分配的私有 Skill。</span></div>
+              <button type="button" className="settings-action-button" disabled={!authReady} onClick={() => setSkillsOpen(true)}>Skill 管理</button>
+            </div>
             <div className="settings-section">
               <div className="settings-section__copy">
                 <strong>详细模式</strong>
@@ -3814,6 +3825,7 @@ export default function App() {
                 </p>
               ) : null}
             </div>
+            </>}
           </section>
         </div>
       ) : null}

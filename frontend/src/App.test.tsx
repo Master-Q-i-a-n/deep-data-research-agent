@@ -2314,3 +2314,22 @@ describe("研究工作台", () => {
     expect(input.value).toBe("");
   });
 });
+
+
+it("设置中的 Skill 管理入口可打开并返回", async () => {
+  window.localStorage.setItem("deep-data-auth-token", "token-a");
+  vi.stubGlobal("fetch", withAuthenticatedUser(async (input) => {
+    if (String(input).endsWith("/skills/user")) return { ok: true, status: 200, json: async () => ({ skills: [{ name: "private-demo", agents: ["supervisor"] }] }) };
+    return { ok: true, status: 200, json: async () => [] };
+  }));
+  render(<App />);
+  await screen.findByText("Alice");
+  fireEvent.click(screen.getByRole("button", { name: "打开账户菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+  fireEvent.click(screen.getByRole("button", { name: "Skill 管理" }));
+  expect(await screen.findByText("private-demo")).toBeTruthy();
+  expect(screen.getByRole("dialog", { name: "Skill 管理" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "返回设置" }));
+  expect(screen.getByRole("dialog", { name: "设置" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "清除记忆" })).toBeTruthy();
+});

@@ -414,3 +414,9 @@ Set-Location -LiteralPath '.\frontend'
 npm test -- --run
 npm run build
 ```
+
+### 私有 Skill 管理
+
+设置中的「Skill 管理」可查看当前用户的私有 Skill 及所属 Agent。同名 Skill 合并展示，删除会移除所有 Agent 下的私有副本及分配记录，保留公共 Skill 和暂存文件。变更在下一次 Agent 执行时同步；运行中的任务可能仍使用已加载内容，删除后同名公共 Skill 会恢复使用。
+
+认证接口：`GET /skills/user` 返回名称及 Agent 列表，`DELETE /skills/user/{skill_name}` 删除当前用户的全部同名私有分配；重复删除返回成功。

@@ -8,7 +8,6 @@ OpenSandbox 后端处理，所以文件工具与 execute 使用完全相同的�
 from __future__ import annotations
 
 import json
-import re
 import shlex
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -23,9 +22,10 @@ from deep_data_research_agent.skill_system.storage import (
     file_store_value,
     rewrite_candidate_content,
 )
+from deep_data_research_agent.skill_system.storage import (
+    validated_skill_name as _validated_skill_name,
+)
 
-_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-_MAX_SKILL_NAME_LENGTH = 64
 _LANGGRAPH_JSON = Path(__file__).resolve().parents[3] / "langgraph.json"
 _FALLBACK_TARGETS = SKILL_AGENT_NAMES
 _COMPONENT = "supervisor"
@@ -45,19 +45,6 @@ def _available_targets() -> frozenset[str]:
     if isinstance(graphs, dict) and graphs:
         return frozenset(graphs.keys()) | SKILL_AGENT_NAMES
     return _FALLBACK_TARGETS
-
-
-def _validated_skill_name(value: str) -> str:
-    name = value.strip()
-    if (
-        not name
-        or len(name) > _MAX_SKILL_NAME_LENGTH
-        or not _SKILL_NAME_RE.fullmatch(name)
-    ):
-        raise ValueError(
-            "Skill 名称必须为 1 到 64 个字符，且只能包含小写字母、数字和单连字符"
-        )
-    return name
 
 
 def _validated_targets(values: list[str], available: frozenset[str]) -> list[str]:

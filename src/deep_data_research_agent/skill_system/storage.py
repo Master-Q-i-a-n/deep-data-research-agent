@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -84,3 +85,20 @@ def rewrite_candidate_content(
     for source in replacements:
         rewritten = rewritten.replace(source, target)
     return rewritten
+
+
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_MAX_SKILL_NAME_LENGTH = 64
+
+
+def validated_skill_name(value: str) -> str:
+    name = value.strip()
+    if (
+        not name
+        or len(name) > _MAX_SKILL_NAME_LENGTH
+        or not _SKILL_NAME_RE.fullmatch(name)
+    ):
+        raise ValueError(
+            "Skill 名称必须为 1 到 64 个字符，且只能包含小写字母、数字和单连字符"
+        )
+    return name

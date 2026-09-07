@@ -1164,6 +1164,7 @@ code, pre {
 }
 .provider-settings-form input:focus { border-color: rgba(54, 89, 217, 0.55); box-shadow: 0 0 0 3px rgba(54, 89, 217, 0.08); }
 .provider-key-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.settings-action-button,
 .provider-key-field > button,
 .provider-settings-actions > button {
   padding: 8px 11px;
@@ -1275,3 +1276,10 @@ code, pre {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+.skill-management__list { list-style: none; padding: 0; margin: 0; }
+.skill-management .settings-section__copy { min-width: 0; overflow-wrap: anywhere; }
+.skill-management .settings-confirm { margin-top: 16px; }
+
+.skill-management { display: grid; gap: 14px; font-size: 0.78rem; }
+.skill-management > .settings-action-button { justify-self: start; }

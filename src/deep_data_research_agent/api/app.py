@@ -81,6 +81,8 @@ from deep_data_research_agent.providers.service import (
     save_provider,
     validate_provider_url,
 )
+from deep_data_research_agent.skill_system import management as skill_management
+from deep_data_research_agent.skill_system.storage import validated_skill_name
 
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
 _PASSWORD_HASHER = PasswordHasher()
@@ -453,6 +455,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     finally:
         if agent_client is not None:
             await agent_client.aclose()
+        await skill_management.close_skill_management_client()
         await MEMORY_QUEUE.close()
         await sandbox_manager.SANDBOX_MANAGER.workspace_store.close()
         await close_mongodb_health_client()
@@ -941,6 +944,36 @@ async def clear_current_user_memory(
             detail="记忆服务暂不可用，请稍后重试",
         ) from exc
     return {"status": "cleared", "cancelled_jobs": cancelled_jobs}
+
+
+@app.get("/skills/user")
+async def list_current_user_skills(authorization: str | None = Header(default=None)) -> dict:
+    user_id = await _authenticated_user_id(authorization)
+    identity_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    try:
+        async with asyncio.timeout(5):
+            skills = await skill_management.list_user_skills(identity_hash)
+    except Exception as exc:
+        logger.exception("读取私有 Skill 失败")
+        raise HTTPException(status_code=503, detail="Skill 服务暂不可用，请稍后重试") from exc
+    return {"skills": skills}
+
+
+@app.delete("/skills/user/{skill_name}")
+async def delete_current_user_skill(skill_name: str, authorization: str | None = Header(default=None)) -> dict:
+    user_id = await _authenticated_user_id(authorization)
+    try:
+        name = validated_skill_name(skill_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    identity_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    try:
+        async with asyncio.timeout(5):
+            count = await skill_management.delete_user_skill(identity_hash, name)
+    except Exception as exc:
+        logger.exception("删除私有 Skill 失败")
+        raise HTTPException(status_code=503, detail="删除 Skill 失败，请稍后重试") from exc
+    return {"status": "deleted", "deleted_count": count}
 
 
 @app.get("/memories/settings")
