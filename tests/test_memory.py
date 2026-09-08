@@ -44,7 +44,8 @@ def _provider_runtime(model, *, method="json_mode"):
 def test_memory_timeout_and_review_output_defaults_are_independent() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.memory_model_timeout_seconds == 60
+    assert "memory_model" not in Settings.model_fields
+    assert "memory_model_timeout_seconds" not in Settings.model_fields
     assert settings.failure_review_bundle_max_bytes == 2 * 1024 * 1024
     assert settings.memory_job_timeout_seconds == 75
     assert settings.failure_review_max_output_tokens == 4096
@@ -460,7 +461,7 @@ async def test_failure_review_middleware_enqueues_full_snapshot_once(
             "input": [{"role": "user", "content": "分析数据"}],
             "tools": request.tools,
         }
-        capture.begin(model, request.messages, request.model_settings, wire_request)
+        capture.begin()
         capture.wire_request(wire_request)
         capture.calls[-1]["request_id"] = "req-front"
         capture.raw(
@@ -477,7 +478,7 @@ async def test_failure_review_middleware_enqueues_full_snapshot_once(
                 }
             }
         )
-        capture.finish(history[-1])
+
         return ModelResponse(result=[history[-1]])
 
     wrapped = await middleware.awrap_model_call(request, captured_handler)
@@ -734,7 +735,6 @@ async def test_failure_reviewer_uses_only_compact_bundle(monkeypatch) -> None:
         memory,
         "get_settings",
         lambda: SimpleNamespace(
-            memory_model="deepseek-memory",
             openai_model="deepseek-chat",
             failure_review_max_output_tokens=4096,
         ),
@@ -805,7 +805,6 @@ async def test_failure_reviewer_rejects_tool_calls_and_never_executes_them(
         memory,
         "get_settings",
         lambda: SimpleNamespace(
-            memory_model=None,
             openai_model="deepseek-chat",
             failure_review_max_output_tokens=4096,
         ),
@@ -875,7 +874,7 @@ async def test_data_analyst_snapshot_replays_full_history_and_tools(
                     "tools": snapshot.actual_request["tools"],
                     "max_output_tokens": 4096,
                 }
-                capture.begin(self, messages, kwargs, payload)
+                capture.begin()
                 capture.wire_request(payload)
                 capture.calls[-1]["request_id"] = "req-review"
                 capture.raw(
@@ -891,7 +890,7 @@ async def test_data_analyst_snapshot_replays_full_history_and_tools(
                         }
                     }
                 )
-                capture.finish(result)
+
             return result
 
     async def runtime_model(_user_id, profile):
@@ -1173,7 +1172,7 @@ async def test_snapshot_review_exposes_wrapped_wire_validation_error(
         async def ainvoke(self, messages, **kwargs):
             capture = memory.ACTIVE_CAPTURE.get()
             assert isinstance(capture, memory.TransientCapture)
-            capture.begin(self, messages, kwargs, {})
+            capture.begin()
             capture.calls[-1]["validation_error"] = "prefix_mismatch"
             raise APIConnectionError(
                 request=httpx.Request("POST", "https://offline.invalid/responses")

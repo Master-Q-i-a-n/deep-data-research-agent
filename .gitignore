@@ -20,6 +20,7 @@ htmlcov/
 coverage/
 build/
 data/
+/evals/cases.yaml
 dist/
 frontend/node_modules/
 frontend/.env.local

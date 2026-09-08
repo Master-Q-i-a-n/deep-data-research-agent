@@ -16,8 +16,71 @@ from deep_data_research_agent.core.review_capture import (
     TransientCapture,
     capture_request,
     capture_response,
+    usage_values,
 )
 from deep_data_research_agent.memory import service
+
+
+@pytest.mark.asyncio
+async def test_stream_capture_preserves_reply_and_cache_usage():
+    # SDK 负责拼接回复；捕获只保留完成状态和原始 usage，不再额外累计消息。
+    events = [
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "reasoning_content": "核对"},
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {"index": 0, "delta": {"content": "完成"}, "finish_reason": None}
+            ]
+        },
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "total_tokens": 1010,
+                "prompt_cache_hit_tokens": 900,
+            },
+        },
+    ]
+    body = (
+        "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+        + "data: [DONE]\n\n"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, text=body, headers={"content-type": "text/event-stream"}
+            )
+        ),
+        event_hooks={"request": [capture_request], "response": [capture_response]},
+    ) as client:
+        model = HarnessChatOpenAI(
+            model="test", api_key="offline", http_async_client=client, max_retries=0
+        )
+        capture = TransientCapture()
+        token = ACTIVE_CAPTURE.set(capture)
+        try:
+            chunks = [chunk async for chunk in model.astream("核对数据")]
+        finally:
+            ACTIVE_CAPTURE.reset(token)
+    assert "".join(chunk.content for chunk in chunks) == "完成"
+    assert any(
+        chunk.additional_kwargs.get("reasoning_content") == "核对" for chunk in chunks
+    )
+    assert capture.complete(capture.calls[0])
+    assert usage_values(capture.calls[0]["response"])["cached_tokens"] == 900
+    assert (
+        not {"message", "messages", "kwargs", "constructed_request"}
+        & capture.calls[0].keys()
+    )
 
 
 @pytest.mark.asyncio
@@ -112,7 +175,7 @@ def test_transient_capture_allows_only_stream_and_output_limit_changes():
         "response": {},
     }
     capture = TransientCapture(phase="review", baseline=baseline)
-    capture.begin(None, [], {}, {})
+    capture.begin()
     capture.wire_request(
         {
             "messages": [
@@ -127,7 +190,7 @@ def test_transient_capture_allows_only_stream_and_output_limit_changes():
     assert capture.prefix_verified is True
 
     changed = TransientCapture(phase="review", baseline=baseline)
-    changed.begin(None, [], {}, {})
+    changed.begin()
     with pytest.raises(ValueError, match="unexpected_parameter_difference"):
         changed.wire_request(
             {

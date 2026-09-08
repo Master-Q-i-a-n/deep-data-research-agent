@@ -131,10 +131,7 @@ class Settings(BaseSettings):
         le=100 * 1024 * 1024,
     )
 
-    # User-memory capture and automatic failure review enqueue work for the
-    # lifespan-managed background consolidator.
-    memory_model: str | None = None
-    memory_model_timeout_seconds: float = Field(default=60.0, ge=5, le=300)
+    # 后台记忆使用账户模型配置，任务总耗时由队列单独限制。
     memory_job_timeout_seconds: float = Field(default=75.0, ge=10, le=600)
     failure_review_max_output_tokens: int = Field(default=4096, ge=512, le=8192)
     # 兼容原环境变量名；现在也约束完整请求快照的临时 Mongo 载荷。
@@ -184,10 +181,6 @@ class Settings(BaseSettings):
             or self.celery_broker_key_prefix.startswith("ddra:")
         ):
             raise ValueError("CELERY_BROKER_KEY_PREFIX 必须与应用 ddra:* 键空间隔离")
-        if self.memory_job_timeout_seconds <= self.memory_model_timeout_seconds:
-            raise ValueError(
-                "MEMORY_JOB_TIMEOUT_SECONDS 必须大于 MEMORY_MODEL_TIMEOUT_SECONDS"
-            )
         if self.sandbox_lock_lease_seconds <= self.sandbox_lock_renew_seconds * 2:
             raise ValueError("SANDBOX_LOCK_LEASE_SECONDS 必须大于两倍续租间隔")
         return self

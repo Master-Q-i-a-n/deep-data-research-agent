@@ -1326,7 +1326,9 @@ describe("研究工作台", () => {
     enableDetailedMode();
 
     expect(screen.getByText("研究步骤")).toBeTruthy();
-    expect(screen.getByText("Supervisor 入口就绪")).toBeTruthy();
+    expect(screen.queryByText("Supervisor 入口就绪")).toBeNull();
+    expect(screen.queryByText("Agent API")).toBeNull();
+    expect(screen.getByRole("button", { name: "开始新任务" })).toBeTruthy();
     expect(screen.getByText("50%")).toBeTruthy();
     expect(screen.getByText("任务控制台")).toBeTruthy();
     expect(screen.getByText("运行中")).toBeTruthy();

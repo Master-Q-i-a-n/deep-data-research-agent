@@ -8,7 +8,7 @@ import json
 from contextvars import ContextVar
 
 import httpx
-from langchain_core.messages import AIMessage, message_chunk_to_message
+from langchain_core.messages import AIMessage
 
 ACTIVE_CAPTURE: ContextVar = ContextVar("failure_review_capture", default=None)
 
@@ -22,14 +22,9 @@ class TransientCapture:
         self.calls: list[dict] = []
         self.prefix_verified = False
 
-    def begin(self, model, messages, kwargs, payload):
-        self.calls.append(
-            {
-                "messages": copy.deepcopy(messages),
-                "kwargs": copy.deepcopy(kwargs),
-                "constructed_request": copy.deepcopy(payload),
-            }
-        )
+    def begin(self):
+        # 仅保留实际 wire 请求与响应；本地报告已移除，无需复制中间消息。
+        self.calls.append({})
 
     def wire_request(self, payload):
         call = self.calls[-1]
@@ -85,9 +80,6 @@ class TransientCapture:
         if choices and choices[0].get("finish_reason"):
             self.calls[-1]["finish_reason"] = choices[0]["finish_reason"]
 
-    def finish(self, message):
-        self.calls[-1]["message"] = copy.deepcopy(message)
-
     def complete(self, call):
         body = call.get("response", {})
         if "input" in call.get("request", {}):
@@ -97,10 +89,6 @@ class TransientCapture:
             choices[0].get("finish_reason") if choices else None
         )
         return finish == "stop"
-
-    def log(self, _event, _data):
-        # Durable persistence happens once, after the model call completes.
-        return None
 
 
 def usage_values(body: dict) -> dict:
@@ -152,9 +140,8 @@ async def capture_response(response: httpx.Response) -> None:
         try:
             await asyncio.to_thread(capture.raw, response.json())
         except ValueError:
-            await asyncio.to_thread(
-                capture.log, "invalid_response", {"status": response.status_code}
-            )
+            # 非 JSON 错误响应由 SDK 处理，捕获不改变调用结果。
+            pass
 
 
 class _CaptureStream(httpx.AsyncByteStream):
@@ -175,7 +162,8 @@ class _CaptureStream(httpx.AsyncByteStream):
                         try:
                             await asyncio.to_thread(self.capture.raw, json.loads(value))
                         except ValueError:
-                            await asyncio.to_thread(self.capture.log, "invalid_sse", {})
+                            # 原始字节继续交给 SDK，捕获忽略无法解析的事件。
+                            pass
             yield chunk
 
     async def aclose(self):
@@ -214,10 +202,7 @@ class ReviewCaptureMixin:
                     + copy.deepcopy(output)
                     + [payload[field][-1]]
                 )
-        replay_kwargs = dict(kwargs)
-        if stop is not None:
-            replay_kwargs["stop"] = stop
-        capture.begin(self, messages, replay_kwargs, payload)
+        capture.begin()
         return payload
 
     def _convert_chunk_to_generation_chunk(
@@ -245,23 +230,4 @@ class ReviewCaptureMixin:
                     generation.message.additional_kwargs["reasoning_content"] = choice[
                         "message"
                     ]["reasoning_content"]
-        return result
-
-    async def _astream(self, *args, **kwargs):
-        capture = ACTIVE_CAPTURE.get()
-        total = None
-        async for chunk in super()._astream(*args, **kwargs):
-            if capture is not None:
-                saved = copy.deepcopy(chunk)
-                total = saved if total is None else total + saved
-            yield chunk
-        if capture is not None and total is not None:
-            await asyncio.to_thread(
-                capture.finish, message_chunk_to_message(total.message)
-            )
-
-    async def _agenerate(self, *args, **kwargs):
-        result = await super()._agenerate(*args, **kwargs)
-        if (capture := ACTIVE_CAPTURE.get()) is not None:
-            await asyncio.to_thread(capture.finish, result.generations[0].message)
         return result

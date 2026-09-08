@@ -3073,20 +3073,18 @@ export default function App() {
           </div>
         </div>
 
-        <div className="session-card">
-          <div className="session-card__status">
-            <span className="status-dot" aria-hidden="true" />
-            <span>{workspaceLocked ? "登录后启用 Supervisor" : !providerReady ? "请先配置模型 Provider" : stream.isLoading ? "Supervisor 正在回答" : "Supervisor 入口就绪"}</span>
-          </div>
-          <code title={threadId ?? "等待创建"}>{workspaceLocked ? "会话功能已锁定" : threadId ?? "新会话 · 等待首次消息"}</code>
-          <button
-            type="button"
-            disabled={workspaceLocked || threadAllocating || filesUploading || interruptSubmitting}
-            onClick={startNewThread}
-          >
-            开始新任务
-          </button>
-        </div>
+        <button
+          className="new-task-button"
+          type="button"
+          disabled={workspaceLocked || threadAllocating || filesUploading || interruptSubmitting}
+          onClick={startNewThread}
+        >
+          <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v8M8 12h8" />
+          </svg>
+          <span>开始新任务</span>
+        </button>
 
         <SessionHistory
           sessions={sessions}
@@ -3154,10 +3152,6 @@ export default function App() {
           {!authMode && authError ? <p className="account-card__error">{authError}</p> : null}
         </section>
 
-        <div className="sidebar-foot">
-          <span>Agent API</span>
-          <code>{apiUrl.replace(/^https?:\/\//, "")}</code>
-        </div>
       </aside>
 
       <main
@@ -3182,11 +3176,7 @@ export default function App() {
         <section ref={conversationRef} className="conversation" aria-label="研究对话">
           {(showDetails ? rows.length === 0 : compactTurns.length === 0) ? (
             <div className="empty-state">
-              <p className="empty-state__index">研究入口 / 01</p>
               <h2>把一个问题，变成一条证据链。</h2>
-              <p className="empty-state__lead">
-                描述目标、网址，或上传 CSV、TSV、XLSX。Supervisor 会规划、验证并整理成可核验的分析结果。
-              </p>
               <div className="example-grid">
                 {EXAMPLES.map((example) => (
                   <button key={example} type="button" onClick={() => setInput(example)}>
