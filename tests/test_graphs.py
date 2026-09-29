@@ -13,12 +13,39 @@ from deep_data_research_agent.agents.model_profile import (
 )
 from deep_data_research_agent.agents.prompts import (
     ANALYSIS_REVIEWER_PROMPT,
+    BASE_AGENT_PROMPT,
+    CRAWL_WORKER_PROMPT,
     DATA_ANALYST_PROMPT,
     SUPERVISOR_PROMPT,
 )
 from deep_data_research_agent.agents.supervisor import graph as supervisor_graph
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "role_prompt"),
+    [
+        ("supervisor", SUPERVISOR_PROMPT),
+        ("data-analyst", DATA_ANALYST_PROMPT),
+        ("analysis-reviewer", ANALYSIS_REVIEWER_PROMPT),
+        ("crawl-worker", CRAWL_WORKER_PROMPT),
+    ],
+)
+def test_compiled_agents_preserve_role_and_shared_system_instructions(
+    agent_name: str, role_prompt: str,
+) -> None:
+    # Inspect the actual compiled model node: checking prompt constants alone
+    # misses HarnessProfile overwriting the inline subagent's role prompt.
+    task_tool = supervisor_graph.nodes["tools"].bound.tools_by_name["task"]
+    children = inspect.getclosurevars(task_tool.coroutine).nonlocals["subagent_graphs"]
+    graphs = {"supervisor": supervisor_graph, "crawl-worker": crawl_agent, **children}
+    closure = inspect.getclosurevars(graphs[agent_name].nodes["model"].bound.func).nonlocals
+    content = closure["system_message"].content
+    assert isinstance(content, str)
+    assert content.count(role_prompt) == 1
+    assert content.count(BASE_AGENT_PROMPT) == 1
+    assert content.index(role_prompt) < content.index(BASE_AGENT_PROMPT)
 
 
 def test_supervisor_exposes_sync_and_async_delegation_tools() -> None:
@@ -172,14 +199,14 @@ def test_prompts_keep_supervisor_generic_and_data_analyst_contract_complete() ->
     assert "artifacts 返回空列表" in DATA_ANALYST_PROMPT
     assert "同一目标" in SUPERVISOR_PROMPT
     assert "只派发一个data-analyst" in SUPERVISOR_PROMPT
-    assert "默认调用动态注入的报告转换 Skill" in SUPERVISOR_PROMPT
+    assert "不因分析复杂就自动转换" in SUPERVISOR_PROMPT
     assert "在报告同目录生成同名 PDF" in SUPERVISOR_PROMPT
     assert "不得仅完成探查、部分指标或某个报告章节" in DATA_ANALYST_PROMPT
     assert "相对于报告文件的路径嵌入" in DATA_ANALYST_PROMPT
     assert "完整产物自检" in DATA_ANALYST_PROMPT
     assert "可正常解码" in DATA_ANALYST_PROMPT
     assert "结构化输出能够读取" in DATA_ANALYST_PROMPT
-    assert "核心结果的脚本必须作为 artifacts" in DATA_ANALYST_PROMPT
+    assert "核心结果的脚本在 artifacts 交付时必须作为 artifacts" in DATA_ANALYST_PROMPT
     assert "Reviewer 要求的分析修订完成后" in DATA_ANALYST_PROMPT
     assert "capture_user_memory" in SUPERVISOR_PROMPT
     assert "record_failure_lesson" not in SUPERVISOR_PROMPT

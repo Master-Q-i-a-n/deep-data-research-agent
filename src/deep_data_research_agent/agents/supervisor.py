@@ -72,10 +72,10 @@ graph = create_deep_agent(
                 DATA_ANALYST_MODEL_PROFILE.harness_provider
             ),
             description=(
-                "分析本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据。委派时必须标注模式："
-                "quick_answer 用于直接查值、计数或简单统计，只返回经校验的简洁结论且不生成"
-                "文件；formal_report 用于复杂分析或用户明确要求报告、图表、导出时，在一次"
-                "委派内完成探查、计算、验证、制图和 Markdown 主报告，并生成可核验产物；"
+                "分析本地 CSV、TSV、XLSX 文件或 PostgreSQL 只读数据。委派分别标注分析模式："
+                "quick_answer 用于直接查值和简单统计，formal_report 用于系统分析；"
+                "以及交付形式：inline 在对话内返回结论，artifacts 生成用户所需文件。"
+                "复杂分析也可以 inline，简单统计也可以导出；一次委派内完成所需探查、计算、验证和交付；"
                 "信息不足时返回 needs_input。"
             ),
             system_prompt=DATA_ANALYST_PROMPT,

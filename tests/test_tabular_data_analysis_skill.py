@@ -65,7 +65,7 @@ def test_tabular_skill_is_builtin_planning_guidance() -> None:
     assert "不在本 Skill 中假定业务指标" in text
     assert "quick_answer" in text
     assert "formal_report" in text
-    assert "不得生成 Markdown、CSV、JSON、PNG 或 PDF" in text
+    assert "不生成交付文件，但允许必要的内部计算脚本及探查数据" in text
     assert "write_todos" in text
     assert "/workspace/output/final_report.md" in text
     assert "不得只完成探查" in text

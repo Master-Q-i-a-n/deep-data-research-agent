@@ -286,8 +286,146 @@ async def test_database_tool_returns_mcp_failure_as_json(monkeypatch) -> None:
 async def test_real_postgres_mcp_lists_schemas() -> None:
     result = json.loads(
         await database_tools.database_list_schemas.coroutine(
-            runtime=_runtime("thread-real-database")
+            runtime=SimpleNamespace(config={})
         )
     )
     assert result["status"] == "success", result.get("error", result)
     assert "olist" in result["result"] or "public" in result["result"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["json", "repr"])
+async def test_details_enrich_comments_and_real_constraints(monkeypatch, encoding):
+    base = {"basic": {"schema": "olist", "name": "sample"},
+            "columns": [{"column": "id", "data_type": "text"}],
+            "constraints": [], "indexes": [{"name": "existing"}]}
+    calls = []
+
+    async def invoke(name, arguments, runtime):
+        calls.append(name)
+        if name == "get_object_details":
+            return json.dumps(base) if encoding == "json" else repr(base)
+        return repr([{"__bridge_json": json.dumps([{
+            "table_comment": "测试表", "column_comments": {"id": None},
+            "constraints": [{"name": "pk", "type": "p", "definition": "PRIMARY KEY (id)"}],
+        }])}])
+
+    monkeypatch.setattr(database_tools, "_invoke_text", invoke)
+    response = json.loads(await database_tools.database_get_object_details.coroutine(
+        schema_name="olist", object_name="sample", runtime=_runtime()))
+    result = json.loads(response["result"])
+    assert calls == ["get_object_details", "execute_sql"]
+    assert response["metadata_status"] == "complete"
+    assert result["basic"]["comment"] == "测试表"
+    assert result["columns"][0]["comment"] is None
+    assert result["constraints"][0]["type"] == "p"
+    assert result["indexes"] == base["indexes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", ["query_error", "bad_base", "missing_object", "changed_columns"])
+async def test_details_partial_preserves_original(monkeypatch, problem):
+    original = "not a dict" if problem == "bad_base" else repr({
+        "basic": {}, "columns": [{"column": "id"}], "constraints": []})
+
+    async def invoke(name, arguments, runtime):
+        if name == "get_object_details":
+            return original
+        if problem == "query_error":
+            raise database_tools.DatabaseToolError("catalog unavailable")
+        rows = [] if problem == "missing_object" else [{
+            "table_comment": None, "column_comments": {"different": None}, "constraints": []}]
+        return repr([{"__bridge_json": json.dumps(rows)}])
+
+    monkeypatch.setattr(database_tools, "_invoke_text", invoke)
+    response = json.loads(await database_tools.database_get_object_details.coroutine(
+        schema_name="olist", object_name="sample", runtime=_runtime()))
+    assert response["status"] == "success"
+    assert response["metadata_status"] == "partial"
+    assert response["result"] == original
+    assert response["warnings"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("object_type", ["sequence", "extension"])
+async def test_non_relation_details_unchanged(monkeypatch, object_type):
+    calls = []
+
+    async def invoke(name, arguments, runtime):
+        calls.append(name)
+        return "original"
+
+    monkeypatch.setattr(database_tools, "_invoke_text", invoke)
+    response = json.loads(await database_tools.database_get_object_details.coroutine(
+        schema_name="public", object_name="sample", object_type=object_type, runtime=_runtime()))
+    assert response == {"status": "success", "result": "original"}
+    assert calls == ["get_object_details"]
+
+
+@pytest.mark.asyncio
+async def test_catalog_names_are_literals_and_views_have_no_invented_constraints(monkeypatch):
+    from psycopg import sql
+
+    name = "中文'\\; DROP TABLE anything;--"
+    queries = []
+
+    async def invoke(tool, arguments, runtime):
+        if tool == "get_object_details":
+            return repr({"basic": {}, "columns": []})
+        queries.append(arguments["sql"])
+        return repr([{"__bridge_json": json.dumps([{
+            "table_comment": None, "column_comments": {}, "constraints": []}])}])
+
+    monkeypatch.setattr(database_tools, "_invoke_text", invoke)
+    response = json.loads(await database_tools.database_get_object_details.coroutine(
+        schema_name=name, object_name=name, object_type="view", runtime=_runtime()))
+    assert response["metadata_status"] == "complete"
+    assert json.loads(response["result"])["constraints"] == []
+    assert f"n.nspname={sql.Literal(name).as_string()}" in queries[0]
+    assert f"c.relname={sql.Literal(name).as_string()}" in queries[0]
+    assert "c.relkind IN ('v','m')" in queries[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_schema_comments_and_missing_permission_warning(monkeypatch, failure):
+    original = repr([{"schema_name": "olist", "schema_owner": "qf"}, {"schema_name": "public"}])
+
+    async def invoke(tool, arguments, runtime):
+        if tool == "list_schemas":
+            return original
+        comments = {"olist": "业务数据", "public": None} if not failure else {"public": None}
+        return repr([{"__bridge_json": json.dumps([{"comments": comments}])}])
+
+    monkeypatch.setattr(database_tools, "_invoke_text", invoke)
+    response = json.loads(await database_tools.database_list_schemas.coroutine(runtime=_runtime()))
+    if failure:
+        assert response["metadata_status"] == "partial"
+        assert response["result"] == original
+        assert response["warnings"]
+    else:
+        result = json.loads(response["result"])
+        assert response["metadata_status"] == "complete"
+        assert result[0]["schema_comment"] == "业务数据"
+        assert result[1]["schema_comment"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(os.environ.get("RUN_POSTGRES_MCP_INTEGRATION") != "1", reason="需要本地 Olist MCP")
+@pytest.mark.asyncio
+async def test_real_olist_metadata_comments_and_constraints():
+    runtime = SimpleNamespace(config={})
+    schema_result = json.loads(await database_tools.database_list_schemas.coroutine(runtime=runtime))
+    assert schema_result["metadata_status"] == "complete", schema_result
+    schemas = json.loads(schema_result["result"])
+    assert next(s for s in schemas if s["schema_name"] == "olist")["schema_comment"]
+    for name in ("customers", "orders", "closed_deals"):
+        response = json.loads(await database_tools.database_get_object_details.coroutine(
+            schema_name="olist", object_name=name, runtime=runtime))
+        assert response["metadata_status"] == "complete", response
+        result = json.loads(response["result"])
+        assert result["basic"]["comment"]
+        assert all(c["comment"] for c in result["columns"])
+        assert any(c["type"] == "p" for c in result["constraints"])
+        if name == "closed_deals":
+            assert any(c["type"] == "f" and "mql_id" in c["definition"] for c in result["constraints"])

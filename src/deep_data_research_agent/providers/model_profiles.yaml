@@ -56,7 +56,7 @@ providers:
       supports_web_search: false
       responses_include: []
     models:
-      deepseek-v4-flash: &deepseek_responses
+      deepseek-flash: &deepseek_responses
         protocol: responses
         max_input_tokens: 1000000
         structured_output_method: json_mode

@@ -17,6 +17,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langsmith import traceable, tracing_context
+from psycopg import sql as pg_sql
 
 from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
@@ -310,11 +311,61 @@ async def _simple_remote_result(
         return _json_result("error", error=_safe_error(exc))
 
 
+def _parse_object_metadata(text: str, expected_type: type) -> Any:
+    """Accept the MCP server's JSON or Python repr, never executable expressions."""
+    try:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            value = ast.literal_eval(text)
+        if not isinstance(value, expected_type):
+            raise TypeError("unexpected metadata shape")
+        return value
+    except (ValueError, SyntaxError, TypeError) as exc:
+        raise DatabaseToolError("MCP 结构结果格式无法解析，保留原始结果") from exc
+
+
+async def _catalog_metadata(query: str, runtime: ToolRuntime) -> dict[str, Any]:
+    """Run only internally built catalog SQL through the existing read-only MCP.
+
+    Names are SQL literals, not executable SQL. Do not apply the user-query regex:
+    valid quoted names can contain words such as 'update' or semicolons.
+    """
+    text = await _invoke_text("execute_sql", {"sql": _bridge_sql(query, 1)}, runtime)
+    rows = _parse_bridge_rows(text)
+    if len(rows) != 1:
+        raise DatabaseToolError("补充元数据不可用：对象不存在、不可读或结果不唯一")
+    return rows[0]
+
+
 @tool("database_list_schemas")
 async def database_list_schemas(runtime: ToolRuntime) -> str:
-    """列出只读 PostgreSQL 数据库中的 schema；数据库分析应先确认数据范围。"""
-
-    return await _simple_remote_result("list_schemas", {}, runtime)
+    """列出 PostgreSQL schema 及业务注释；补充查询失败时返回明确警告。"""
+    try:
+        original = await _invoke_text("list_schemas", {}, runtime)
+    except DatabaseToolError as exc:
+        return _json_result("error", error=_safe_error(exc))
+    try:
+        schemas = _parse_object_metadata(original, list)
+        if any(not isinstance(s, dict) or not isinstance(s.get("schema_name"), str) for s in schemas):
+            raise DatabaseToolError("MCP schema 列表格式无法解析")
+        names = ", ".join(pg_sql.Literal(s["schema_name"]).as_string() for s in schemas)
+        if schemas:
+            metadata = await _catalog_metadata(f"""
+SELECT COALESCE(jsonb_object_agg(n.nspname, d.description), '{{}}'::jsonb) AS comments
+FROM pg_catalog.pg_namespace n
+LEFT JOIN pg_catalog.pg_description d ON d.objoid=n.oid
+ AND d.classoid='pg_catalog.pg_namespace'::regclass AND d.objsubid=0
+WHERE n.nspname IN ({names}) AND has_schema_privilege(n.oid, 'USAGE')
+""", runtime)
+            comments = metadata["comments"]
+            if not isinstance(comments, dict) or any(s["schema_name"] not in comments for s in schemas):
+                raise DatabaseToolError("部分 schema 注释不可读取，不能判定为无注释")
+            for schema in schemas:
+                schema["schema_comment"] = comments[schema["schema_name"]]
+        return _json_result("success", result=json.dumps(schemas, ensure_ascii=False), metadata_status="complete")
+    except (DatabaseToolError, KeyError, TypeError, ValueError) as exc:
+        return _json_result("success", result=original, metadata_status="partial", warnings=[_safe_error(exc)])
 
 
 @tool("database_list_objects")
@@ -339,17 +390,53 @@ async def database_get_object_details(
     runtime: ToolRuntime,
     object_type: Literal["table", "view", "sequence", "extension"] = "table",
 ) -> str:
-    """读取一个数据库对象的字段、约束和索引，避免模型猜测关联关系。"""
-
-    return await _simple_remote_result(
-        "get_object_details",
-        {
-            "schema_name": schema_name,
-            "object_name": object_name,
-            "object_type": object_type,
-        },
-        runtime,
-    )
+    """读取字段、业务注释、实际约束和索引；metadata_status=partial 时须核验警告。"""
+    arguments = {"schema_name": schema_name, "object_name": object_name, "object_type": object_type}
+    if object_type not in {"table", "view"}:
+        return await _simple_remote_result("get_object_details", arguments, runtime)
+    try:
+        original = await _invoke_text("get_object_details", arguments, runtime)
+    except DatabaseToolError as exc:
+        return _json_result("error", error=_safe_error(exc))
+    try:
+        details = _parse_object_metadata(original, dict)
+        if not isinstance(details.get("basic"), dict) or not isinstance(details.get("columns"), list):
+            raise DatabaseToolError("MCP 对象结构格式无法解析")
+        if any(not isinstance(c, dict) or not isinstance(c.get("column"), str) for c in details["columns"]):
+            raise DatabaseToolError("MCP 字段结构格式无法解析")
+        schema_literal = pg_sql.Literal(schema_name).as_string()
+        object_literal = pg_sql.Literal(object_name).as_string()
+        kinds = "'r','p'" if object_type == "table" else "'v','m'"
+        metadata = await _catalog_metadata(f"""
+SELECT
+(SELECT d.description FROM pg_catalog.pg_description d
+ WHERE d.objoid=c.oid AND d.classoid='pg_catalog.pg_class'::regclass AND d.objsubid=0) AS table_comment,
+COALESCE((SELECT jsonb_object_agg(a.attname,d.description)
+ FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_description d
+ ON d.objoid=a.attrelid AND d.objsubid=a.attnum AND d.classoid='pg_catalog.pg_class'::regclass
+ WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped), '{{}}'::jsonb) AS column_comments,
+COALESCE((SELECT jsonb_agg(jsonb_build_object('name',k.conname,'type',k.contype,
+ 'definition',pg_get_constraintdef(k.oid)) ORDER BY k.conname)
+ FROM pg_catalog.pg_constraint k WHERE k.conrelid=c.oid AND k.contype IN ('p','u','f','c','x')),
+ '[]'::jsonb) AS constraints
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname={schema_literal} AND c.relname={object_literal} AND c.relkind IN ({kinds})
+ AND has_schema_privilege(n.oid,'USAGE') AND has_table_privilege(c.oid,'SELECT')
+""", runtime)
+        comments = metadata["column_comments"]
+        if not isinstance(comments, dict) or set(comments) != {c["column"] for c in details["columns"]}:
+            raise DatabaseToolError("基础字段与补充元数据不一致，请重新探查")
+        if not isinstance(metadata["constraints"], list):
+            raise DatabaseToolError("补充约束格式无效")
+        details["basic"]["comment"] = metadata["table_comment"]
+        for column in details["columns"]:
+            column["comment"] = comments[column["column"]]
+        # The catalog is authoritative; the MCP's information_schema view can omit
+        # constraints for a SELECT-only role. An actual empty list remains empty.
+        details["constraints"] = metadata["constraints"]
+        return _json_result("success", result=json.dumps(details, ensure_ascii=False), metadata_status="complete")
+    except (DatabaseToolError, KeyError, TypeError, ValueError) as exc:
+        return _json_result("success", result=original, metadata_status="partial", warnings=[_safe_error(exc)])
 
 
 @tool("database_query_preview")

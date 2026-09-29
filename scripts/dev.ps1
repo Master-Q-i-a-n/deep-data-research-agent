@@ -206,7 +206,9 @@ if (-not $SkipFrontend) {
 }
 
 try {
-    $sandboxCommand = "exec uvx opensandbox-server --config $SandboxConfig"
+    # Pin the verified server version: 1.1.0 fails at startup because its package
+    # is missing opensandbox_server.services.fast_sandbox.generated.
+    $sandboxCommand = "exec uvx --from opensandbox-server==0.2.3 opensandbox-server --config $SandboxConfig"
     Start-DevProcess `
         -Name "opensandbox" `
         -Executable $wsl `

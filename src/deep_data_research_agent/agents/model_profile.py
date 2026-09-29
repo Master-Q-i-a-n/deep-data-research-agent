@@ -39,10 +39,12 @@ REVIEWER_EXCLUDED_TOOLS = frozenset(
 def register_mvp_profile() -> None:
     """Register separate Supervisor and crawl-worker harness profiles."""
 
+    # DeepAgents replaces inline subagent prompts when base_system_prompt is set.
+    # A suffix preserves each role's instructions and appends shared rules instead.
     register_harness_profile(
         "openai",
         HarnessProfile(
-            base_system_prompt=BASE_AGENT_PROMPT,
+            system_prompt_suffix=BASE_AGENT_PROMPT,
             tool_description_overrides=TOOL_DESCRIPTION_OVERRIDES,
             # DeepAgents 0.7 adds a recursive delete tool. This application
             # deletes user files only through its authenticated HTTP API.
@@ -53,7 +55,7 @@ def register_mvp_profile() -> None:
     register_harness_profile(
         "deep-data-worker",
         HarnessProfile(
-            base_system_prompt=BASE_AGENT_PROMPT,
+            system_prompt_suffix=BASE_AGENT_PROMPT,
             tool_description_overrides=TOOL_DESCRIPTION_OVERRIDES,
             excluded_tools=DEFAULT_EXCLUDED_TOOLS,
             general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
@@ -62,7 +64,7 @@ def register_mvp_profile() -> None:
     register_harness_profile(
         "deep-data-reviewer",
         HarnessProfile(
-            base_system_prompt=BASE_AGENT_PROMPT,
+            system_prompt_suffix=BASE_AGENT_PROMPT,
             tool_description_overrides=TOOL_DESCRIPTION_OVERRIDES,
             # Execute is filtered dynamically and is visible only to the
             # numeric-consistency Reviewer role.

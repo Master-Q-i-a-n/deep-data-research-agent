@@ -1,12 +1,13 @@
 ---
 name: tabular-data-analysis
-description: 对 CSV、TSV 或 XLSX 表格执行分析。quick_answer 处理直接查值和简单统计且不生成文件；formal_report 执行从探查到 Markdown 主报告的完整流程。任务包含 /workspace/input/ 路径或要求分析上传表格时必须使用。
+description: 对 CSV、TSV 或 XLSX 表格执行分析。quick_answer 处理简单统计，formal_report 完成系统分析；独立按 inline 返回对话结论或 artifacts 交付文件。任务包含 /workspace/input/ 路径或要求分析上传表格时必须使用。
 ---
 
 # 本地表格数据分析
 
 根据委派中明确标注的 `quick_answer` 或 `formal_report` 模式执行。根据真实数据和上级目标选择
-方法，不在本 Skill 中假定业务指标。formal_report 对一次委派负责完整分析生命周期；除非上级
+方法，不在本 Skill 中假定业务指标。交付形式 inline/artifacts 与分析模式独立；复杂分析也可
+仅在对话内给结论，简单统计也可导出文件。formal_report 对一次委派负责完整分析生命周期；除非上级
 明确限定了可独立验收的子目标，不得只完成探查、部分计算或报告章节就返回。
 
 ## 阶段一：理解任务并规划
@@ -43,15 +44,16 @@ description: 对 CSV、TSV 或 XLSX 表格执行分析。quick_answer 处理直�
 
 1. 核对输入输出行数、筛选与去重影响、关联未匹配数、汇总与总计、单位币种、缺失和异常值。
 2. 验证失败时先修正；无法消除的限制写入 `warnings`，不得给出虚假精确结论。
-3. quick_answer 只在最终 JSON 的 `summary`、`findings` 和 `warnings` 中返回答案、有效样本数、
-   口径及必要限制，`artifacts` 必须为空；不得生成 Markdown、CSV、JSON、PNG 或 PDF。
-4. formal_report 必须生成分析摘要和主 Markdown 报告，按任务需要生成图表。上级未指定主报告
+3. inline 只在最终 JSON 的 `summary`、`findings` 和 `warnings` 中返回答案、有效样本数、
+   口径及必要限制，`artifacts` 必须为空；不生成交付文件，但允许必要的内部计算脚本及探查数据。
+4. artifacts 交付时，quick_answer 仅导出所需结果；formal_report 生成分析摘要和主 Markdown
+   报告，按任务需要生成图表。上级未指定主报告
    路径时使用 `/workspace/output/final_report.md`。主报告说明目标与口径、处理规则、关键发现、
    验证结果、数据局限和产物索引；辅助产物按需
    使用 CSV、JSON 和 PNG。图表放在主报告同目录或子目录，必须用相对于主报告的路径嵌入
    本次生成的每一张 PNG，不能只列出文件名或绝对路径。
-5. formal_report 完成前用文件工具核验主报告的全部图片引用及所有声明产物存在。两种模式都仅
-   按 data-analyst 系统提示词返回 JSON 文本；只有 formal_report 在 `artifacts` 中列出真实路径。
+5. artifacts 交付前用文件工具核验主报告（如有）的全部图片引用及所有声明产物存在。两种模式都仅
+   按 data-analyst 系统提示词返回 JSON 文本；只有文件交付在 `artifacts` 中列出真实路径。
 
 ## 注意事项
 
