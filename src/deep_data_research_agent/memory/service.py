@@ -1,7 +1,7 @@
 """MongoDB-backed user memory and shared per-Agent failure lessons.
 
-Agents can only read memory files. User feedback is captured explicitly, while
-tool-using Agent turns enqueue one automatic review for the background worker.
+Agents read memory files and submit validated user edits through a dedicated tool.
+Tool-using Agent turns still enqueue failure reviews for the background worker.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from langchain.agents.middleware import (
     ModelResponse,
 )
 from langchain.agents.middleware.types import PrivateStateAttr
-from langchain.tools import ToolRuntime, tool
+from langchain.tools import InjectedToolArg, ToolRuntime, tool
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import (
     AIMessage,
@@ -91,6 +91,8 @@ USER_MEMORY_PATH = "/memories/user/MEMORY.md"
 USER_MEMORY_KEY = "/MEMORY.md"
 MEMORY_SETTINGS_KEY = "/SETTINGS.json"
 MAX_BEHAVIOR_ITEMS = 20
+_MAX_USER_MEMORY_WRITE_ATTEMPTS = 3
+_USER_MEMORY_WRITE_TIMEOUT_SECONDS = 5
 MAX_ACTIVE_FAILURES = 50
 MAX_FAILURE_INDEX_BYTES = 12 * 1024
 _QUEUE_JOB_LEASE_SECONDS = 120
@@ -250,7 +252,7 @@ class PreferenceUpdate(BaseModel):
 
 
 class UserMemoryPatch(BaseModel):
-    """Structured decision returned by the background user-memory model."""
+    """Internal deterministic patch for user preferences and behavior feedback."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -287,6 +289,64 @@ class UserMemoryPatch(BaseModel):
         if len(fields) != len(set(fields)):
             raise ValueError("同一偏好字段在一个 patch 中只能出现一次")
         return self
+
+
+class UserMemoryEdit(BaseModel):
+    """One bounded edit; identities and file paths never come from the model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: Literal[
+        "preferred_output",
+        "preferred_chart_type",
+        "preferred_currency",
+        "preferred_language",
+        "avoid_behaviors",
+        "reinforce_behaviors",
+    ]
+    action: Literal["set", "add", "replace", "remove"] = "set"
+    value: str | None = None
+    old_text: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_operation(self) -> UserMemoryEdit:
+        if self.field in UserPreferences.model_fields:
+            if self.action != "set" or self.old_text is not None:
+                raise ValueError("固定偏好只支持 set，不能指定 old_text")
+            if "value" not in self.model_fields_set:
+                raise ValueError("set 必须提供 value；只有明确传入 null 才清除偏好")
+            self.value = PreferenceUpdate(field=self.field, value=self.value).value
+            return self
+
+        if self.action == "set":
+            raise ValueError("行为列表只支持 add、replace、remove，不能整体覆盖")
+        if self.action in {"replace", "remove"}:
+            if not self.old_text or not self.old_text.strip():
+                raise ValueError("replace/remove 必须提供完整原条目 old_text")
+            self.old_text = self.old_text.strip()
+            if len(self.old_text) > 180:
+                raise ValueError("old_text 不能超过 180 字")
+        elif self.old_text is not None:
+            raise ValueError("add 不能指定 old_text")
+
+        if self.action == "remove":
+            if self.value is not None:
+                raise ValueError("remove 不接受新内容 value")
+        else:
+            if not self.value or not self.value.strip():
+                raise ValueError("add/replace 必须提供非空 value")
+            self.value = _normalize_short_text(self.value, limit=2000)
+            if len(self.value) > 180:
+                raise ValueError("行为条目不能超过 180 字")
+            if not _is_safe_memory_text(self.value):
+                raise ValueError("行为条目包含不允许持久化的敏感内容")
+        return self
+
+
+class _CaptureUserMemoryInput(UserMemoryEdit):
+    # Custom schemas must accept ToolNode's injected runtime while keeping it
+    # out of the model-facing schema and serialized argument values.
+    runtime: Annotated[Any, InjectedToolArg()] = Field(exclude=True)
 
 
 class FailureLesson(BaseModel):
@@ -871,16 +931,31 @@ def _render_user_memory(memory: UserMemory) -> str:
     )
 
 
-def _parse_user_memory(content: str | None) -> UserMemory:
+def _parse_user_memory(content: str | None, *, strict: bool = False) -> UserMemory:
     if not content:
+        if strict:
+            raise ValueError("现有用户记忆内容缺失，拒绝覆盖")
         return UserMemory()
     match = _FRONTMATTER_RE.search(content)
     if match is None:
+        if strict:
+            raise ValueError("现有用户记忆格式无效，拒绝覆盖")
         return UserMemory()
     try:
         payload = yaml.safe_load(match.group(1))
+        if strict:
+            if not isinstance(payload, dict):
+                raise ValueError("记忆必须包含结构化字段")
+            for name in ("avoid_behaviors", "reinforce_behaviors"):
+                items = payload.get(name, [])
+                if not isinstance(items, list) or len(items) > MAX_BEHAVIOR_ITEMS:
+                    raise ValueError("现有行为列表无效")
+                if any(not isinstance(item, str) or len(item) > 180 for item in items):
+                    raise ValueError("现有行为条目无效")
         return UserMemory.model_validate(payload if isinstance(payload, dict) else {})
     except (yaml.YAMLError, ValidationError, TypeError, ValueError):
+        if strict:
+            raise ValueError("现有用户记忆未通过校验，拒绝覆盖") from None
         logger.warning("用户记忆格式无效，本次按空记忆处理")
         return UserMemory()
 
@@ -898,6 +973,69 @@ def _user_memory_generation(document: dict[str, Any] | None) -> int:
 
     value = document.get("generation", 0) if document else 0
     return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _user_memory_version(document: dict[str, Any] | None) -> int:
+    """Legacy documents start at zero; every write and clear increments version."""
+
+    value = document.get("version", 0) if document else 0
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("用户记忆版本无效，拒绝覆盖")
+    return value
+
+
+class UserMemoryEditConflict(ValueError):
+    """The original entry cannot be located in the freshly read behavior list."""
+
+    def __init__(self, entries: list[str]) -> None:
+        super().__init__("old_text 未唯一匹配当前条目，请依据最新条目修正调用")
+        self.entries = entries
+
+
+def _apply_user_edit(current: UserMemory, edit: UserMemoryEdit) -> UserMemory:
+    """Reapply the original operation to a freshly read version, without an LLM."""
+
+    patch = UserMemoryPatch(action="update")
+    if edit.field in UserPreferences.model_fields:
+        patch.preference_updates = [
+            PreferenceUpdate(field=edit.field, value=edit.value)
+        ]
+    else:
+        values = getattr(current, edit.field)
+        prefix = "avoid" if edit.field == "avoid_behaviors" else "reinforce"
+        opposite = (
+            current.reinforce_behaviors
+            if prefix == "avoid"
+            else current.avoid_behaviors
+        )
+        if (
+            edit.action == "add"
+            and any(item.casefold() == edit.value.casefold() for item in values)
+            and not any(item.casefold() == edit.value.casefold() for item in opposite)
+        ):
+            return current
+        if edit.action in {"replace", "remove"}:
+            matches = [
+                item for item in values if item.casefold() == edit.old_text.casefold()
+            ]
+            if len(matches) != 1:
+                raise UserMemoryEditConflict(list(values))
+            if edit.action == "replace" and matches[0] == edit.value:
+                return current
+            setattr(patch, f"remove_{prefix}", matches)
+        if edit.action in {"add", "replace"}:
+            # Reject overflow instead of letting the historical patch helper drop old entries.
+            remaining = [
+                item
+                for item in values
+                if item not in getattr(patch, f"remove_{prefix}")
+            ]
+            if len(remaining) >= MAX_BEHAVIOR_ITEMS and not any(
+                item.casefold() == edit.value.casefold() for item in remaining
+            ):
+                raise ValueError("行为列表已满，请先删除或合并已有条目")
+            setattr(patch, f"add_{prefix}", [edit.value])
+    return _apply_user_patch(current, patch)
 
 
 def _apply_user_patch(current: UserMemory, patch: UserMemoryPatch) -> UserMemory:
@@ -1128,93 +1266,6 @@ async def _invoke_structured_memory_model(
                 continue
             raise
     raise TypeError("记忆模型未返回有效结果") from last_error
-
-
-@traceable(
-    name="memory.user.consolidate",
-    run_type="chain",
-    process_inputs=lambda _inputs: {"kind": "user_memory"},
-    process_outputs=lambda output: {"action": output.action},
-)
-async def _extract_user_memory_patch(
-    *,
-    current: UserMemory,
-    user_message: str,
-    previous_assistant: str,
-    user_id: str = "",
-    root_run_id: str | None = None,
-    thread_id: str | None = None,
-) -> UserMemoryPatch:
-    prompt = f"""你是用户长期记忆整理器，只输出符合 Schema 的 JSON。
-
-你必须且只能返回以下 UserMemoryPatch 结构，不得增加、遗漏或重命名字段：
-{{
-  "action": "update | discard",
-  "preference_updates": [
-    {{
-      "field": "preferred_output | preferred_chart_type | preferred_currency | preferred_language",
-      "value": "字符串或 null"
-    }}
-  ],
-  "add_avoid": ["需要避免的行为"],
-  "remove_avoid": ["需要撤销的避免行为"],
-  "add_reinforce": ["需要继续保持的行为"],
-  "remove_reinforce": ["需要撤销的保持行为"],
-  "reason": "不超过 200 字的简短原因"
-}}
-
-合法 update 示例：
-{{
-  "action": "update",
-  "preference_updates": [
-    {{"field": "preferred_currency", "value": "CNY"}}
-  ],
-  "add_avoid": [],
-  "remove_avoid": [],
-  "add_reinforce": [],
-  "remove_reinforce": [],
-  "reason": "用户明确表达了跨会话使用人民币结算的偏好"
-}}
-
-合法 discard 示例：
-{{
-  "action": "discard",
-  "preference_updates": [],
-  "add_avoid": [],
-  "remove_avoid": [],
-  "add_reinforce": [],
-  "remove_reinforce": [],
-  "reason": "该要求只适用于当前任务，不属于长期偏好"
-}}
-
-禁止返回 schema_version、updated_at、preferences、avoid_behaviors、
-reinforce_behaviors 等最终 UserMemory 字段。
-
-现有用户记忆：
-{json.dumps(current.model_dump(mode="json"), ensure_ascii=False)}
-
-用户当前原始反馈：
-{user_message}
-
-该反馈所针对的上一条 Assistant 回复：
-{previous_assistant or "（没有关联回复）"}
-
-规则：
-1. 只记录可跨会话复用的明确偏好、明确纠正、不要做什么、做得好继续保持。
-2. 当前任务的一次性输出要求、业务数据、供应商、查询内容、URL、路径、账号和秘密必须丢弃。
-3. preference_updates 只列出明确变化的输出形式、图表类型、币种或语言；value=null 表示
-   用户明确要求清除该字段。未提及的字段绝不能出现在列表中。
-4. avoid/reinforce 使用简短自然语言；用户撤销旧反馈时放入对应 remove 数组。
-5. 新反馈优先于旧记忆；冲突时通过 remove 和 add 清楚表达，不自行补充隐含偏好。
-6. 无稳定信息时 action=discard，其余数组为空。"""
-    result = await _invoke_structured_memory_model(
-        UserMemoryPatch,
-        prompt,
-        user_id=user_id,
-        root_run_id=root_run_id,
-        thread_id=thread_id,
-    )
-    return UserMemoryPatch.model_validate(result)
 
 
 @traceable(
@@ -1928,64 +1979,64 @@ def _job_idempotency_key(
 
 @tool(
     "capture_user_memory",
+    args_schema=_CaptureUserMemoryInput,
     description=(
         "仅当用户明确表达可跨会话复用的偏好、纠正、不要做什么，或对某种做法表示"
-        "今后继续保持时调用。无参数；系统自动捕获当前用户原文及相关上一条回复。"
-        "当前任务的一次性要求不要调用。"
+        "今后继续保持时调用。同步校验并保存，不调用后台记忆模型。"
+        "field 只允许四个 preferred_* 偏好及 avoid_behaviors、reinforce_behaviors。"
+        "固定偏好使用 set 和 value，显式 value=null 清除；行为列表使用 add/replace/remove，"
+        "replace/remove 必须通过 old_text 指定完整原条目，必要时先 read_file 读取最新记忆。"
+        "当前任务的一次性要求不要记录；只在返回 updated/unchanged 时确认保存，"
+        "uncertain 表示写入结果不确定，先读取记忆核实，不盲目重试。"
     ),
 )
-async def capture_user_memory(runtime: ToolRuntime) -> ToolMessage:
-    user_message, previous_assistant = _capture_user_evidence(runtime.state)
-    if not user_message:
-        return ToolMessage(
-            content="未记录：当前状态中没有可识别的用户反馈。",
-            tool_call_id=runtime.tool_call_id,
-            name="capture_user_memory",
-            status="error",
-        )
-    identity_hash = user_hash(runtime)
-    idempotency_key, thread_id = _job_idempotency_key(
-        runtime,
-        kind="user_memory",
-        scope=identity_hash,
-    )
+async def capture_user_memory(
+    field: str,
+    runtime: ToolRuntime,
+    value: str | None = None,
+    action: str = "set",
+    old_text: str | None = None,
+) -> ToolMessage:
     try:
-        async with asyncio.timeout(2):
-            await MEMORY_QUEUE.enqueue(
-                kind="user_memory",
-                scope=identity_hash,
-                idempotency_key=idempotency_key,
-                thread_digest=hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[
-                    :12
-                ],
-                payload={
-                    "user_message": user_message,
-                    "previous_assistant": previous_assistant,
-                },
-                billing_user_id=user_identity(runtime),
-                billing_root_run_id=str(
-                    ((runtime.config or {}).get("metadata", {}) or {}).get(
-                        "token_budget_session_id"
-                    )
-                    or ((runtime.config or {}).get("metadata", {}) or {}).get("run_id")
-                    or ""
-                ),
-                billing_thread_id=thread_id,
-            )
-    except Exception as exc:
-        logger.exception("用户记忆入队失败")
-        return ToolMessage(
-            content=f"未记录用户记忆：{type(exc).__name__}",
-            tool_call_id=runtime.tool_call_id,
-            name="capture_user_memory",
-            status="error",
+        edit = UserMemoryEdit(
+            field=field, action=action, value=value, old_text=old_text
         )
+        user_message, _previous_assistant = _capture_user_evidence(runtime.state)
+        if not user_message:
+            raise ValueError("当前状态中没有可识别的用户反馈")
+        result = await MEMORY_QUEUE.update_user_memory(user_hash(runtime), edit)
+    except ValidationError as exc:
+        # Do not echo rejected input (which may contain secrets) into the conversation.
+        result = {
+            "status": "failed",
+            "error": "; ".join(error["msg"] for error in exc.errors()),
+        }
+    except UserMemoryEditConflict as exc:
+        result = {"status": "failed", "error": str(exc), "current_entries": exc.entries}
+    except ValueError as exc:
+        result = {"status": "failed", "error": str(exc)}
+    except MemoryWriteUncertain:
+        logger.exception("用户记忆写入结果不确定")
+        result = {
+            "status": "uncertain",
+            "error": "无法确认写入结果，请先读取最新记忆核实，不要直接重试",
+        }
+    except Exception as exc:
+        logger.exception("用户记忆更新失败")
+        result = {
+            "status": "failed",
+            "error": f"记忆服务暂不可用：{type(exc).__name__}",
+        }
     return ToolMessage(
-        content="用户记忆已可靠加入后台整理队列。",
+        content=json.dumps(result, ensure_ascii=False),
         tool_call_id=runtime.tool_call_id,
         name="capture_user_memory",
-        status="success",
+        status="success" if result["status"] in {"updated", "unchanged"} else "error",
     )
+
+
+class MemoryWriteUncertain(RuntimeError):
+    """A write was sent, but its acknowledgement could not be confirmed."""
 
 
 class MemoryJobCancelled(RuntimeError):
@@ -2057,6 +2108,25 @@ class MemoryQueue:
                     "source_user_hash": "",
                     "settings_generation": "",
                 },
+            },
+        )
+
+        # Old jobs contain raw feedback, not validated edits. Never interpret them
+        # with a model after the synchronous tool has replaced that write path.
+        await jobs.update_many(
+            {
+                "kind": "user_memory",
+                "status": {"$in": ["pending", "retry", "processing"]},
+            },
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "skip_reason": "user_memory_now_synchronous",
+                    "finished_at": now,
+                    "updated_at": now,
+                    "expires_at": now + timedelta(days=7),
+                },
+                "$unset": {"payload": "", "lease_until": ""},
             },
         )
 
@@ -2173,18 +2243,11 @@ class MemoryQueue:
         billing_root_run_id: str | None = None,
         billing_thread_id: str | None = None,
     ) -> bool:
-        jobs, _leases, memories = await self._collections()
+        if kind == "user_memory":
+            raise ValueError("用户记忆必须通过同步工具修改，不再接受后台任务")
+        jobs, _leases, _memories = await self._collections()
         now = datetime.now(UTC)
         queued_payload = dict(payload)
-        if kind == "user_memory":
-            namespace = user_memory_namespace_from_hash(scope)
-            document = await memories.find_one(
-                {
-                    "namespace_str": _namespace_string(namespace),
-                    "key": USER_MEMORY_KEY,
-                }
-            )
-            queued_payload["memory_generation"] = _user_memory_generation(document)
         inserted: dict[str, Any] = {
             "kind": kind,
             "scope": scope,
@@ -2313,27 +2376,29 @@ class MemoryQueue:
         value: dict[str, Any],
         *,
         expected_generation: int,
+        expected_version: int,
     ) -> bool:
-        """Write only while no concurrent clear has advanced the generation."""
+        """Atomically replace both representations only if the read version still exists."""
 
         _jobs, _leases, memories = await self._collections()
         now = datetime.now(UTC)
-        generation_filter: dict[str, Any]
-        if expected_generation == 0:
-            generation_filter = {
-                "$or": [
-                    {"generation": 0},
-                    {"generation": {"$exists": False}},
-                ]
-            }
-        else:
-            generation_filter = {"generation": expected_generation}
+        # Missing metadata in legacy documents is equivalent to version/generation zero.
+        conditions = []
+        for name, expected in (
+            ("generation", expected_generation),
+            ("version", expected_version),
+        ):
+            conditions.append(
+                {"$or": [{name: 0}, {name: {"$exists": False}}]}
+                if expected == 0
+                else {name: expected}
+            )
         try:
             result = await memories.update_one(
                 {
                     "namespace_str": _namespace_string(namespace),
                     "key": USER_MEMORY_KEY,
-                    **generation_filter,
+                    "$and": conditions,
                 },
                 {
                     "$set": {
@@ -2346,13 +2411,71 @@ class MemoryQueue:
                         "generation": expected_generation,
                         "created_at": now,
                     },
+                    "$inc": {"version": 1},
                 },
-                upsert=True,
+                upsert=expected_version == 0,
             )
         except DuplicateKeyError:
-            # A clear won the race and kept the unique namespace/key document.
+            # Another writer created/updated the unique document; reread before retrying.
             return False
         return result.matched_count > 0 or result.upserted_id is not None
+
+    async def update_user_memory(
+        self, identity_hash: str, edit: UserMemoryEdit
+    ) -> dict[str, Any]:
+        """Bounded compare-and-swap retries; only the requested operation is replayed."""
+
+        namespace = user_memory_namespace_from_hash(identity_hash)
+        initial_generation: int | None = None
+        write_pending = False
+        try:
+            async with asyncio.timeout(_USER_MEMORY_WRITE_TIMEOUT_SECONDS):
+                # The unique namespace/key index also protects two first-time inserts.
+                await self.ensure_indexes()
+                for _attempt in range(_MAX_USER_MEMORY_WRITE_ATTEMPTS):
+                    document = await self._memory_document(namespace, USER_MEMORY_KEY)
+                    generation = _user_memory_generation(document)
+                    if initial_generation is None:
+                        initial_generation = generation
+                    elif generation != initial_generation:
+                        raise ValueError("用户记忆已被清空，本次旧修改已取消")
+                    version = _user_memory_version(document)
+                    current = _parse_user_memory(
+                        _store_content(document), strict=document is not None
+                    )
+                    updated = _apply_user_edit(current, edit)
+                    result = {
+                        "status": "unchanged",
+                        "field": edit.field,
+                        "action": edit.action,
+                        "value": edit.value,
+                        "old_text": edit.old_text,
+                        "version": version,
+                    }
+                    if updated == current:
+                        return result
+                    write_pending = True
+                    written = await self._put_user_memory_file(
+                        namespace,
+                        {
+                            "content": _render_user_memory(updated),
+                            "encoding": "utf-8",
+                            "memory_kind": "user_memory",
+                            "memory": updated.model_dump(mode="json"),
+                        },
+                        expected_generation=generation,
+                        expected_version=version,
+                    )
+                    write_pending = False
+                    if written:
+                        return {**result, "status": "updated", "version": version + 1}
+                raise ValueError("记忆更新繁忙，版本连续冲突，本次未写入")
+        except Exception as exc:
+            if write_pending:
+                # An acknowledgement timeout is not a confirmed version conflict:
+                # the database may have committed, so never replay it automatically.
+                raise MemoryWriteUncertain("用户记忆写入未得到确认") from exc
+            raise
 
     async def clear_user_memory(self, identity_hash: str) -> int:
         """Reset one user's learned preferences and invalidate stale jobs."""
@@ -2381,7 +2504,7 @@ class MemoryQueue:
                     "namespace": list(namespace),
                     "created_at": now,
                 },
-                "$inc": {"generation": 1},
+                "$inc": {"generation": 1, "version": 1},
             },
             upsert=True,
         )
@@ -2480,37 +2603,6 @@ class MemoryQueue:
             victim = min(records, key=_failure_sort_key)
             await self._archive_failure(victim)
             records = [item for item in records if item.lesson_id != victim.lesson_id]
-
-    async def _process_user_memory(self, job: dict[str, Any]) -> None:
-        identity_hash = str(job.get("scope") or "")
-        namespace = user_memory_namespace_from_hash(identity_hash)
-        document = await self._memory_document(namespace, USER_MEMORY_KEY)
-        current = _parse_user_memory(_store_content(document))
-        payload = dict(job.get("payload") or {})
-        expected_generation = int(payload.get("memory_generation", 0))
-        if _user_memory_generation(document) != expected_generation:
-            return
-        patch = await _extract_user_memory_patch(
-            current=current,
-            user_message=str(payload.get("user_message") or ""),
-            previous_assistant=str(payload.get("previous_assistant") or ""),
-            user_id=str(job.get("billing_user_id") or ""),
-            root_run_id=str(job.get("billing_root_run_id") or "") or None,
-            thread_id=str(job.get("billing_thread_id") or "") or None,
-        )
-        updated = _apply_user_patch(current, patch)
-        if updated == current:
-            return
-        await self._put_user_memory_file(
-            namespace,
-            {
-                "content": _render_user_memory(updated),
-                "encoding": "utf-8",
-                "memory_kind": "user_memory",
-                "memory": updated.model_dump(mode="json"),
-            },
-            expected_generation=expected_generation,
-        )
 
     async def _apply_failure_decision(
         self,
@@ -2961,7 +3053,7 @@ class MemoryQueue:
             async with asyncio.timeout(timeout):
                 kind = str(job.get("kind") or "")
                 if kind == "user_memory":
-                    await self._process_user_memory(job)
+                    raise MemoryJobCancelled("user_memory_now_synchronous")
                 elif kind == "failure_lesson":
                     await self._process_failure_lesson(job)
                 elif kind == "failure_review":

@@ -107,19 +107,26 @@ class InMemoryMemoryQueue(memory.MemoryQueue):
         value,
         *,
         expected_generation,
+        expected_version,
     ):
         key = (namespace, memory.USER_MEMORY_KEY)
         current = self.documents.get(key)
         if memory._user_memory_generation(current) != expected_generation:
+            return False
+        if memory._user_memory_version(current) != expected_version:
             return False
         self.documents[key] = {
             "namespace": list(namespace),
             "namespace_str": "/".join(namespace),
             "key": memory.USER_MEMORY_KEY,
             "generation": expected_generation,
+            "version": expected_version + 1,
             "value": value,
         }
         return True
+
+    async def ensure_indexes(self):
+        pass
 
     async def _delete_memory_file(self, namespace, key):
         self.documents.pop((namespace, key), None)
@@ -280,15 +287,16 @@ def test_capture_evidence_uses_visible_user_and_previous_assistant() -> None:
 
 
 @pytest.mark.asyncio
-async def test_capture_user_memory_enqueues_without_model_wait(monkeypatch) -> None:
-    calls: list[dict] = []
+async def test_capture_user_memory_saves_without_queue_or_model(monkeypatch) -> None:
+    queue = InMemoryMemoryQueue()
+    monkeypatch.setattr(memory, "MEMORY_QUEUE", queue)
 
-    class Queue:
-        async def enqueue(self, **kwargs):
-            calls.append(kwargs)
-            return True
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("User memory must not enqueue or call a model")
 
-    monkeypatch.setattr(memory, "MEMORY_QUEUE", Queue())
+    monkeypatch.setattr(queue, "enqueue", forbidden)
+    monkeypatch.setattr(memory, "get_runtime_model", forbidden)
+    monkeypatch.setattr(memory, "metered_model_ainvoke", forbidden)
     runtime = _runtime(
         [
             HumanMessage(content="生成了三个委派"),
@@ -297,16 +305,25 @@ async def test_capture_user_memory_enqueues_without_model_wait(monkeypatch) -> N
         ]
     )
 
-    result = await memory.capture_user_memory.coroutine(runtime=runtime)
+    result = await memory.capture_user_memory.coroutine(
+        field="avoid_behaviors",
+        action="add",
+        value="同一数据任务只委派一次",
+        runtime=runtime,
+    )
 
     assert result.status == "success"
-    assert calls[0]["kind"] == "user_memory"
-    assert len(calls[0]["scope"]) == 64
-    assert calls[0]["payload"] == {
-        "user_message": "以后同一数据任务只委派一次",
-        "previous_assistant": "这是上一条回复",
-    }
-    assert len(calls[0]["idempotency_key"]) == 64
+    content = json.loads(result.content)
+    assert content["status"] == "updated"
+    assert content["value"] == "同一数据任务只委派一次"
+    document = queue.documents[
+        (memory.user_memory_namespace(runtime), memory.USER_MEMORY_KEY)
+    ]
+    assert document["value"]["memory"]["avoid_behaviors"] == ["同一数据任务只委派一次"]
+    assert (
+        memory._parse_user_memory(document["value"]["content"]).model_dump(mode="json")
+        == document["value"]["memory"]
+    )
 
 
 def _review_messages(*, result="No matches found", final="没有查到结果"):
@@ -1407,13 +1424,13 @@ async def test_structured_model_repairs_once_and_detaches_callbacks(
             if len(calls) == 1:
                 raise OutputParserException("bad json")
             return {
-                "parsed": memory.UserMemoryPatch(action="discard"),
+                "parsed": memory.FailureDecision(action="discard"),
                 "raw": AIMessage(content="{}"),
             }
 
     class Model:
         def with_structured_output(self, schema, *, method, include_raw):
-            assert schema is memory.UserMemoryPatch
+            assert schema is memory.FailureDecision
             assert method == "json_mode"
             assert include_raw is True
             return StructuredModel()
@@ -1424,10 +1441,9 @@ async def test_structured_model_repairs_once_and_detaches_callbacks(
     monkeypatch.setattr(memory, "get_runtime_model", runtime_model)
     monkeypatch.setattr(memory, "metered_model_ainvoke", _invoke_without_metering)
 
-    result = await memory._extract_user_memory_patch(
-        current=memory.UserMemory(),
-        user_message="本轮只导出 CSV",
-        previous_assistant="",
+    result = await memory._invoke_structured_memory_model(
+        memory.FailureDecision,
+        "仅返回结构化失败经验决定",
         user_id="test-user",
     )
 
@@ -1435,40 +1451,8 @@ async def test_structured_model_repairs_once_and_detaches_callbacks(
     assert len(calls) == 2
     assert calls[0]["config"]["callbacks"] == []
     assert "memory-internal" in calls[0]["config"]["tags"]
-    assert '"action": "update"' in calls[0]["prompt"]
-    assert '"action": "discard"' in calls[0]["prompt"]
-    assert '"field": "preferred_currency", "value": "CNY"' in calls[0]["prompt"]
-    assert "禁止返回 schema_version" in calls[0]["prompt"]
+    assert "结构化失败经验" in calls[0]["prompt"]
     assert "上一输出未通过" in calls[1]["prompt"]
-
-
-@pytest.mark.asyncio
-async def test_user_memory_job_writes_only_when_patch_changes(monkeypatch) -> None:
-    queue = InMemoryMemoryQueue()
-    identity_hash = "a" * 64
-
-    async def extract(**_kwargs):
-        return memory.UserMemoryPatch(
-            action="update",
-            preference_updates=[
-                memory.PreferenceUpdate(field="preferred_language", value="zh")
-            ],
-            add_avoid=["不要重复委派"],
-        )
-
-    monkeypatch.setattr(memory, "_extract_user_memory_patch", extract)
-    await queue._process_user_memory(
-        {
-            "scope": identity_hash,
-            "payload": {"user_message": "以后不要重复委派"},
-        }
-    )
-
-    namespace = memory.user_memory_namespace_from_hash(identity_hash)
-    document = queue.documents[(namespace, "/MEMORY.md")]
-    restored = memory._parse_user_memory(document["value"]["content"])
-    assert restored.preferences.preferred_language == "zh"
-    assert restored.avoid_behaviors == ["不要重复委派"]
 
 
 @pytest.mark.asyncio
@@ -1840,43 +1824,6 @@ async def test_failure_review_permission_rejects_changed_generation(
 
 
 @pytest.mark.asyncio
-async def test_user_memory_generation_discards_stale_job(monkeypatch) -> None:
-    queue = InMemoryMemoryQueue()
-    identity_hash = "b" * 64
-    namespace = memory.user_memory_namespace_from_hash(identity_hash)
-    queue.documents[(namespace, memory.USER_MEMORY_KEY)] = {
-        "namespace": list(namespace),
-        "namespace_str": "/".join(namespace),
-        "key": memory.USER_MEMORY_KEY,
-        "generation": 2,
-        "value": {
-            "content": memory._render_user_memory(memory.UserMemory()),
-            "encoding": "utf-8",
-        },
-    }
-    called = False
-
-    async def extract(**_kwargs):
-        nonlocal called
-        called = True
-        return memory.UserMemoryPatch(action="discard")
-
-    monkeypatch.setattr(memory, "_extract_user_memory_patch", extract)
-    await queue._process_user_memory(
-        {
-            "scope": identity_hash,
-            "payload": {
-                "memory_generation": 1,
-                "user_message": "旧反馈",
-            },
-        }
-    )
-
-    assert called is False
-    assert queue.documents[(namespace, memory.USER_MEMORY_KEY)]["generation"] == 2
-
-
-@pytest.mark.asyncio
 async def test_clear_user_memory_resets_content_and_cancels_only_user_jobs(
     monkeypatch,
 ) -> None:
@@ -1907,7 +1854,7 @@ async def test_clear_user_memory_resets_content_and_cancels_only_user_jobs(
     assert cancelled == 3
     memory_query, memory_update = memory_updates[0]
     assert memory_query["namespace_str"] == f"{identity_hash}/memories/user"
-    assert memory_update["$inc"] == {"generation": 1}
+    assert memory_update["$inc"] == {"generation": 1, "version": 1}
     restored = memory._parse_user_memory(memory_update["$set"]["value"]["content"])
     assert restored == memory.UserMemory()
     job_query, job_update = job_updates[0]
