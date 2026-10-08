@@ -13,8 +13,7 @@ x-backend-service: &backend-service
     REDIS_USERNAME: ddra
     REDIS_PASSWORD_FILE: /run/secrets/redis_password
     MODEL_PROVIDER_ENCRYPTION_KEY_FILE: /run/secrets/model_provider_key
-    CELERY_BROKER_URL: redis://redis:6379/1
-    CELERY_REDIS_USERNAME: ddra-celery
+    CELERY_BROKER_URL: "${CELERY_BROKER_URL:?请设置现有 RabbitMQ 的 AMQP 连接地址}"
     OPEN_SANDBOX_DOMAIN: opensandbox:8080
     OPEN_SANDBOX_API_KEY: "${OPEN_SANDBOX_API_KEY:?请设置 OPEN_SANDBOX_API_KEY}"
     OPEN_SANDBOX_PROTOCOL: http
@@ -96,7 +95,6 @@ services:
           echo "user default off"
           printf '%s\n' "user langgraph on >$${password} ~* &* +@all -@admin -@dangerous"
           printf '%s\n' "user ddra on >$${password} ~ddra:* &* +ping +time +eval +evalsha +script|load +script|exists +zadd +zrem +zremrangebyscore +zcard +zrange +zscore +pexpire +pttl +set +get +getdel +del +unlink +hget +hset +hmget +hgetall +hdel"
-          printf '%s\n' "user ddra-celery on >$${password} ~ddra-celery:* &* +@all -@admin -@dangerous +eval +evalsha +script|load +script|exists"
         } > /run/redis/users.acl
         exec redis-server \
           --bind 0.0.0.0 \
@@ -117,7 +115,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - 'password="$$(cat /run/secrets/redis_password)"; REDISCLI_AUTH="$$password" redis-cli --user langgraph --no-auth-warning -n 2 ping | grep -qx PONG && REDISCLI_AUTH="$$password" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG && REDISCLI_AUTH="$$password" redis-cli --user ddra-celery --no-auth-warning -n 1 ping | grep -qx PONG'
+        - 'password="$$(cat /run/secrets/redis_password)"; REDISCLI_AUTH="$$password" redis-cli --user langgraph --no-auth-warning -n 2 ping | grep -qx PONG && REDISCLI_AUTH="$$password" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG'
       interval: 5s
       timeout: 3s
       retries: 20
@@ -207,8 +205,7 @@ services:
         REDIS_URL: redis://redis:6379/0
         REDIS_USERNAME: ddra
         REDIS_PASSWORD_FILE: /run/secrets/redis_password
-        CELERY_BROKER_URL: redis://redis:6379/1
-        CELERY_REDIS_USERNAME: ddra-celery
+        CELERY_BROKER_URL: "${CELERY_BROKER_URL:?请设置现有 RabbitMQ 的 AMQP 连接地址}"
         OPEN_SANDBOX_DOMAIN: opensandbox:8080
         OPEN_SANDBOX_API_KEY: "${OPEN_SANDBOX_API_KEY}"
         OPEN_SANDBOX_PROTOCOL: http

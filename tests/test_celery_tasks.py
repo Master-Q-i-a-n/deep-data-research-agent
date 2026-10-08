@@ -2,8 +2,10 @@ import io
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+from celery.exceptions import Reject
 from pydantic import SecretStr
 
 from deep_data_research_agent.core.config import Settings
@@ -15,6 +17,7 @@ from deep_data_research_agent.tools.interaction import _SMTPDeliveryError
 from deep_data_research_agent.workers import app as celery_config
 from deep_data_research_agent.workers.app import celery_app
 from deep_data_research_agent.workers.tasks import email as celery_tasks
+from deep_data_research_agent.workers.tasks import memory as memory_tasks
 
 
 def _settings(**overrides) -> Settings:
@@ -78,31 +81,52 @@ def test_celery_routes_use_three_explicit_queues() -> None:
     assert routes["ddra.mail.send"]["queue"] == "mail"
     assert routes["ddra.maintenance.recover_memory"]["queue"] == "maintenance"
     assert celery_app.conf.task_ignore_result is True
-    assert celery_app.conf.broker_transport_options["global_keyprefix"] == "ddra-celery:"
+    assert celery_app.conf.broker_transport_options == {"confirm_publish": True}
+    assert celery_app.conf.task_acks_on_failure_or_timeout is False
+    assert set(celery_app.amqp.queues) == {"memory", "mail", "maintenance"}
+    for queue in celery_app.conf.task_queues:
+        assert queue.durable
+        assert queue.exchange.name == "ddra"
+        assert queue.queue_arguments["x-dead-letter-exchange"] == "ddra.dead"
+        assert queue.queue_arguments["x-dead-letter-routing-key"] == f"{queue.name}.dead"
+    # Dead-letter destinations must not be registered as consumer queues.
+    declarations = []
+    celery_config._declare_dead_queues("ddra.memory.process", declarations)
+    assert {queue.name for queue in declarations} == {
+        "memory.dead", "mail.dead", "maintenance.dead"
+    }
 
 
-def test_celery_defers_secret_file_read_until_connection(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    password_file = tmp_path / "missing-redis-password"
-    settings = Settings(
-        _env_file=None,
-        redis_password_file=password_file,
-    )
-    monkeypatch.setattr(celery_config, "get_settings", lambda: settings)
+def test_celery_uses_rabbitmq_without_reading_redis_secrets() -> None:
+    with celery_app.connection_for_read() as connection:
+        assert connection.transport.driver_type == "amqp"
+        assert connection.virtual_host == "ddra"
 
-    app = celery_config._SecretFileCelery("lazy-secret-test")
 
-    with pytest.raises(RuntimeError, match="无法读取 Redis 密钥文件"):
-        app.connection_for_write()
+@pytest.mark.parametrize("url", ["redis://localhost/1", "amqp:///ddra", "amqp://localhost:0/ddra"])
+def test_settings_reject_invalid_or_legacy_broker(url) -> None:
+    with pytest.raises(ValueError, match="CELERY_BROKER_URL"):
+        Settings(_env_file=None, celery_broker_url=url)
 
+
+def test_memory_writer_lock_uses_application_redis(monkeypatch, tmp_path) -> None:
+    password_file = tmp_path / "redis-password"
     password_file.write_text("p" * 32, encoding="utf-8")
-    connection = app.connection_for_read()
+    settings = Settings(_env_file=None, redis_password_file=password_file)
+    monkeypatch.setattr(memory_tasks, "get_settings", lambda: settings)
+    client = Mock()
+    client.set.return_value = True
+    connect = Mock(return_value=client)
+    monkeypatch.setattr(memory_tasks.Redis, "from_url", connect)
 
-    assert connection.userid == "ddra-celery"
-    assert connection.password == "p" * 32
-    assert connection.virtual_host == "1"
+    with memory_tasks._memory_writer_lock() as acquired:
+        assert acquired is True
+    assert connect.call_args.args == (settings.redis_url,)
+    assert connect.call_args.kwargs["username"] == "ddra"
+    assert connect.call_args.kwargs["password"] == "p" * 32
+    assert client.set.call_args.args[0] == "ddra:v1:lock:memory-writer"
+    assert client.eval.call_args.args[2:] == client.set.call_args.args
+    client.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -226,3 +250,96 @@ async def test_email_worker_marks_ambiguous_submission_uncertain(
 
     assert await celery_tasks._process_email_delivery(delivery.idempotency_key) is None
     assert finished == ["uncertain"]
+
+
+@pytest.mark.parametrize("failure", ["attachments", "smtp", "retry_exhausted", "internal"])
+@pytest.mark.asyncio
+async def test_email_terminal_failure_is_saved_before_dead_letter(
+    monkeypatch, tmp_path, failure
+) -> None:
+    delivery = _delivery(attempts=3)
+    if failure == "attachments":
+        delivery.pdf_path = None
+    _install_worker_workspace(monkeypatch, tmp_path, delivery)
+    states = []
+
+    async def claim(_delivery_id):
+        return delivery
+
+    async def submitting(_delivery_id, **_kwargs):
+        return delivery
+
+    async def finish(_delivery_id, *, status, **_kwargs):
+        states.append(status)
+        return delivery
+
+    async def schedule(_delivery_id, **_kwargs):
+        # schedule_email_retry persists failed when its attempt budget is exhausted.
+        states.append("failed")
+        return SimpleNamespace(status="failed"), None
+
+    async def close():
+        return None
+
+    def send(*_args, **_kwargs):
+        raise _SMTPDeliveryError("SMTP 失败", retryable=failure == "retry_exhausted")
+
+    async def load(*_args, **_kwargs):
+        raise RuntimeError("附件存储连接中断")
+
+    monkeypatch.setattr(celery_tasks.database, "claim_email_delivery", claim)
+    monkeypatch.setattr(celery_tasks.database, "mark_email_submitting", submitting)
+    monkeypatch.setattr(celery_tasks.database, "finish_email_delivery", finish)
+    monkeypatch.setattr(celery_tasks.database, "schedule_email_retry", schedule)
+    monkeypatch.setattr(celery_tasks.database, "close_database", close)
+    monkeypatch.setattr(celery_tasks, "get_settings", _settings)
+    monkeypatch.setattr(celery_tasks, "_send_smtp_message", send)
+    if failure == "internal":
+        monkeypatch.setattr(celery_tasks, "_load_report_attachments", load)
+
+    with pytest.raises(Reject) as rejected:
+        await celery_tasks._process_email_delivery(delivery.idempotency_key)
+    assert rejected.value.requeue is False
+    assert states == ["failed"]
+
+
+@pytest.mark.parametrize("retry_after", [None, 5])
+@pytest.mark.asyncio
+async def test_memory_failure_preserves_retry_or_signals_terminal_state(
+    monkeypatch, retry_after
+) -> None:
+    from deep_data_research_agent.memory import service as memory
+
+    queue = memory.MemoryQueue()
+    saved = []
+
+    async def process(_job):
+        raise TimeoutError("model timeout")
+
+    async def mark_failed(_job, _error, *, retryable):
+        assert retryable is True
+        saved.append("failed" if retry_after is None else "retry")
+        return retry_after
+
+    monkeypatch.setattr(queue, "_process_failure_review", process)
+    monkeypatch.setattr(queue, "_mark_failed", mark_failed)
+    if retry_after is None:
+        with pytest.raises(memory.MemoryJobFailed):
+            await queue._process_job({"kind": "failure_review"})
+        assert saved == ["failed"]
+    else:
+        assert await queue._process_job({"kind": "failure_review"}) == retry_after
+        assert saved == ["retry"]
+
+
+def test_memory_worker_rejects_terminal_failure(monkeypatch) -> None:
+    from contextlib import nullcontext
+
+    async def failed(_job_id):
+        raise memory_tasks.MemoryJobFailed("已落库的终态失败")
+
+    monkeypatch.setattr(memory_tasks, "_memory_writer_lock", lambda: nullcontext(True))
+    monkeypatch.setattr(memory_tasks, "_process_memory_job", failed)
+    with pytest.raises(Reject) as rejected:
+        memory_tasks.process_memory_job.run("job-id")
+    assert rejected.value.requeue is False

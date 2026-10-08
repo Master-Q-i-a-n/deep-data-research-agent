@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 from celery import Task
+from celery.exceptions import Reject
 
 from deep_data_research_agent.artifacts.service import ArtifactError
 from deep_data_research_agent.core.config import get_settings
@@ -85,25 +86,27 @@ async def _process_email_delivery(delivery_id: str) -> int | None:
             delay = _EMAIL_RETRY_DELAYS[
                 min(max(delivery.attempts - 1, 0), len(_EMAIL_RETRY_DELAYS) - 1)
             ]
-            _record, retry_after = await database.schedule_email_retry(
+            record, retry_after = await database.schedule_email_retry(
                 delivery_id,
                 delay_seconds=delay,
                 error_summary=str(exc),
             )
+            if record.status == "failed":
+                raise Reject("邮件重试已耗尽，详情见数据库投递记录", requeue=False) from exc
             return retry_after
         await database.finish_email_delivery(
             delivery_id,
             status="failed",
             error_summary=str(exc),
         )
-        return None
+        raise Reject("邮件投递已失败，详情见数据库投递记录", requeue=False) from exc
     except (ArtifactError, ValueError) as exc:
         await database.finish_email_delivery(
             delivery_id,
             status="failed",
             error_summary=str(exc),
         )
-        return None
+        raise Reject("邮件附件处理失败，详情见数据库投递记录", requeue=False) from exc
     except Exception as exc:
         logger.exception("后台邮件任务失败（阶段=%s）：%s", phase, delivery_id)
         if phase == "submitting":
@@ -121,7 +124,7 @@ async def _process_email_delivery(delivery_id: str) -> int | None:
             min(max(delivery.attempts - 1, 0), len(_EMAIL_RETRY_DELAYS) - 1)
         ]
         try:
-            _record, retry_after = await database.schedule_email_retry(
+            record, retry_after = await database.schedule_email_retry(
                 delivery_id,
                 delay_seconds=delay,
                 error_summary=f"{type(exc).__name__}: 后台处理失败",
@@ -129,6 +132,8 @@ async def _process_email_delivery(delivery_id: str) -> int | None:
         except Exception:  # noqa: BLE001 - the durable lease is the fallback.
             # The processing lease lets maintenance recover a database outage.
             return None
+        if record.status == "failed":
+            raise Reject("邮件重试已耗尽，详情见数据库投递记录", requeue=False) from exc
         return retry_after
     else:
         try:

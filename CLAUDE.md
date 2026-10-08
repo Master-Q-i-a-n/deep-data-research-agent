@@ -17,17 +17,20 @@ Runtime is multi-user: each user configures their own OpenAI-compatible model pr
 rest, injected per request) or uses the default `OPENAI_*` model in CLI/evals. Persistence topology:
 PostgreSQL (accounts, sessions, thread ownership, token ledger, email deliveries, LangGraph
 checkpoints), MongoDB (Skills + long-term memories), Redis (rate limits, run admission, sandbox
-registry, token-bucket cache, Celery broker), local `data/` or Aliyun OSS for workspace snapshots.
+registry, token-bucket cache, shared failure-memory write lock), RabbitMQ (Celery broker in the `ddra`
+vhost), local `data/` or Aliyun OSS for workspace snapshots.
 
 UI text, system prompts, and error messages are written in Simplified Chinese; keep that convention when
 editing prompts/strings. Never commit real API keys — `.env` is gitignored.
 
 ## Common commands
 
-Backend + sandbox must both be running for any agent execution. Infra (PostgreSQL/MongoDB/Redis), `.env`,
+Backend + sandbox must both be running for any agent execution. Infra (PostgreSQL/MongoDB/Redis/RabbitMQ), `.env`,
 and `.secrets/` must be configured first (README 配置 section). After first-time setup, `.\scripts\dev.ps1`
 starts Redis + OpenSandbox + LangGraph + Celery worker/Beat + frontend in one shot (logs in
-`%TEMP%\deep-data-research-agent\dev-logs/`); add `-SkipRedis -SkipFrontend` to run backend only.
+`%TEMP%\deep-data-research-agent\dev-logs/`); checks the existing RabbitMQ instead of managing its
+container. Initialize its vhost with `.\scripts\setup\rabbitmq.ps1` (details in
+`docs/operations/rabbitmq.md`). Add `-SkipRedis -SkipFrontend` to run backend only.
 
 ```powershell
 # 1. OpenSandbox server (required; agents fail without it)
@@ -189,10 +192,11 @@ injected by LangGraph Auth. Every environment refuses to operate without an auth
 ### Long-term memory and admission controls
 
 `memory/service.py` is the agent-facing memory layer (MongoDB-backed, read-only to agents):
-`/memories/user/MEMORY.md` holds user preferences/feedback (written only by `capture_user_memory`),
+`/memories/user/MEMORY.md` holds user preferences/feedback, synchronously written by
+`capture_user_memory` using MongoDB optimistic concurrency; user edits never enter the task queue.
 `/memories/agent/{agent}/` holds cross-agent public failure lessons (each agent per run records at most
 three). `FailureReviewMiddleware` enqueues a review job automatically; sensitive data is stripped by
-regex before enqueue. Jobs are processed asynchronously by the Celery `memory` queue with leases and
+regex before enqueue. Failure-memory jobs are processed asynchronously by the Celery `memory` queue with leases and
 retries (no Celery result backend — results live in MongoDB/PostgreSQL). Users can disable their
 contribution or clear memories; `uv run reset-agent-memory` wipes all memories and job collections.
 
@@ -203,7 +207,9 @@ marker (`issue_internal_run_marker`). Redis failure is fail-closed for limits; t
 authoritative and only its Redis cache is allowed to fail. `infrastructure/postgres/` owns the PostgreSQL
 checkpointer and the Alembic setup (`setup-agent-postgres` creates migrator/app roles; the app never
 runs `create_all()` or checkpoint `setup()` — migrations run explicitly by deploy). `infrastructure/redis/`
-owns client + lock + key-prefix helpers (`ddra:` app keyspace, `ddra-celery:` Celery keyspace).
+owns client + lock + key-prefix helpers (`ddra:` app keyspace). RabbitMQ owns Celery transport;
+terminal task failures go to `memory.dead`, `mail.dead` or `maintenance.dead`, which workers do not
+consume. Safe retries use `self.retry()`; ambiguous SMTP submission stays `uncertain` in PostgreSQL.
 
 The API layer is in `api/`: custom routes (health in `api/health.py`, auth in `api/auth.py`,
 provider settings, email delivery status) are mounted in `api/app.py`, `enable_custom_route_auth=true`

@@ -2043,6 +2043,10 @@ class MemoryJobCancelled(RuntimeError):
     """Signal that a claimed review lost permission before persistence."""
 
 
+class MemoryJobFailed(RuntimeError):
+    """A terminal failure has been persisted and should be dead-lettered."""
+
+
 class MemoryQueue:
     """MongoDB-backed durable memory jobs and memory documents."""
 
@@ -2284,7 +2288,7 @@ class MemoryQueue:
                 await asyncio.to_thread(publish_memory_job, str(result.upserted_id))
             except Exception:
                 # MongoDB is the outbox. Beat republishes this pending job after
-                # the Redis broker recovers, so accepting it here is still safe.
+                # the broker recovers, so accepting it here is still safe.
                 logger.exception(
                     "发布记忆 Celery 任务失败，等待恢复扫描：%s", result.upserted_id
                 )
@@ -3065,11 +3069,15 @@ class MemoryQueue:
             return None
         except Exception as exc:
             logger.exception("整理长期记忆失败：%s", job.get("_id"))
-            return await self._mark_failed(
+            retry_after = await self._mark_failed(
                 job,
                 exc,
                 retryable=_is_retryable_memory_error(exc),
             )
+            if retry_after is None:
+                # Signal only after saving the terminal state; safe retries stay intact.
+                raise MemoryJobFailed("记忆任务已失败，详情见 MongoDB 任务记录") from exc
+            return retry_after
         else:
             await self._mark_succeeded(job, stats=stats)
             return None

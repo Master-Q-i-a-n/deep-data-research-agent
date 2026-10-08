@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from langchain_openai import ChatOpenAI
 from pydantic import Field, SecretStr, model_validator
@@ -92,11 +93,8 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     redis_max_connections: int = Field(default=20, ge=1, le=200)
     health_check_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
-    # Celery reuses the Redis service but has its own logical DB and ACL user.
-    celery_broker_url: str = "redis://127.0.0.1:16379/1"
-    celery_redis_username: str = "ddra-celery"
-    celery_broker_key_prefix: str = "ddra-celery:"
-    celery_visibility_timeout_seconds: int = Field(default=300, ge=60, le=3600)
+    # Reuse the existing RabbitMQ instance; ddra isolates this project's queues.
+    celery_broker_url: str = "amqp://guest:guest@127.0.0.1:5672/ddra"
     auth_login_limit: int = Field(default=10, ge=1, le=100)
     auth_login_window_seconds: int = Field(default=60, ge=1, le=86400)
     auth_register_limit: int = Field(default=3, ge=1, le=100)
@@ -159,8 +157,6 @@ class Settings(BaseSettings):
             raise ValueError("生产环境 RATE_LIMIT_KEY_SECRET 至少需要 32 个字符")
         if self.app_env == "production" and not self.redis_username.strip():
             raise ValueError("生产环境 REDIS_USERNAME 不能为空")
-        if self.app_env == "production" and not self.celery_redis_username.strip():
-            raise ValueError("生产环境 CELERY_REDIS_USERNAME 不能为空")
         if self.app_env == "production" and self.workspace_storage_backend != "oss":
             raise ValueError("生产环境 WORKSPACE_STORAGE_BACKEND 必须为 oss")
         if self.workspace_storage_backend == "oss":
@@ -176,11 +172,12 @@ class Settings(BaseSettings):
             ]
             if missing:
                 raise ValueError(f"OSS 工作区存储缺少配置：{'、'.join(missing)}")
-        if (
-            not self.celery_broker_key_prefix
-            or self.celery_broker_key_prefix.startswith("ddra:")
-        ):
-            raise ValueError("CELERY_BROKER_KEY_PREFIX 必须与应用 ddra:* 键空间隔离")
+        broker = urlsplit(self.celery_broker_url)
+        if broker.scheme not in {"amqp", "amqps"} or not broker.hostname:
+            raise ValueError("CELERY_BROKER_URL 必须是有效的 RabbitMQ AMQP URL")
+        # Accessing port also rejects malformed/non-numeric ports before startup.
+        if broker.port is not None and broker.port == 0:
+            raise ValueError("CELERY_BROKER_URL 端口不能为 0")
         if self.sandbox_lock_lease_seconds <= self.sandbox_lock_renew_seconds * 2:
             raise ValueError("SANDBOX_LOCK_LEASE_SECONDS 必须大于两倍续租间隔")
         return self

@@ -1,4 +1,4 @@
-"""Celery task that processes durable user-memory jobs."""
+"""Celery task that processes durable shared failure-memory jobs."""
 
 from __future__ import annotations
 
@@ -9,12 +9,15 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from celery import Task
+from celery.exceptions import Reject
 from redis import Redis
 
 from deep_data_research_agent.core.config import get_settings
 from deep_data_research_agent.database import repository as database
-from deep_data_research_agent.memory.service import MEMORY_QUEUE
-from deep_data_research_agent.workers.app import celery_app, celery_broker_url
+from deep_data_research_agent.infrastructure.redis.client import redis_password
+from deep_data_research_agent.infrastructure.redis.keys import KEY_PREFIX
+from deep_data_research_agent.memory.service import MEMORY_QUEUE, MemoryJobFailed
+from deep_data_research_agent.workers.app import celery_app
 
 logger = logging.getLogger(__name__)
 _MEMORY_LOCK_RELEASE_SCRIPT = """
@@ -31,12 +34,15 @@ def _memory_writer_lock() -> Iterator[bool]:
 
     settings = get_settings()
     client = Redis.from_url(
-        celery_broker_url(),
+        settings.redis_url,
+        username=settings.redis_username,
+        password=redis_password(settings.redis_password_file),
         decode_responses=True,
         socket_connect_timeout=settings.redis_connect_timeout_seconds,
         socket_timeout=settings.redis_socket_timeout_seconds,
     )
-    key = f"{settings.celery_broker_key_prefix}lock:memory-writer"
+    # The shared-index lock belongs to application Redis, independently of AMQP.
+    key = f"{KEY_PREFIX}:lock:memory-writer"
     token = secrets.token_hex(16)
     acquired = False
     try:
@@ -79,10 +85,14 @@ async def _process_memory_job(job_id: str) -> int | None:
 def process_memory_job(self: Task, job_id: str) -> dict[str, object]:
     """Process one idempotent MongoDB memory job."""
 
-    with _memory_writer_lock() as acquired:
-        if not acquired:
-            raise self.retry(countdown=2, max_retries=None)
-        retry_after = asyncio.run(_process_memory_job(job_id))
+    try:
+        with _memory_writer_lock() as acquired:
+            if not acquired:
+                raise self.retry(countdown=2, max_retries=None)
+            retry_after = asyncio.run(_process_memory_job(job_id))
+    except MemoryJobFailed as exc:
+        # MongoDB already records the terminal failure; preserve this message in DLQ.
+        raise Reject(str(exc), requeue=False) from exc
     if retry_after is not None:
         raise self.retry(countdown=retry_after, max_retries=None)
     return {"status": "handled", "job_id": job_id}

@@ -1,8 +1,8 @@
 # Redis 限流运维说明
 
 项目使用 `compose.redis.yaml` 构建并管理 `deep-data-research-agent/redis:7.4`。容器名为
-`ddra-redis`，数据保存在 `ddra-redis-data` 卷。限流和 Token 桶使用 DB 0；Celery Broker
-复用同一容器的 DB 1。两者都不依赖容器 ID、容器 IP，也不把 ACL 密码写入 `.env`。
+`ddra-redis`，数据保存在 `ddra-redis-data` 卷。限流、Token 桶及共享失败经验写入锁使用
+DB 0。Celery Broker 使用独立的 RabbitMQ。Redis 不依赖容器 ID、容器 IP，ACL 密码不写入 `.env`。
 
 ## Token 桶一致性
 
@@ -34,19 +34,16 @@
 1. 创建 `.secrets/redis_password`（64 位随机十六进制密码，已被 Git 忽略）。
 2. 校验 Compose 配置。
 3. 若检测到本项目旧的 `redis` 容器，直接移除旧容器及 `redis-data` 卷。
-4. 构建项目镜像并启动 `ddra-redis`，验证健康检查、匿名访问拒绝以及 `ddra`、
-   `ddra-celery` 用户认证。
+4. 构建项目镜像并启动 `ddra-redis`，验证健康检查、匿名访问拒绝以及 `ddra` 用户认证。
 
 脚本可以重复执行。不要提交 `.secrets/` 或 `.redis-backups/`。
 
 ## 安全与持久化
 
 - 容器内仍监听 6379，宿主机只发布到 `127.0.0.1:16379`，不接受外部网络连接。
-- `default` 用户关闭；`ddra` 只能访问 `ddra:*`，`ddra-celery` 只能访问
-  `ddra-celery:*`。两个ACL用户复用同一密码文件。
+- `default` 用户关闭；`ddra` 只能访问 `ddra:*`。
 - ACL 只开放 PING、TIME、项目 Lua 脚本及 ZSET、HASH、TTL、锁所需命令。
-- Celery消息只保存MongoDB/PostgreSQL任务ID，不保存附件、提示词或邮件正文；业务数据库是
-  权威任务状态，Beat每30秒恢复漏发和租约过期任务。
+- Celery 消息路由、重试与死信处理见 [RabbitMQ 运维说明](rabbitmq.md)。
 - AOF 使用 `appendfsync everysec`，同时保留 RDB 快照。
 - `maxmemory` 为 256 MB，策略为 `noeviction`；内存耗尽时请求会失败，应用返回 503，避免静默
   丢失限流数据。
@@ -59,7 +56,6 @@ docker compose -f .\compose.redis.yaml config --quiet
 docker inspect ddra-redis --format '{{.State.Health.Status}}'
 docker exec ddra-redis redis-cli --no-auth-warning PING
 docker exec ddra-redis sh -c 'REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli --user ddra --no-auth-warning PING'
-docker exec ddra-redis sh -c 'REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli --user ddra-celery --no-auth-warning -n 1 PING'
 docker exec ddra-redis sh -c 'grep -E "^(appendonly|appendfsync|maxmemory|maxmemory-policy) " /usr/local/etc/redis/redis.conf'
 docker exec ddra-redis sh -c 'test -d /data/appendonlydir && echo "AOF directory OK"'
 ```

@@ -162,6 +162,21 @@ if (-not $SkipRedis) {
     }
 }
 
+Write-Host "Checking existing RabbitMQ and declaring task/dead-letter queues..."
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = "Continue"
+    & $uv run python -c "from deep_data_research_agent.workers.app import declare_task_queues; declare_task_queues()" 2>$null
+    $rabbitCheckExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($rabbitCheckExitCode -ne 0) {
+    throw "RabbitMQ is not ready. Check CELERY_BROKER_URL and run scripts/setup/rabbitmq.ps1 against the existing container."
+}
+Write-Host "[ready]   RabbitMQ"
+
 if (-not $SkipFrontend) {
     $frontendDirectory = Join-Path $workspaceRoot "frontend"
     $frontendEnv = Join-Path $frontendDirectory ".env.local"
@@ -223,12 +238,14 @@ try {
         -WorkingDirectory $workspaceRoot
     Wait-DevPort -Name "LangGraph" -Port 2024
 
+    # RabbitMQ 4.3 rejects the transient non-exclusive queues used by mingle/gossip.
     Start-DevProcess `
         -Name "celery-worker" `
         -Executable $uv `
         -Arguments @(
             "run", "celery", "-A", "deep_data_research_agent.workers.app:celery_app",
-            "worker", "--pool=solo", "-Q", "memory,mail,maintenance", "--loglevel=INFO"
+            "worker", "--pool=solo", "-Q", "memory,mail,maintenance", "--loglevel=INFO",
+            "--without-mingle", "--without-gossip"
         ) `
         -WorkingDirectory $workspaceRoot
     Start-DevProcess `

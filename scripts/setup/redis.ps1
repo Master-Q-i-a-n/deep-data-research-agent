@@ -73,9 +73,5 @@ $authenticated = (docker exec $containerName sh -c 'REDISCLI_AUTH="$(cat /run/se
 if ($authenticated -ne "PONG") {
     throw "Redis ACL 认证验证失败"
 }
-$celeryAuthenticated = (docker exec $containerName sh -c 'REDISCLI_AUTH="$(cat /run/secrets/redis_password)" redis-cli --user ddra-celery --no-auth-warning -n 1 PING').Trim()
-if ($celeryAuthenticated -ne "PONG") {
-    throw "Celery Redis ACL 认证验证失败"
-}
 
 Write-Output "Redis 已由 Compose 管理，项目镜像、16379 端口和 ACL 验证通过。"

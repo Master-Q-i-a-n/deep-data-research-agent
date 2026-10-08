@@ -24,7 +24,12 @@ async def _recover_memory_jobs() -> list[str]:
         await MEMORY_QUEUE.close()
 
 
-@celery_app.task(name="ddra.maintenance.recover_memory", ignore_result=True)
+@celery_app.task(
+    name="ddra.maintenance.recover_memory",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def recover_memory_jobs() -> dict[str, int]:
     """Republish MongoDB jobs whose broker message was lost or expired."""
 
@@ -46,7 +51,12 @@ async def _recover_email_deliveries() -> list[str]:
         await database.close_database()
 
 
-@celery_app.task(name="ddra.maintenance.recover_mail", ignore_result=True)
+@celery_app.task(
+    name="ddra.maintenance.recover_mail",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def recover_email_deliveries() -> dict[str, int]:
     """Republish safe deliveries and terminalize stale SMTP submissions."""
 

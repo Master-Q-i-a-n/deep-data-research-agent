@@ -72,10 +72,10 @@ Skill 变更从下一次 Agent 执行起生效。运行中的任务可能仍使�
 
 ## 本地启动
 
-项目包含 Python 后端与 React 前端。本地运行需要准备 Python、uv、Node.js，以及 PostgreSQL、MongoDB、Redis 和 OpenSandbox 等依赖服务；网页检索还需配置相应服务凭据。
+项目包含 Python 后端与 React 前端。本地运行需要准备 Python、uv、Node.js，以及 PostgreSQL、MongoDB、Redis、RabbitMQ 和 OpenSandbox 等依赖服务；网页检索还需配置相应服务凭据。
 
 1. 复制根目录的 `.env.example` 为 `.env`，按模板完成环境配置和模型凭据加密密钥配置。
-2. 按 [PostgreSQL 配置说明](docs/operations/postgres.md) 和 [Redis 配置说明](docs/operations/redis.md) 初始化依赖，并确认 MongoDB、OpenSandbox 可用。
+2. 按 [PostgreSQL 配置说明](docs/operations/postgres.md)、[Redis 配置说明](docs/operations/redis.md) 和 [RabbitMQ 配置说明](docs/operations/rabbitmq.md) 初始化依赖，并确认 MongoDB、OpenSandbox 可用。RabbitMQ 复用已有容器，默认 `guest/guest`，项目使用 `ddra` vhost。
 3. 在 Windows PowerShell 中，从项目根目录启动开发环境：
 
 ```powershell
@@ -90,4 +90,5 @@ Skill 变更从下一次 Agent 执行起生效。运行中的任务可能仍使�
 - [架构设计](docs/architecture/design.md)
 - [PostgreSQL 配置与维护](docs/operations/postgres.md)
 - [Redis 配置与维护](docs/operations/redis.md)
+- [RabbitMQ、任务重试与死信队列](docs/operations/rabbitmq.md)
 - [PostgreSQL 数据源接入](docs/operations/postgres-mcp.md)

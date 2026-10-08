@@ -20,7 +20,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - 'password="$$(cat /run/secrets/redis_password)"; REDISCLI_AUTH="$$password" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG && REDISCLI_AUTH="$$password" redis-cli --user ddra-celery --no-auth-warning -n 1 ping | grep -qx PONG'
+        - 'password="$$(cat /run/secrets/redis_password)"; REDISCLI_AUTH="$$password" redis-cli --user ddra --no-auth-warning ping | grep -qx PONG'
       interval: 5s
       timeout: 3s
       retries: 12

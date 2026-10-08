@@ -1,14 +1,13 @@
-"""Celery broker configuration and small task publishing helpers."""
+"""RabbitMQ task topology, dead-letter destinations and publishing helpers."""
 
 from __future__ import annotations
 
 import asyncio
 import sys
-from pathlib import Path
-from urllib.parse import quote, urlsplit, urlunsplit
 
 from celery import Celery
-from celery.signals import worker_process_shutdown
+from celery.signals import before_task_publish, worker_process_shutdown
+from kombu import Exchange, Queue
 
 from deep_data_research_agent.core.config import get_settings
 
@@ -17,51 +16,39 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-def _redis_password(path: Path) -> str:
-    """Read the shared Docker secret without copying it into .env."""
-
-    try:
-        password = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise RuntimeError(f"无法读取 Redis 密钥文件：{path}") from exc
-    if len(password) < 32:
-        raise RuntimeError("Redis 密钥至少需要 32 个字符")
-    return password
-
-
-def celery_broker_url() -> str:
-    """Add ACL credentials to the configured non-secret broker URL."""
-
-    settings = get_settings()
-    parsed = urlsplit(settings.celery_broker_url)
-    if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
-        raise ValueError("CELERY_BROKER_URL 必须是有效的 Redis URL")
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    if parsed.port is not None:
-        host = f"{host}:{parsed.port}"
-    username = quote(settings.celery_redis_username, safe="")
-    password = quote(_redis_password(settings.redis_password_file), safe="")
-    return urlunsplit(
-        (parsed.scheme, f"{username}:{password}@{host}", parsed.path, parsed.query, "")
+_settings = get_settings()
+_task_exchange = Exchange("ddra", type="direct", durable=True)
+_dead_exchange = Exchange("ddra.dead", type="direct", durable=True)
+_queue_names = ("memory", "mail", "maintenance")
+_task_queues = tuple(
+    Queue(
+        name,
+        exchange=_task_exchange,
+        routing_key=name,
+        durable=True,
+        queue_arguments={
+            "x-queue-type": "classic",
+            "x-dead-letter-exchange": _dead_exchange.name,
+            "x-dead-letter-routing-key": f"{name}.dead",
+        },
     )
+    for name in _queue_names
+)
+# Dead queues are declared separately, so ordinary workers never consume them.
+_dead_queues = tuple(
+    Queue(
+        f"{name}.dead",
+        exchange=_dead_exchange,
+        routing_key=f"{name}.dead",
+        durable=True,
+        queue_arguments={"x-queue-type": "classic"},
+    )
+    for name in _queue_names
+)
 
-
-class _SecretFileCelery(Celery):
-    """Resolve the password-backed broker URL only when a connection is needed."""
-
-    def connection_for_read(self, url=None, **kwargs):
-        """Create a consumer connection without reading secrets during import."""
-
-        return super().connection_for_read(url or celery_broker_url(), **kwargs)
-
-    def connection_for_write(self, url=None, **kwargs):
-        """Create a producer connection without reading secrets during import."""
-
-        return super().connection_for_write(url or celery_broker_url(), **kwargs)
-
-
-celery_app = _SecretFileCelery(
+celery_app = Celery(
     "deep-data-research-agent",
+    broker=_settings.celery_broker_url,
     include=[
         "deep_data_research_agent.workers.tasks.memory",
         "deep_data_research_agent.workers.tasks.email",
@@ -69,26 +56,29 @@ celery_app = _SecretFileCelery(
     ],
 )
 
-_settings = get_settings()
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
     task_ignore_result=True,
+    task_default_queue="maintenance",
+    task_default_exchange="ddra",
+    task_default_exchange_type="direct",
+    task_default_routing_key="maintenance",
+    task_default_delivery_mode="persistent",
+    task_queues=_task_queues,
+    task_create_missing_queues=False,
+    # Late-acked unhandled failures are rejected without requeue and go to DLX.
+    # Domain-level safe retries continue to use self.retry() explicitly.
+    task_acks_on_failure_or_timeout=False,
     timezone="Asia/Shanghai",
     enable_utc=True,
     worker_prefetch_multiplier=1,
     worker_enable_remote_control=False,
     task_send_sent_event=False,
     broker_connection_retry_on_startup=True,
-    broker_transport_options={
-        "global_keyprefix": _settings.celery_broker_key_prefix,
-        "visibility_timeout": _settings.celery_visibility_timeout_seconds,
-        "socket_connect_timeout": _settings.redis_connect_timeout_seconds,
-        "socket_timeout": max(5.0, _settings.redis_socket_timeout_seconds),
-        "health_check_interval": 30,
-        "max_connections": 20,
-    },
+    broker_connection_timeout=5,
+    broker_transport_options={"confirm_publish": True},
     task_routes={
         "ddra.memory.process": {"queue": "memory"},
         "ddra.mail.send": {"queue": "mail"},
@@ -106,6 +96,24 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@before_task_publish.connect
+def _declare_dead_queues(sender=None, declare=None, **_kwargs) -> None:
+    """Declare dead-letter destinations before a ddra task can be delivered."""
+
+    if sender and sender.startswith("ddra.") and declare is not None:
+        # Kombu caches declarations per connection, avoiding repeated broker calls.
+        declare.extend(_dead_queues)
+
+
+def declare_task_queues() -> None:
+    """Check AMQP credentials/vhost and provision the project's six queues."""
+
+    with celery_app.connection_for_write() as connection:
+        connection.ensure_connection(max_retries=0)
+        for queue in (*_dead_queues, *_task_queues):
+            queue(connection.default_channel).declare()
 
 
 @worker_process_shutdown.connect
@@ -145,7 +153,7 @@ def publish_email_delivery(delivery_id: str) -> None:
 
 __all__ = [
     "celery_app",
-    "celery_broker_url",
+    "declare_task_queues",
     "publish_email_delivery",
     "publish_memory_job",
 ]
