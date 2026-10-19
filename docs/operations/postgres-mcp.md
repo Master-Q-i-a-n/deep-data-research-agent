@@ -45,6 +45,29 @@ docker start deep-data-postgres-mcp
 
 ## 业务注释与结构探查
 
+### 工作台数据浏览
+
+侧边栏的「数据源与查询」复用此 MCP 数据源，不额外连接应用账户数据库，
+也不需要用户配置模型。所有接口都要求登录；当前部署中的登录用户共享 MCP
+只读账号可访问的业务表，实际可见范围由此账号的 schema 使用权限与整表 SELECT
+权限决定。系统 schema 和单独的分区子表不显示。
+
+- `GET /data/catalog`：读取可访问的表及业务说明。
+- `GET /data/table?schema_name=...&table_name=...`：读取字段、类型、空值约束与主键。
+- `POST /data/query`：接收表、字段筛选、条件组合和分页，返回总数与本页真实数据。
+- `POST /data/export`：按相同筛选与显示字段导出 CSV，忽略当前页码。
+
+接口不接受任意 SQL。表、字段按实际元数据校验，标识和值分别引用后生成只读查询。
+时间戳字段的按日筛选包含整天，日期范围包含结束日期；时间仍按数据库原始时区展示。
+每页可选 20、50 或 100 条，最多组合 12 个筛选条件；导出复用
+`POSTGRES_MCP_EXPORT_ROWS` 与 `POSTGRES_MCP_EXPORT_BYTES` 上限。
+CSV 使用带 BOM 的 UTF-8，文本公式前缀转义；数值不受转义影响。
+
+新增表优先通过中文数据库注释提供业务名称与说明。Olist 表和常用字段有中文展示名称；
+未提供中文名称的其他表使用「数据表 N」，真实表名仅用于接口标识和搜索。
+
+### Agent 结构探查
+
 `database_list_schemas` 在 MCP 的 schema 列表中补充 `schema_comment`。
 `database_get_object_details` 对表和视图补充 `basic.comment`、各字段的
 `comment`，并以系统目录中的实际约束更新 `constraints`。约束包含 `name`、

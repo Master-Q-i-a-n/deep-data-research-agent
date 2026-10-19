@@ -6,6 +6,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useThreadRunManager } from "./features/chat/useThreadRunManager";
 import SkillManagement from "./features/skills/SkillManagement";
+import DataExplorer from "./features/data-browser/DataExplorer";
+import ColumnResizeHandle from "./features/layout/ColumnResizeHandle";
 import SessionHistory, { type ConversationThread } from "./features/threads/SessionHistory";
 import SubagentPlanPanel from "./features/tasks/SubagentPlanPanel";
 import TodoPanel, { type TodoItem } from "./features/tasks/TodoPanel";
@@ -1229,6 +1231,16 @@ export default function App() {
     () => new URLSearchParams(window.location.search).get("thread") ?? undefined,
   );
   const [input, setInput] = useState("");
+  const [workspaceView, setWorkspaceView] = useState<"chat" | "data">("chat");
+  const [dataVisited, setDataVisited] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState<number>();
+  useLayoutEffect(() => {
+    if (workspaceView !== "data") return undefined;
+    const previousOverflow = document.body.style.overflow;
+    // 数据页限定在窗口内，滚动只交给表列表、筛选条件和结果区域。
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previousOverflow; };
+  }, [workspaceView]);
   const [composerInputHeight, setComposerInputHeight] = useState(COMPOSER_TEXTAREA_MIN_HEIGHT);
   const [authToken, setAuthToken] = useState<string | null>(
     () => window.localStorage.getItem(AUTH_TOKEN_KEY),
@@ -1338,6 +1350,12 @@ export default function App() {
   );
   const runManager = useThreadRunManager(graphClient, assistantId);
   const authReady = authStatus === "ready";
+  useEffect(() => {
+    if (!authReady) {
+      setWorkspaceView("chat");
+      setDataVisited(false);
+    }
+  }, [authReady]);
   const workspaceLocked = !authReady;
   const providerReady = providerConfigured === true;
   useEffect(() => {
@@ -2266,6 +2284,7 @@ export default function App() {
   }, [authReady, currentQueueSize, presentRunAdmissionError, requestRunAdmission, stream.isLoading, stream.submit, tasks, threadId, trackedTasks]);
 
   useEffect(() => {
+    if (workspaceView !== "chat") return undefined;
     const updateAutoFollow = () => {
       const atBottom = viewportAtBottom();
       autoFollowRef.current = atBottom;
@@ -2277,9 +2296,11 @@ export default function App() {
       window.removeEventListener("scroll", updateAutoFollow);
       window.removeEventListener("resize", updateAutoFollow);
     };
-  }, []);
+  }, [workspaceView]);
 
   useLayoutEffect(() => {
+    // 数据页打开时，对话可继续运行，但新消息不能滚动数据浏览页面。
+    if (workspaceView !== "chat") return;
     if (!autoFollowRef.current) {
       setShowJumpToBottom(true);
       return;
@@ -2287,10 +2308,10 @@ export default function App() {
     // 只有用户原本位于底部时才跟随新内容；滚轮离开底部后保持阅读位置。
     scrollViewportToBottom();
     setShowJumpToBottom(false);
-  }, [compactFollowKey, rows, showDetails, stream.isLoading]);
+  }, [compactFollowKey, rows, showDetails, stream.isLoading, workspaceView]);
 
   useEffect(() => {
-    if (!showDetails) return undefined;
+    if (!showDetails || workspaceView !== "chat") return undefined;
     const conversation = conversationRef.current;
     if (!conversation || typeof ResizeObserver === "undefined") return undefined;
     // 子智能体过程会在 rows 不变时持续增高，监听真实布局变化才能保持贴底。
@@ -2301,7 +2322,7 @@ export default function App() {
     });
     observer.observe(conversation);
     return () => observer.disconnect();
-  }, [showDetails]);
+  }, [showDetails, workspaceView]);
 
   async function createThreadForUpload(firstFilename: string): Promise<string> {
     if (!authReady) throw new Error("请先登录");
@@ -2721,6 +2742,7 @@ export default function App() {
 
   function startNewThread() {
     if (!authReady || threadAllocating || filesUploading || interruptSubmitting) return;
+    setWorkspaceView("chat");
     if (threadId) runManager.markDetached(threadId);
     setThreadAllocating(false);
     setThreadId(undefined);
@@ -2731,7 +2753,9 @@ export default function App() {
   }
 
   function selectSession(nextThreadId: string) {
-    if (!authReady || nextThreadId === threadId || threadAllocating || filesUploading || interruptSubmitting) return;
+    if (!authReady || threadAllocating || filesUploading || interruptSubmitting) return;
+    setWorkspaceView("chat");
+    if (nextThreadId === threadId) return;
     if (threadId) runManager.markDetached(threadId);
     setThreadId(nextThreadId);
     setInput("");
@@ -3063,13 +3087,16 @@ export default function App() {
   }
 
   return (
-    <div className={`workspace-shell${showDetails ? "" : " workspace-shell--compact"}`}>
+    <div
+      className={`workspace-shell${showDetails && workspaceView === "chat" ? "" : " workspace-shell--compact"}${workspaceView === "data" ? " workspace-shell--data" : ""}`}
+      style={sidebarWidth === undefined ? undefined : { "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+    >
       <aside className="sidebar">
         <div className="brand">
           <BrandMark />
           <div>
             <strong>深研</strong>
-            <span>网页与文件数据工作台</span>
+            <span>数据分析与资料研究</span>
           </div>
         </div>
 
@@ -3085,6 +3112,17 @@ export default function App() {
           </svg>
           <span>开始新任务</span>
         </button>
+
+        <nav className="workspace-nav" aria-label="工作台导航">
+          <button type="button" aria-current={workspaceView === "chat" ? "page" : undefined} onClick={() => setWorkspaceView("chat")}>
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-2 2V11.5A8.5 8.5 0 0 1 10.5 3h2a8.5 8.5 0 0 1 8.5 8.5Z" /><path d="M7 11h10M7 15h6" /></svg>
+            会话
+          </button>
+          <button type="button" disabled={workspaceLocked} aria-current={workspaceView === "data" ? "page" : undefined} onClick={() => { setDataVisited(true); setWorkspaceView("data"); }}>
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" /></svg>
+            数据源与查询
+          </button>
+        </nav>
 
         <SessionHistory
           sessions={sessions}
@@ -3152,10 +3190,12 @@ export default function App() {
           {!authMode && authError ? <p className="account-card__error">{authError}</p> : null}
         </section>
 
+        <ColumnResizeHandle label="调整主侧栏宽度" defaultWidth={window.innerWidth <= 1280 ? 250 : 282} minWidth={220} maxWidth={380} remainingWidth={560} onResize={setSidebarWidth} />
       </aside>
 
       <main
         className="main-panel"
+        hidden={workspaceView !== "chat"}
         style={{ "--composer-input-height": `${composerInputHeight}px` } as CSSProperties}
       >
         <header className="topbar">
@@ -3539,7 +3579,11 @@ export default function App() {
         </form>
       </main>
 
-      {showDetails ? (
+      {dataVisited && authReady && authToken ? (
+        <DataExplorer key={authUser.id} apiUrl={apiUrl} token={authToken} hidden={workspaceView !== "data"} onExpired={expireAuthentication} />
+      ) : null}
+
+      {showDetails && workspaceView === "chat" ? (
         <aside className="operations-rail" aria-label="研究执行状态">
           <TaskTrace
             tasks={tasks}

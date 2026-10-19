@@ -153,7 +153,7 @@ def _extract_text(result: Any) -> str:
 async def _invoke_remote_tool(
     tool_name: str,
     arguments: dict[str, Any],
-    runtime: ToolRuntime,
+    runtime: ToolRuntime | None,
 ) -> Any:
     tools = await _load_remote_tools()
     remote_tool = tools[tool_name]
@@ -163,13 +163,14 @@ async def _invoke_remote_tool(
     # into LangSmith while keeping the MCP lifecycle observable.
     with tracing_context(enabled=False):
         async with asyncio.timeout(settings.postgres_mcp_tool_timeout_seconds):
-            return await remote_tool.ainvoke(arguments, config=runtime.config)
+            # HTTP 数据浏览复用只读通道，但不创建 Agent 运行或沙箱。
+            return await remote_tool.ainvoke(arguments, config=runtime.config if runtime else None)
 
 
 async def _invoke_text(
     tool_name: str,
     arguments: dict[str, Any],
-    runtime: ToolRuntime,
+    runtime: ToolRuntime | None,
 ) -> str:
     """Retry only transport/session failures; server SQL errors are deterministic."""
 

@@ -29,11 +29,14 @@ code, pre {
 }
 
 .workspace-shell {
+  --sidebar-default-width: 282px;
+  /* 所有视图和固定输入框共用实际侧栏宽度，窗口变窄时为内容区保留空间。 */
+  --workspace-sidebar-width: clamp(220px, var(--sidebar-width, var(--sidebar-default-width)), min(380px, calc(100vw - 560px)));
   min-height: 100vh;
   display: grid;
-  grid-template-columns: minmax(250px, 282px) minmax(0, 1fr) minmax(280px, 318px);
+  grid-template-columns: var(--workspace-sidebar-width) minmax(0, 1fr) minmax(280px, 318px);
 }
-.workspace-shell--compact { grid-template-columns: minmax(250px, 282px) minmax(0, 1fr); }
+.workspace-shell--compact { grid-template-columns: var(--workspace-sidebar-width) minmax(0, 1fr); }
 
 .sidebar {
   display: flex;
@@ -146,7 +149,7 @@ code, pre {
 .subagent-plan-panel li span { color: rgba(238, 246, 247, 0.76); font-size: 0.63rem; line-height: 1.4; }
 .subagent-plan-panel li small { color: rgba(185, 218, 221, 0.42); font-size: 0.54rem; }
 
-.session-history { min-height: 140px; flex: 1; overflow-y: auto; padding: 18px 3px 18px 0; border-top: 1px solid rgba(255, 255, 255, 0.09); scrollbar-color: rgba(114, 211, 200, 0.25) transparent; }
+.session-history { min-height: 0; flex: 1; overflow-y: auto; padding: 18px 3px 18px 0; border-top: 1px solid rgba(255, 255, 255, 0.09); scrollbar-color: rgba(114, 211, 200, 0.25) transparent; }
 .session-history__heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; }
 .session-history__heading h2 { margin: 0; font-size: 0.92rem; }
 .session-history__heading > div:last-child { display: flex; align-items: center; gap: 6px; }
@@ -787,7 +790,7 @@ code, pre {
 .working-card button { padding: 6px 9px; color: var(--muted); cursor: pointer; border: 1px solid var(--line); border-radius: 7px; background: transparent; font-size: 0.68rem; }
 .jump-to-bottom {
   position: fixed;
-  left: calc(50% - 18px);
+  left: calc(50% + (var(--workspace-sidebar-width) - 318px) / 2);
   bottom: 164px;
   z-index: 7;
   padding: 7px 11px;
@@ -931,9 +934,9 @@ code, pre {
 .artifact-card__actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .artifact-card__error { margin: 12px 0 0; color: var(--danger); font-size: 0.7rem; }
 
-.composer { position: fixed; right: 318px; bottom: 0; left: 282px; z-index: 5; padding: 18px clamp(24px, 3vw, 48px) 24px; display: flex; align-items: stretch; justify-content: center; gap: 12px; border-top: 1px solid rgba(23, 49, 61, 0.1); background: linear-gradient(180deg, rgba(234, 240, 243, 0.55), rgba(234, 240, 243, 0.98) 24%); backdrop-filter: blur(14px); }
+.composer { position: fixed; right: 318px; bottom: 0; left: var(--workspace-sidebar-width); z-index: 5; padding: 18px clamp(24px, 3vw, 48px) 24px; display: flex; align-items: stretch; justify-content: center; gap: 12px; border-top: 1px solid rgba(23, 49, 61, 0.1); background: linear-gradient(180deg, rgba(234, 240, 243, 0.55), rgba(234, 240, 243, 0.98) 24%); backdrop-filter: blur(14px); }
 .composer--compact { right: 0; }
-.workspace-shell--compact .jump-to-bottom { left: calc(50% + 141px); }
+.workspace-shell--compact .jump-to-bottom { left: calc(50% + var(--workspace-sidebar-width) / 2); }
 .composer__resize-divider {
   position: absolute;
   z-index: 2;
@@ -1021,12 +1024,11 @@ code, pre {
 @keyframes compact-activity-spin { to { transform: translateY(-50%) rotate(360deg); } }
 
 @media (max-width: 1280px) {
-  .workspace-shell { grid-template-columns: 250px minmax(0, 1fr) 280px; }
-  .workspace-shell--compact { grid-template-columns: 250px minmax(0, 1fr); }
-  .composer { right: 280px; left: 250px; }
+  .workspace-shell { --sidebar-default-width: 250px; grid-template-columns: var(--workspace-sidebar-width) minmax(0, 1fr) 280px; }
+  .workspace-shell--compact { grid-template-columns: var(--workspace-sidebar-width) minmax(0, 1fr); }
+  .composer { right: 280px; }
   .composer--compact { right: 0; }
-  .jump-to-bottom { left: calc(50% - 15px); }
-  .workspace-shell--compact .jump-to-bottom { left: calc(50% + 125px); }
+  .jump-to-bottom { left: calc(50% + (var(--workspace-sidebar-width) - 280px) / 2); }
 }
 .interrupt-card__email-details {
   display: grid;
@@ -1203,7 +1205,7 @@ code, pre {
   position: fixed;
   right: 342px;
   bottom: 144px;
-  left: 306px;
+  left: calc(var(--workspace-sidebar-width) + 24px);
   z-index: 6;
   max-width: 760px;
   margin: 0 auto;

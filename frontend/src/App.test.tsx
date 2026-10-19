@@ -2335,3 +2335,45 @@ it("设置中的 Skill 管理入口可打开并返回", async () => {
   expect(screen.getByRole("dialog", { name: "设置" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "清除记忆" })).toBeTruthy();
 });
+
+it("数据页切换保留会话草稿和运行，新建任务返回会话", async () => {
+  const initialOverflow = document.body.style.overflow;
+  window.localStorage.setItem("deep-data-auth-token", "token-a");
+  window.history.replaceState({}, "", "http://localhost:5174/?thread=thread-a");
+  vi.stubGlobal("fetch", withAuthenticatedUser(async (input) => {
+    if (String(input).endsWith("/data/catalog")) return { ok: true, status: 200, json: async () => ({ label: "数据库数据源", tables: [] }) };
+    return { ok: true, status: 200, json: async () => [] };
+  }));
+  streamState.isLoading = true;
+  const view = render(<App />);
+  await screen.findByText("Alice");
+  const input = await screen.findByRole("textbox", { name: "补充要求或纠正方向" }) as HTMLTextAreaElement;
+  const sidebarHandle = screen.getByRole("separator", { name: "调整主侧栏宽度" });
+  fireEvent.keyDown(sidebarHandle, { key: "ArrowRight" });
+  const shell = sidebarHandle.closest(".workspace-shell") as HTMLElement;
+  const resizedWidth = shell.style.getPropertyValue("--sidebar-width");
+  expect(resizedWidth).toBe("266px");
+  fireEvent.change(input, { target: { value: "保留的分析草稿" } });
+  fireEvent.click(screen.getByRole("button", { name: "数据源与查询" }));
+  await screen.findByText("暂无可读取的数据表，请联系管理员检查只读权限。");
+  expect(document.body.style.overflow).toBe("hidden");
+  expect(shell.style.getPropertyValue("--sidebar-width")).toBe(resizedWidth);
+  expect(screen.queryByRole("textbox", { name: "补充要求或纠正方向" })).toBeNull();
+  expect(capturedOptions?.threadId).toBe("thread-a");
+  expect(stop).not.toHaveBeenCalled();
+  const scrollCount = vi.mocked(window.scrollTo).mock.calls.length;
+  streamState.messages = [...streamState.messages, { id: "new-progress", type: "ai", content: "继续处理分析" }];
+  view.rerender(<App />);
+  expect(vi.mocked(window.scrollTo).mock.calls.length).toBe(scrollCount);
+  fireEvent.click(screen.getByRole("button", { name: "会话" }));
+  expect(document.body.style.overflow).toBe(initialOverflow);
+  expect(screen.getByLabelText("补充要求或纠正方向")).toBe(input);
+  expect(input.value).toBe("保留的分析草稿");
+  expect(shell.style.getPropertyValue("--sidebar-width")).toBe(resizedWidth);
+  fireEvent.doubleClick(sidebarHandle);
+  expect(shell.style.getPropertyValue("--sidebar-width")).toBe("");
+  fireEvent.click(screen.getByRole("button", { name: "数据源与查询" }));
+  fireEvent.click(screen.getByRole("button", { name: "开始新任务" }));
+  expect(screen.getByLabelText("补充要求或纠正方向")).toBeTruthy();
+  expect(input.value).toBe("");
+});

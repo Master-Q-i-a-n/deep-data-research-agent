@@ -33,6 +33,7 @@ from redis.exceptions import RedisError
 
 from deep_data_research_agent.admissions import redis_limits
 from deep_data_research_agent.api.auth import bearer_token
+from deep_data_research_agent.api.data_browser import router as data_browser_router
 from deep_data_research_agent.api.health import readiness_checks
 from deep_data_research_agent.api.schemas import (
     AsyncTaskCancelRequest,
@@ -464,6 +465,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="深研账户 API", lifespan=lifespan)
+# 新版 FastAPI 的 include_router 生成懒加载节点，LangGraph 尚不能为其
+# 挂载中间件。通过公开 API 逐条注册具体路由，保留数据模块的路由声明。
+for data_route in data_browser_router.routes:
+    app.add_api_route(
+        data_route.path,
+        data_route.endpoint,
+        methods=list(data_route.methods),
+        tags=data_route.tags,
+        response_model=data_route.response_model,
+        response_class=data_route.response_class,
+        status_code=data_route.status_code,
+        name=data_route.name,
+    )
 
 
 @app.get("/health/live")
