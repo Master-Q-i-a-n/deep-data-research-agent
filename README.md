@@ -83,7 +83,7 @@ Skill 变更从下一次 Agent 执行起生效。运行中的任务可能仍使�
 项目包含 Python 后端与 React 前端。本地运行需要准备 Python、uv、Node.js，以及 PostgreSQL、MongoDB、Redis、RabbitMQ 和 OpenSandbox 等依赖服务；网页检索还需配置相应服务凭据。
 
 1. 复制根目录的 `.env.example` 为 `.env`，按模板完成环境配置和模型凭据加密密钥配置。
-2. 按 [PostgreSQL 配置说明](docs/operations/postgres.md)、[Redis 配置说明](docs/operations/redis.md) 和 [RabbitMQ 配置说明](docs/operations/rabbitmq.md) 初始化依赖，并确认 MongoDB、OpenSandbox 可用。RabbitMQ 复用已有容器，默认 `guest/guest`，项目使用 `ddra` vhost。
+2. 按 [运维指南](docs/operations/README.md#首次部署) 初始化 PostgreSQL、Redis 和 RabbitMQ，并确认 MongoDB、OpenSandbox 可用。
 3. 在 Windows PowerShell 中，从项目根目录启动开发环境：
 
 ```powershell
@@ -92,13 +92,10 @@ Skill 变更从下一次 Agent 执行起生效。运行中的任务可能仍使�
 
 默认访问 [本地工作台](http://127.0.0.1:5174)。开发脚本默认通过 WSL Debian 启动 OpenSandbox；其他环境请按实际部署调整。模型服务在登录后的设置中配置，完整环境选项以 `.env.example` 为准。不要提交真实凭据文件。
 
-沙箱在首次实际文件操作或代码执行时按需分配，Supervisor 和 crawl-worker 共用默认容量为 2 的联网预热池；会话仍独立隔离。上传附件只写持久化工作区，使用时再同步到沙箱。池配置与 Redis ACL 更新要求见 [Redis 运维说明](docs/operations/redis.md#sandbox-生命周期协调)。
+沙箱在首次实际文件操作或代码执行时按需分配，Supervisor 和 crawl-worker 共用默认容量为 2 的联网预热池；会话仍独立隔离。上传附件只写持久化工作区，使用时再同步到沙箱。池配置与 Redis ACL 更新要求见 [运维指南](docs/operations/README.md#沙箱预热与-redis-acl)。
 
 ## 更多文档
 
 - [项目结构](docs/architecture/project-structure.md)
 - [架构设计](docs/architecture/design.md)
-- [PostgreSQL 配置与维护](docs/operations/postgres.md)
-- [Redis 配置与维护](docs/operations/redis.md)
-- [RabbitMQ、任务重试与死信队列](docs/operations/rabbitmq.md)
-- [PostgreSQL 数据源接入](docs/operations/postgres-mcp.md)
+- [运维指南](docs/operations/README.md)

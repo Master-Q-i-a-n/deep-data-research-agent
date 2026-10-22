@@ -30,7 +30,7 @@ and `.secrets/` must be configured first (README 配置 section). After first-ti
 starts Redis + OpenSandbox + LangGraph + Celery worker/Beat + frontend in one shot (logs in
 `%TEMP%\deep-data-research-agent\dev-logs/`); checks the existing RabbitMQ instead of managing its
 container. Initialize its vhost with `.\scripts\setup\rabbitmq.ps1` (details in
-`docs/operations/rabbitmq.md`). Add `-SkipRedis -SkipFrontend` to run backend only.
+`docs/operations/README.md#rabbitmq`). Add `-SkipRedis -SkipFrontend` to run backend only.
 
 ```powershell
 # 1. OpenSandbox server (required; agents fail without it)
