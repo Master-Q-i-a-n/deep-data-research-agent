@@ -20,7 +20,7 @@ chown root:redis /run/redis
 chmod 0750 /run/redis
 {
   echo "user default off"
-  printf '%s\n' "user ddra on >${password} ~ddra:* &* +ping +time +eval +evalsha +script|load +script|exists +zadd +zrem +zremrangebyscore +zcard +zrange +zscore +pexpire +pttl +set +get +getdel +del +unlink +hget +hset +hmget +hgetall +hdel"
+  printf '%s\n' "user ddra on >${password} ~ddra:* &* +ping +time +eval +evalsha +script|load +script|exists +zadd +zrem +zremrangebyscore +zcard +zrange +zscore +pexpire +pttl +set +get +getdel +del +unlink +hget +hset +hmget +hgetall +hdel +hlen +lpop +rpush +lrem +llen +lrange"
   # Celery uses a separate key namespace and logical DB. Dangerous commands
   # stay disabled; EVAL is re-enabled only for token-safe lock release.
 } > "$acl_path"

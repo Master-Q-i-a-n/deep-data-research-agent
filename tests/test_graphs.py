@@ -86,11 +86,11 @@ def test_crawl_worker_exposes_tavily_tools() -> None:
 
     assert worker_graph.name == "crawl-worker"
     assert {
-        "ensure_sandbox",
         "crawl_agent",
         "export_workspace",
         "build_result",
     } <= set(worker_graph.nodes)
+    assert "ensure_sandbox" not in worker_graph.nodes
     assert {"tavily_search", "tavily_crawl", "tavily_extract"} <= set(tools)
     assert "record_failure_lesson" not in tools
     assert "execute" in tools
@@ -338,22 +338,17 @@ def test_agents_enable_the_expected_memory_sources() -> None:
     assert "MongoSkillsRestoreMiddleware.before_agent" not in reviewer_names
 
 
-def test_supervisor_sandbox_lifecycle_precedes_skill_loading() -> None:
+def test_supervisor_skill_loading_does_not_require_a_sandbox() -> None:
     edges = {
         (edge.source, edge.target)
         for edge in supervisor_graph.get_graph().edges
     }
 
+    nodes = supervisor_graph.get_graph().nodes
+    assert "SandboxLifecycleMiddleware.before_agent" not in nodes
+    assert "MongoSkillsRestoreMiddleware.before_agent" not in nodes
     assert (
-        "SandboxLifecycleMiddleware.before_agent",
         "MemoryRefreshMiddleware.before_agent",
-    ) in edges
-    assert (
-        "MemoryRefreshMiddleware.before_agent",
-        "MongoSkillsRestoreMiddleware.before_agent",
-    ) in edges
-    assert (
-        "MongoSkillsRestoreMiddleware.before_agent",
         "ReloadableSkillsMiddleware.before_agent",
     ) in edges
     assert ("ReloadableSkillsMiddleware.before_agent", "model") in edges

@@ -1,11 +1,11 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from deepagents.backends.protocol import FileDownloadResponse, LsResult
 from langgraph.store.memory import InMemoryStore
 
 from deep_data_research_agent.agents.middleware.skills import (
-    MongoSkillsRestoreMiddleware,
     ReloadableSkillsMiddleware,
     SandboxLifecycleMiddleware,
 )
@@ -27,6 +27,9 @@ class FakeManager:
         user_id: str,
     ) -> None:
         self.calls.append(("ensure", thread_id, component, network_enabled, user_id))
+
+    async def export_existing_workspace(self, thread_id, *, component, user_id):
+        self.calls.append(("export_existing", thread_id, component, user_id))
 
     async def export_workspace(
         self,
@@ -56,27 +59,23 @@ def _runtime(store=None):
 
 
 @pytest.mark.asyncio
-async def test_supervisor_lifecycle_ensures_and_exports(monkeypatch) -> None:
+async def test_supervisor_lifecycle_only_exports_existing(monkeypatch) -> None:
     manager = FakeManager()
     monkeypatch.setattr(sandbox_manager, "SANDBOX_MANAGER", manager)
     middleware = SandboxLifecycleMiddleware(
         component="supervisor",
-        network_enabled=True,
     )
 
-    await middleware.abefore_agent({}, _runtime())
     await middleware.aafter_agent({}, _runtime())
 
     assert manager.calls == [
-        ("ensure", "thread-a", "supervisor", True, "user-a"),
-        ("ensure", "thread-a", "supervisor", True, "user-a"),
-        ("export", "thread-a", "supervisor"),
+        ("export_existing", "thread-a", "supervisor", "user-a"),
     ]
 
 
 @pytest.mark.asyncio
 async def test_public_and_user_skills_are_restored_to_isolated_roots(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ) -> None:
     manager = FakeManager()
     monkeypatch.setattr(sandbox_manager, "SANDBOX_MANAGER", manager)
@@ -99,14 +98,23 @@ async def test_public_and_user_skills_are_restored_to_isolated_roots(
         "/manifests/demo-skill.json",
         file_store_value(b"{}"),
     )
-    middleware = MongoSkillsRestoreMiddleware(
-        component="supervisor",
-        agent_name="supervisor",
-    )
+    from test_sandbox_manager import _handle, _settings
 
-    await middleware.abefore_agent({}, runtime)
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    handle = _handle("lazy-skills")
+    handle.component = "supervisor"
+    manager._handles[manager._key("thread-a", "supervisor", "user-a")] = handle
+    calls = []
+    original_replace = manager.replace_directory_files
 
-    assert manager.calls == [
+    async def replace(thread_id, root, files, *, component):
+        calls.append(("replace", thread_id, root, files, component))
+        return await original_replace(thread_id, root, files, component=component)
+
+    monkeypatch.setattr(manager, "replace_directory_files", replace)
+    await manager.prepare(runtime, component="supervisor")
+
+    assert calls[:2] == [
         (
             "replace",
             "thread-a",
@@ -125,21 +133,25 @@ async def test_public_and_user_skills_are_restored_to_isolated_roots(
 
 
 @pytest.mark.asyncio
-async def test_deleted_mongodb_skills_clear_sandbox_residue(monkeypatch) -> None:
-    manager = FakeManager()
-    monkeypatch.setattr(sandbox_manager, "SANDBOX_MANAGER", manager)
-    middleware = MongoSkillsRestoreMiddleware(
-        component="crawl-worker",
-        agent_name="crawl-worker",
-    )
+async def test_deleted_mongodb_skills_clear_sandbox_residue(monkeypatch, tmp_path) -> None:
+    from test_sandbox_manager import _handle, _settings
 
-    await middleware.abefore_agent({}, _runtime(InMemoryStore()))
-
-    assert [call[3] for call in manager.calls] == [[], []]
-    assert [call[2] for call in manager.calls] == [
-        "/skills/public/crawl-worker/active",
-        "/skills/user/crawl-worker/active",
-    ]
+    manager = sandbox_manager.SandboxManager(settings=_settings(tmp_path))
+    handle = _handle("skill-delete")
+    manager._handles[manager._key("thread-a", "crawl-worker", "user-a")] = handle
+    store = InMemoryStore()
+    namespace = ("public", "skills", "crawl-worker")
+    await store.aput(namespace, "/active/demo/SKILL.md", file_store_value(b"demo"))
+    replace = AsyncMock(wraps=manager.replace_directory_files)
+    monkeypatch.setattr(manager, "replace_directory_files", replace)
+    await manager.prepare(_runtime(store), component="crawl-worker")
+    assert replace.await_count == 2
+    await manager.prepare(_runtime(store), component="crawl-worker")
+    assert replace.await_count == 2  # 内容未变化不重复清理/上传。
+    await store.adelete(namespace, "/active/demo/SKILL.md")
+    await manager.prepare(_runtime(store), component="crawl-worker")
+    assert replace.await_count == 3
+    assert replace.call_args.args[2] == []
 
 
 @pytest.mark.asyncio

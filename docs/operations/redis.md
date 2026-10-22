@@ -20,6 +20,18 @@ DB 0。Celery Broker 使用独立的 RabbitMQ。Redis 不依赖容器 ID、容�
 - Redis HASH 保存各 component 的 Sandbox ID 和配置指纹。AOF 丢失最新记录时，应用通过
   OpenSandbox metadata 找回并接管现有实例，不直接创建重复容器。
 - thread 删除期间写入短期墓碑；部分销毁失败保留注册项，重试不会再次处理成功项。
+- Supervisor 与 crawl-worker 共用联网预热池；池状态位于 `ddra:v1:pool:*`，SDK 协调
+  补充者和原子领取，thread 注册表仍负责已领取实例的所有权与恢复。
+- `SANDBOX_POOL_ENABLED=true` 默认开启；`SANDBOX_POOL_MAX_IDLE=2` 控制共享空闲容量，
+  不是活动会话配额。空闲 TTL 默认 1800 秒，补充检查间隔默认 5 秒，分别通过
+  `SANDBOX_POOL_IDLE_TIMEOUT_SECONDS`、`SANDBOX_POOL_RECONCILE_INTERVAL_SECONDS` 配置。
+  最大空闲容量设为 0 可暂停预热；关闭池后仍按需冷创建。
+- 池启动不等待填满。进程退出停止本地调度，不清空共享池；空闲实例由服务端 TTL 回收。
+  池为空时冷创建，但 Redis 生命周期协调失败时仍拒绝分配。
+- 上传、删除附件和运行前同步共用 thread 生命周期锁；输入附件先持久化，操作本身不分配沙箱。
+- SDK 池额外使用 `HLEN`、`LPOP`、`RPUSH`、`LREM`、`LRANGE` 等命令。部署此改动需
+  重新构建并重建 Redis 容器以加载 `infra/redis/entrypoint.sh` 中的 ACL，不删除数据卷。
+  OpenSandbox 服务端需支持 SDK 0.1.15 的 metadata patch API；领取后绑定失败会销毁实例。
 
 ## 首次部署与旧容器切换
 

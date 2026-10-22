@@ -194,6 +194,11 @@ async def test_database_tool_exports_query_to_shared_sandbox(
             {"thread_id": thread_id, "files": files, "kwargs": kwargs}
         )
 
+    async def prepare(runtime, *, component):
+        assert component == "supervisor"
+
+    monkeypatch.setattr(database_tools.sandbox_manager.SANDBOX_MANAGER, "prepare", prepare)
+
     monkeypatch.setattr(database_tools, "_query_rows", fake_query_rows)
     monkeypatch.setattr(
         database_tools,

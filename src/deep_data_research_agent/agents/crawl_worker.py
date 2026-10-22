@@ -24,7 +24,6 @@ from deep_data_research_agent.agents.contracts import (
     compact_crawl_summary,
 )
 from deep_data_research_agent.agents.middleware.skills import (
-    MongoSkillsRestoreMiddleware,
     ReloadableSkillsMiddleware,
 )
 from deep_data_research_agent.agents.model_profile import (
@@ -126,10 +125,6 @@ crawl_agent = create_deep_agent(
             backend=WORKER_BACKEND,
             sources=[USER_MEMORY_PATH, agent_memory_path("crawl-worker")],
         ),
-        MongoSkillsRestoreMiddleware(
-            component="crawl-worker",
-            agent_name="crawl-worker",
-        ),
         ReloadableSkillsMiddleware(
             backend=WORKER_BACKEND,
             sources=[
@@ -146,20 +141,6 @@ crawl_agent = create_deep_agent(
 )
 
 
-async def _ensure_sandbox(
-    _state: DeepAgentState,
-    config: RunnableConfig,
-) -> dict[str, Any]:
-    """Initialize the task sandbox before DeepAgents middleware resolves it."""
-
-    thread_id = sandbox_manager.thread_id_from_config(config)
-    await sandbox_manager.SANDBOX_MANAGER.ensure(
-        thread_id,
-        user_id=user_identity_from_config(config),
-    )
-    return {}
-
-
 async def _export_workspace(
     _state: CrawlWorkerState,
     config: RunnableConfig,
@@ -167,7 +148,9 @@ async def _export_workspace(
     """Persist the successful sandbox workspace for frontend and later runs."""
 
     thread_id = sandbox_manager.thread_id_from_config(config)
-    artifacts = await sandbox_manager.SANDBOX_MANAGER.export_workspace(thread_id)
+    artifacts = await sandbox_manager.SANDBOX_MANAGER.export_existing_workspace(
+        thread_id, user_id=user_identity_from_config(config)
+    )
     return {"exported_artifacts": artifacts}
 
 
@@ -304,12 +287,10 @@ async def _build_structured_result(
 
 
 builder = StateGraph(CrawlWorkerState)
-builder.add_node("ensure_sandbox", _ensure_sandbox)
 builder.add_node("crawl_agent", crawl_agent)
 builder.add_node("export_workspace", _export_workspace)
 builder.add_node("build_result", _build_structured_result)
-builder.add_edge(START, "ensure_sandbox")
-builder.add_edge("ensure_sandbox", "crawl_agent")
+builder.add_edge(START, "crawl_agent")
 builder.add_edge("crawl_agent", "export_workspace")
 builder.add_edge("export_workspace", "build_result")
 builder.add_edge("build_result", END)

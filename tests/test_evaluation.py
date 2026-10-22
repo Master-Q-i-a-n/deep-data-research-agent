@@ -20,8 +20,16 @@ async def _noop_schema_check(**_kwargs) -> None:
     return None
 
 
-def test_manifest_has_expected_twenty_cases_in_order() -> None:
-    manifest = evaluation.load_manifest()
+@pytest.fixture
+def evaluation_manifest() -> evaluation.CaseManifest:
+    # 私有评测清单不随仓库分发；缺失时仅跳过依赖它的测试。
+    if not evaluation.DEFAULT_CASES_PATH.is_file():
+        pytest.skip("requires local private evals/cases.yaml")
+    return evaluation.load_manifest()
+
+
+def test_manifest_has_expected_twenty_cases_in_order(evaluation_manifest) -> None:
+    manifest = evaluation_manifest
 
     assert [case.id for case in manifest.cases] == [
         "Q01", "Q02", "Q03", "F01", "F02", "F03", "F04", "F05", "F06",
@@ -84,8 +92,8 @@ def test_validate_report_checks_pdf_and_relative_images(tmp_path: Path) -> None:
     assert "有效分析内容" in report
 
 
-def test_hard_success_uses_exact_simple_gold() -> None:
-    case = evaluation.load_manifest().cases[0]
+def test_hard_success_uses_exact_simple_gold(evaluation_manifest) -> None:
+    case = evaluation_manifest.cases[0]
 
     success, reasons = evaluation._hard_success(
         case,
@@ -243,6 +251,7 @@ async def test_trace_export_uses_server_filters_and_minimal_records(tmp_path: Pa
 async def test_e2e_freezes_before_slow_artifact_and_trace_exports(
     monkeypatch,
     tmp_path: Path,
+    evaluation_manifest,
 ) -> None:
     clock = {"value": 100.0}
 
@@ -292,7 +301,7 @@ async def test_e2e_freezes_before_slow_artifact_and_trace_exports(
     monkeypatch.setattr(evaluation, "_submit_run", submit)
     monkeypatch.setattr(evaluation, "_export_artifacts", export_artifacts)
     monkeypatch.setattr(evaluation, "_collect_trace", collect_trace)
-    case = evaluation.load_manifest().cases[0]
+    case = evaluation_manifest.cases[0]
 
     result = await evaluation._run_case(
         case,
@@ -325,13 +334,14 @@ async def test_e2e_freezes_before_slow_artifact_and_trace_exports(
 async def test_e2e_terminal_boundaries(
     monkeypatch,
     tmp_path: Path,
+    evaluation_manifest,
     mode: str,
     case_id: str,
     expected_calls: int,
 ) -> None:
     clock = {"value": 10.0}
     submit_calls: list[dict] = []
-    case = next(item for item in evaluation.load_manifest().cases if item.id == case_id)
+    case = next(item for item in evaluation_manifest.cases if item.id == case_id)
     for filename in case.input_files:
         (tmp_path / filename).write_text("fixture", encoding="utf-8")
 

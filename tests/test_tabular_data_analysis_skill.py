@@ -232,10 +232,16 @@ async def test_compiled_supervisor_execute_node_runs_profile_script(
     input_path = tmp_path / "compiled.csv"
     output_path = tmp_path / "compiled-profile.json"
     input_path.write_text("id,value\n001,2\n", encoding="utf-8")
+
+    async def prepare(runtime, *, component):
+        assert component == "supervisor"
+        assert sandbox_manager.thread_id_from_runtime(runtime) == "thread-profile"
+        return LocalTestSandbox()
+
     monkeypatch.setattr(
         sandbox_manager.SANDBOX_MANAGER,
-        "get_backend",
-        lambda *_args, **_kwargs: LocalTestSandbox(),
+        "prepare",
+        prepare,
     )
     command = subprocess.list2cmdline(
         [

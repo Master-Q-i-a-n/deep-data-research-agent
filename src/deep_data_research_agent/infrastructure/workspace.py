@@ -194,10 +194,12 @@ class LocalWorkspaceStore:
                         f"{prefix_text}/"
                     ):
                         continue
+                file_stat = resolved.stat()
                 objects.append(
                     WorkspaceObject(
                         path=virtual_workspace_path(relative),
-                        size=resolved.stat().st_size,
+                        size=file_stat.st_size,
+                        etag=f"local-{file_stat.st_mtime_ns}-{file_stat.st_ctime_ns}-{file_stat.st_size}",
                     )
                 )
             return objects
@@ -214,9 +216,11 @@ class LocalWorkspaceStore:
         def stat() -> WorkspaceObject:
             if target.is_symlink() or not target.is_file():
                 raise WorkspaceFileNotFound(virtual_workspace_path(relative))
+            file_stat = target.stat()
             return WorkspaceObject(
                 path=virtual_workspace_path(relative),
-                size=target.stat().st_size,
+                size=file_stat.st_size,
+                etag=f"local-{file_stat.st_mtime_ns}-{file_stat.st_ctime_ns}-{file_stat.st_size}",
             )
 
         return await asyncio.to_thread(stat)

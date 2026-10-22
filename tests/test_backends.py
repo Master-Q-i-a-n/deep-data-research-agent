@@ -142,15 +142,13 @@ async def test_backend_recreates_sandbox_after_process_restart(monkeypatch) -> N
         "get_backend",
         missing_backend,
     )
-    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "ensure", ensure)
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "prepare", ensure)
 
     backend = backends.create_backend(_runtime("resumed-thread"))
     assert await backend.default._abackend() is restored
     assert calls == [
         {
             "component": "supervisor",
-            "network_enabled": True,
-            "user_id": "test-user",
         }
     ]
 

@@ -80,6 +80,7 @@ async def _persist_result(
     )
 
     thread_id = sandbox_manager.thread_id_from_runtime(runtime)
+    await sandbox_manager.SANDBOX_MANAGER.prepare(runtime, component="crawl-worker")
     await sandbox_manager.SANDBOX_MANAGER.upload_workspace_files(thread_id, files)
     return manifest
 

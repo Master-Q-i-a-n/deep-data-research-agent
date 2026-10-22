@@ -182,22 +182,11 @@ class RestartSafeSandboxBackend(SandboxBackendProtocol):
         )
 
     async def _abackend(self):
-        """Return the backend, recreating it only when this process has no handle."""
+        """Prepare physical files at the first actual sandbox operation."""
 
-        thread_id, user_id = self._scope()
-        try:
-            return sandbox_manager.SANDBOX_MANAGER.get_backend(
-                thread_id,
-                component=self._component,
-                user_id=user_id,
-            )
-        except sandbox_manager.SandboxNotInitializedError:
-            pass
-        return await sandbox_manager.SANDBOX_MANAGER.ensure(
-            thread_id,
+        return await sandbox_manager.SANDBOX_MANAGER.prepare(
+            self._runtime(),
             component=self._component,
-            network_enabled=self._network_enabled,
-            user_id=user_id,
         )
 
     @property
@@ -379,7 +368,7 @@ def create_worker_backend(runtime: Any | None = None) -> CompositeBackend:
     return _sandbox_backend(
         component="crawl-worker",
         skill_agents=("crawl-worker",),
-        network_enabled=False,
+        network_enabled=True,
         runtime=runtime,
     )
 

@@ -171,9 +171,8 @@ async def assign_skill(
     if store is None:
         raise RuntimeError("LangGraph Store 不可用，无法持久化 Skill")
 
-    thread_id = sandbox_manager.thread_id_from_runtime(runtime)
-    backend = sandbox_manager.SANDBOX_MANAGER.get_backend(
-        thread_id,
+    backend = await sandbox_manager.SANDBOX_MANAGER.prepare(
+        runtime,
         component=_COMPONENT,
     )
     source_dir = f"/skill-manage/{name}"

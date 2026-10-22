@@ -2,6 +2,7 @@ import io
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException, UploadFile
@@ -13,6 +14,7 @@ from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_m
 from deep_data_research_agent.infrastructure.workspace import (
     LocalWorkspaceStore,
     WorkspaceScope,
+    WorkspaceStorageError,
 )
 
 TEST_USER_ID = "user-a"
@@ -38,6 +40,7 @@ def _install_workspace_store(monkeypatch, tmp_path: Path) -> Path:
     scope = WorkspaceScope(TEST_USER_ID, "thread-a", "supervisor")
     sandbox_manager.SANDBOX_MANAGER._thread_users.pop("thread-a", None)
     monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "workspace_store", store)
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "_coordination_enabled", False)
     return store.workspace_path(scope)
 
 
@@ -232,7 +235,7 @@ async def test_upload_enforces_per_thread_total_size(
 
 
 @pytest.mark.asyncio
-async def test_delete_file_calls_owned_supervisor_sandbox(
+async def test_delete_file_does_not_allocate_supervisor_sandbox(
     monkeypatch,
     tmp_path: Path,
     owned_thread,
@@ -265,5 +268,43 @@ async def test_delete_file_calls_owned_supervisor_sandbox(
     )
 
     assert result == {"status": "deleted", "path": "/workspace/input/orders.csv"}
-    assert ensured == [("thread-a", "supervisor", TEST_USER_ID)]
-    assert deleted == [("thread-a", "/workspace/input/orders.csv", "supervisor")]
+    assert ensured == []
+    assert deleted == []
+    assert not (workspace / "input" / "orders.csv").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_persists_without_allocating_sandbox(monkeypatch, tmp_path, owned_thread):
+    workspace = _install_workspace_store(monkeypatch, tmp_path)
+    ensure = AsyncMock(side_effect=AssertionError("upload allocated sandbox"))
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "ensure", ensure)
+    result = await webapp.upload_files(
+        "thread-a", _request(), [UploadFile(filename="orders.csv", file=io.BytesIO(b"id\n1\n"))], None
+    )
+    assert result["files"][0]["path"] == "/workspace/input/orders.csv"
+    assert (workspace / "input" / "orders.csv").read_bytes() == b"id\n1\n"
+    ensure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_persist_failure_rolls_back_only_new_batch(monkeypatch, tmp_path, owned_thread):
+    workspace = _install_workspace_store(monkeypatch, tmp_path)
+    (workspace / "input").mkdir(parents=True)
+    (workspace / "input" / "existing.csv").write_bytes(b"old")
+    store = sandbox_manager.SANDBOX_MANAGER.workspace_store
+    original = store.write_many
+
+    async def partial(scope, files):
+        await original(scope, files[:1])
+        raise WorkspaceStorageError("partial")
+
+    monkeypatch.setattr(store, "write_many", partial)
+    with pytest.raises(HTTPException) as exc:
+        await webapp.upload_files(
+            "thread-a", _request(), [
+                UploadFile(filename="one.csv", file=io.BytesIO(b"1")),
+                UploadFile(filename="two.csv", file=io.BytesIO(b"2")),
+            ], None,
+        )
+    assert exc.value.status_code == 503
+    assert sorted(p.name for p in (workspace / "input").iterdir()) == ["existing.csv"]

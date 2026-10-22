@@ -329,12 +329,9 @@ async def request_report_download(
         filename = _validated_download_name(download_name, relative)
 
         thread_id = sandbox_manager.thread_id_from_runtime(runtime)
-        user_id = user_identity(runtime)
-        backend = await sandbox_manager.SANDBOX_MANAGER.ensure(
-            thread_id,
+        backend = await sandbox_manager.SANDBOX_MANAGER.prepare(
+            runtime,
             component="supervisor",
-            network_enabled=True,
-            user_id=user_id,
         )
         responses = await backend.adownload_files([virtual_path])
         response = responses[0] if responses else None
@@ -421,11 +418,9 @@ async def send_report_email(
         stage = "workspace_export"
         thread_id = sandbox_manager.thread_id_from_runtime(runtime)
         user_id = user_identity(runtime)
-        await sandbox_manager.SANDBOX_MANAGER.ensure(
-            thread_id,
+        await sandbox_manager.SANDBOX_MANAGER.prepare(
+            runtime,
             component="supervisor",
-            network_enabled=True,
-            user_id=user_id,
         )
         # HITL resumes before the run-level after_agent export, so snapshot now.
         await sandbox_manager.SANDBOX_MANAGER.export_workspace(

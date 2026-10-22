@@ -5,6 +5,7 @@
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from langgraph.store.memory import InMemoryStore
@@ -173,7 +174,7 @@ async def test_assign_skill_reads_and_keeps_candidate_dir(monkeypatch) -> None:
     monkeypatch.setattr(
         sandbox_manager,
         "SANDBOX_MANAGER",
-        SimpleNamespace(get_backend=lambda _t, *, component: backend),
+        SimpleNamespace(prepare=AsyncMock(return_value=backend)),
     )
     store = InMemoryStore()
     runtime = _runtime(store)
@@ -212,7 +213,7 @@ async def test_assign_skill_error_reports_candidate_path(monkeypatch) -> None:
     monkeypatch.setattr(
         sandbox_manager,
         "SANDBOX_MANAGER",
-        SimpleNamespace(get_backend=lambda _t, *, component: backend),
+        SimpleNamespace(prepare=AsyncMock(return_value=backend)),
     )
     runtime = _runtime(InMemoryStore())
 

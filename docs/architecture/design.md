@@ -114,9 +114,16 @@ flowchart LR
 仓库 Skill 仅作为公共版本化种子，启动时精确同步到
 `("public", "skills", agent_name)`；运行时不再读取仓库文件。Supervisor 读取统一
 `skill-manage` 后在 `/skill-manage/` 创建或下载候选 Skill、用 `execute` 测试，再通过
-`assign_skill` 写入 `(user_hash, "skills", agent_name)`。每个 Agent 每轮分别恢复自身公共与
-用户 Skill，同名时用户版本后加载并覆盖公共版本。下载依赖已联网的 supervisor 沙箱，解压
+`assign_skill` 写入 `(user_hash, "skills", agent_name)`。每轮直接从 MongoDB 加载 Skill 元信息；
+首次实际访问沙箱时才同步实体文件，并通过内容哈希跳过未变化目录。同名时用户版本后加载
+并覆盖公共版本。Supervisor 与 crawl-worker 使用相同的联网策略，解压
 拒绝路径穿越与链接。
+
+沙箱按用户、thread、component 隔离，首次文件操作或代码执行才分配。两个 component
+共用 OpenSandbox SDK 的 Redis 预热池，默认保留 2 个干净空闲实例；领取后绑定会话、
+更新 provider metadata 并恢复工作区，已使用的实例不归还池。池空时回退串行冷创建。
+上传附件先写入 WorkspaceStore，沙箱访问前按版本同步输入；导出跳过 `/workspace/input/`，
+以持久化存储为输入附件的权威副本。纯对话结束不分配沙箱。
 
 ## 9. 上下文与长期记忆
 

@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     open_sandbox_use_server_proxy: bool = True
     open_sandbox_image: str = "python:3.13-slim"
     open_sandbox_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
+    sandbox_pool_enabled: bool = True
+    sandbox_pool_max_idle: int = Field(default=2, ge=0, le=100)
+    sandbox_pool_idle_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
+    sandbox_pool_reconcile_interval_seconds: float = Field(default=5, ge=1, le=300)
     sandbox_lock_wait_seconds: float = Field(default=5.0, ge=0.1, le=60)
     sandbox_lock_lease_seconds: float = Field(default=180.0, ge=10, le=600)
     sandbox_lock_renew_seconds: float = Field(default=30.0, ge=1, le=120)

@@ -497,6 +497,7 @@ async def database_query_to_file(
             "sql_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
         }
         thread_id = sandbox_manager.thread_id_from_runtime(runtime)
+        await sandbox_manager.SANDBOX_MANAGER.prepare(runtime, component="supervisor")
         await sandbox_manager.SANDBOX_MANAGER.upload_workspace_files(
             thread_id,
             [

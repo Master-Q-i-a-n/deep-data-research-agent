@@ -18,6 +18,7 @@ from opensandbox.exceptions import SandboxError, SandboxException
 from deep_data_research_agent.agents import backends
 from deep_data_research_agent.core.config import Settings
 from deep_data_research_agent.infrastructure.sandbox import manager as sandbox_manager
+from deep_data_research_agent.infrastructure.sandbox import pool as sandbox_pool
 
 
 class FakeSandbox:
@@ -68,6 +69,7 @@ class FakeBackend:
                     "is_dir": False,
                 }
                 for file_path in self.files
+                if file_path.startswith("/workspace/")
             ]
         )
 
@@ -375,9 +377,9 @@ async def test_sandbox_cold_starts_are_serialized_process_wide(
     """不同 manager 的 SandboxSync.create 也必须经过同一个进程级信号量。"""
 
     monkeypatch.setattr(
-        sandbox_manager,
-        "_SANDBOX_CREATE_SEMAPHORE",
-        asyncio.Semaphore(1),
+        sandbox_pool,
+        "CREATE_GATE",
+        threading.BoundedSemaphore(1),
     )
     managers = [
         sandbox_manager.SandboxManager(settings=_settings(tmp_path)),
@@ -452,7 +454,7 @@ async def test_sandbox_start_failure_retries_twice(
             )
         return FakeSandbox("sandbox-retried")
 
-    async def fake_sleep(delay: float) -> None:
+    def fake_sleep(delay: float) -> None:
         delays.append(delay)
 
     async def ignore_directories(_handle, _directories) -> None:
@@ -470,9 +472,9 @@ async def test_sandbox_start_failure_retries_twice(
         return 0
 
     monkeypatch.setattr(
-        sandbox_manager,
-        "_SANDBOX_CREATE_SEMAPHORE",
-        asyncio.Semaphore(1),
+        sandbox_pool,
+        "CREATE_GATE",
+        threading.BoundedSemaphore(1),
     )
     monkeypatch.setattr(manager, "_create_sandbox_sync", flaky_create)
     monkeypatch.setattr(manager, "_ensure_directories", ignore_directories)
@@ -482,7 +484,7 @@ async def test_sandbox_start_failure_retries_twice(
         fake_base_distributions,
     )
     monkeypatch.setattr(manager, "restore_workspace", ignore_restore)
-    monkeypatch.setattr(sandbox_manager.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(sandbox_pool.time, "sleep", fake_sleep)
 
     handle = await manager._create_handle("thread-a")
 
@@ -505,9 +507,9 @@ async def test_sandbox_create_does_not_retry_nontransient_errors(
         raise ValueError("镜像名称无效")
 
     monkeypatch.setattr(
-        sandbox_manager,
-        "_SANDBOX_CREATE_SEMAPHORE",
-        asyncio.Semaphore(1),
+        sandbox_pool,
+        "CREATE_GATE",
+        threading.BoundedSemaphore(1),
     )
     monkeypatch.setattr(manager, "_create_sandbox_sync", invalid_create)
 
@@ -747,7 +749,7 @@ async def test_delete_thread_resources_is_user_and_thread_scoped(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_worker_and_supervisor_components_use_separate_network_profiles(
+async def test_worker_and_supervisor_components_share_network_profile(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -776,7 +778,7 @@ async def test_worker_and_supervisor_components_use_separate_network_profiles(
 
     assert crawl is not supervisor
     assert created == [
-        ("shared-thread", "crawl-worker", False),
+        ("shared-thread", "crawl-worker", True),
         ("shared-thread", "supervisor", True),
     ]
 

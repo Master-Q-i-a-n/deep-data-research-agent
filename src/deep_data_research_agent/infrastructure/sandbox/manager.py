@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import shlex
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
@@ -15,15 +17,24 @@ from typing import Any
 
 from deepagents.backends.protocol import ExecuteResponse
 from deepagents_opensandbox import OpensandboxBackend
+from langgraph.config import get_config
 from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree
-from opensandbox import SandboxManagerSync, SandboxSync
+from opensandbox import AcquirePolicy, SandboxManagerSync, SandboxSync
 from opensandbox.config import ConnectionConfigSync
-from opensandbox.exceptions import SandboxException
+from opensandbox.exceptions import (
+    PoolAcquireFailedException,
+    PoolEmptyException,
+    SandboxException,
+)
 from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import NetworkPolicy, SandboxFilter, SandboxInfo
 
 from deep_data_research_agent.core.config import Settings, get_settings
+from deep_data_research_agent.core.identity import (
+    assigned_skill_namespace,
+    user_identity,
+)
 from deep_data_research_agent.infrastructure.redis.client import (
     get_redis,
     initialize_redis,
@@ -32,6 +43,12 @@ from deep_data_research_agent.infrastructure.redis.keys import KEY_PREFIX, diges
 from deep_data_research_agent.infrastructure.redis.lock import (
     DistributedLockUnavailable,
     distributed_lock,
+)
+from deep_data_research_agent.infrastructure.sandbox.pool import (
+    BASELINE_CODE,
+    BASELINE_PATH,
+    WarmSandboxPool,
+    create_with_retries,
 )
 from deep_data_research_agent.infrastructure.workspace import (
     LocalWorkspaceStore,
@@ -43,15 +60,30 @@ from deep_data_research_agent.infrastructure.workspace import (
 from deep_data_research_agent.infrastructure.workspace import (
     workspace_relative_path as stored_workspace_relative_path,
 )
-from deep_data_research_agent.skill_system.storage import SKILL_AGENT_NAMES
+from deep_data_research_agent.skill_system.storage import (
+    SKILL_AGENT_NAMES,
+    public_skill_namespace,
+    public_skill_root,
+    stored_file_content,
+    user_skill_root,
+)
 
 _SAFE_THREAD_ID = re.compile(r"[^A-Za-z0-9_.-]")
 # OpenSandbox 的 Docker 冷启动会同时创建容器、端口和可选 egress sidecar。
 # 整个进程统一串行创建，避免不同 Agent 任务同时争用这些资源。
-_SANDBOX_CREATE_SEMAPHORE = asyncio.Semaphore(1)
-_SANDBOX_CREATE_RETRY_DELAYS = (1.0, 3.0)
 
 logger = logging.getLogger(__name__)
+
+
+async def _finish_cleanup(task: asyncio.Task) -> Any:
+    """Keep owned-resource cleanup alive even if cancellation is requested twice."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 class SandboxNotInitializedError(RuntimeError):
@@ -97,7 +129,15 @@ def thread_id_from_runtime(runtime: Any) -> str:
     thread_id = getattr(execution_info, "thread_id", None)
     if thread_id:
         return sanitize_thread_id(thread_id)
-    return thread_id_from_config(getattr(runtime, "config", {}) or {})
+    config = getattr(runtime, "config", None)
+    if not config:
+        # 直接执行工具节点时 get_runtime() 可能没有 execution_info；认证配置
+        # 仍在当前 RunnableConfig 中，不能把不同会话错误合并到 local 沙箱。
+        try:
+            config = get_config()
+        except RuntimeError:
+            config = {}
+    return thread_id_from_config(config)
 
 
 def _trace_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -218,7 +258,7 @@ class _SandboxHandle:
     sandbox: SandboxSync
     backend: OpensandboxBackend
     component: str = "crawl-worker"
-    network_enabled: bool = False
+    network_enabled: bool = True
     base_distributions: frozenset[str] = frozenset()
 
 
@@ -286,6 +326,75 @@ class SandboxManager:
         self._thread_users: dict[str, str] = {}
         self._lifecycle_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._coordination_enabled = coordination_enabled
+        self._pool: WarmSandboxPool | None = None
+
+    async def start_pool(self) -> None:
+        """Start background replenishment without waiting for a full idle buffer."""
+
+        if not self._settings.sandbox_pool_enabled or self._pool is not None:
+            return
+        startup = None
+        try:
+            self._validate_settings()
+            connection = self._connection_config()
+
+            def launch():
+                pool = WarmSandboxPool(self._settings, connection)
+                try:
+                    pool.start()
+                except BaseException:
+                    try:
+                        pool.close()
+                    except Exception:
+                        logger.warning("关闭启动失败的预热池时发生错误", exc_info=True)
+                    raise
+                return pool
+
+            startup = asyncio.create_task(asyncio.to_thread(launch))
+            self._pool = await asyncio.shield(startup)
+        except asyncio.CancelledError:
+
+            async def dispose_startup():
+                if startup is not None:
+                    try:
+                        pool = await startup
+                    except Exception:
+                        logger.debug("预热池启动失败，取消时无需再次关闭", exc_info=True)
+                        return
+                    await asyncio.to_thread(pool.close)
+
+            await _finish_cleanup(asyncio.create_task(dispose_startup()))
+            raise
+        except Exception:
+            logger.warning("预热池启动失败，实际使用沙箱时回退冷创建", exc_info=True)
+
+    async def close_pool(self) -> None:
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            await asyncio.to_thread(pool.close)
+
+    @asynccontextmanager
+    async def workspace_lock(self, thread_id: str, *, user_id: str | None = None):
+        """Serialize persisted inputs and sandbox synchronization across processes."""
+
+        owner = self._user_for_thread(thread_id, user_id)
+        async with self._lifecycle_lock_for(owner, thread_id):
+            if not self._coordination_enabled:
+                yield
+                return
+            await initialize_redis()
+            lock_key, _, tombstone_key = self._sandbox_keys(owner, thread_id)
+            settings = self._settings
+            async with distributed_lock(
+                lock_key,
+                wait_seconds=settings.sandbox_lock_wait_seconds,
+                lease_seconds=settings.sandbox_lock_lease_seconds,
+                renew_seconds=settings.sandbox_lock_renew_seconds,
+            ) as lease:
+                if await get_redis().get(tombstone_key):
+                    raise RuntimeError("任务正在删除，不能修改工作区")
+                yield
+                lease.ensure_owned()
 
     def _user_for_thread(self, thread_id: str, user_id: str | None = None) -> str:
         """Bind once from an explicit identity, then reuse the trusted mapping."""
@@ -417,9 +526,7 @@ class SandboxManager:
         return {
             "thread_id": _sandbox_metadata_value(sanitize_thread_id(thread_id)),
             "component": _sandbox_metadata_value(component),
-            "ddra_owner": _sandbox_metadata_value(
-                digest_key("sandbox-owner", user_id)
-            ),
+            "ddra_owner": _sandbox_metadata_value(digest_key("sandbox-owner", user_id)),
             "ddra_config": _sandbox_metadata_value(
                 self._config_fingerprint(component, network_enabled)
             ),
@@ -566,14 +673,8 @@ class SandboxManager:
     ) -> frozenset[str]:
         """Record packages present before any restored or candidate code runs."""
 
-        code = (
-            "import importlib.metadata as m, json, re; "
-            "normalize=lambda value: re.sub(r'[-_.]+', '-', value).lower(); "
-            "print(json.dumps(sorted({normalize(d.metadata['Name']) "
-            "for d in m.distributions() if d.metadata['Name']})))"
-        )
         result = await handle.backend.aexecute(
-            "python -c " + shlex.quote(code),
+            "python -c " + shlex.quote(BASELINE_CODE),
         )
         if result.exit_code not in {None, 0}:
             detail = result.output.strip() or f"退出码 {result.exit_code}"
@@ -592,50 +693,42 @@ class SandboxManager:
         self,
         thread_id: str,
         component: str = "crawl-worker",
-        network_enabled: bool = False,
+        network_enabled: bool = True,
     ) -> _SandboxHandle:
-        # 重试期间继续持有进程级信号量，给 Docker 和 egress sidecar 留出恢复时间，
-        # 同时保证所有 SandboxSync.create() 调用都不会交错执行。
-        async with _SANDBOX_CREATE_SEMAPHORE:
-            for attempt in range(len(_SANDBOX_CREATE_RETRY_DELAYS) + 1):
+        def allocate():
+            if self._pool is not None:
                 try:
-                    sandbox = await asyncio.to_thread(
-                        self._create_sandbox_sync,
-                        thread_id,
-                        component,
-                        network_enabled,
-                    )
-                    break
-                except Exception as exc:
-                    error_code = str(
-                        getattr(getattr(exc, "error", None), "code", "")
-                    )
-                    message = str(exc)
-                    retryable = (
-                        error_code.endswith("SANDBOX_START_FAILED")
-                        or error_code == "READY_TIMEOUT"
-                        or "Egress sidecar container failed to start" in message
-                    )
-                    if (
-                        not retryable
-                        or attempt >= len(_SANDBOX_CREATE_RETRY_DELAYS)
-                    ):
-                        raise RuntimeError(
-                            f"无法为任务 {thread_id} 创建 OpenSandbox：{exc}"
-                        ) from exc
+                    return self._pool.sdk.acquire(
+                        sandbox_timeout=timedelta(
+                            seconds=self._settings.open_sandbox_timeout_seconds
+                        ),
+                        policy=AcquirePolicy.RETRY_NEXT_IDLE,
+                    ), True
+                except (PoolEmptyException, PoolAcquireFailedException):
+                    pass
+            return create_with_retries(
+                lambda: self._create_sandbox_sync(thread_id, component, network_enabled)
+            ), False
 
-                    delay = _SANDBOX_CREATE_RETRY_DELAYS[attempt]
-                    logger.warning(
-                        "OpenSandbox 冷启动失败，%.0f 秒后重试（任务=%s，组件=%s，"
-                        "第 %d/%d 次重试）：%s",
-                        delay,
-                        thread_id,
-                        component,
-                        attempt + 1,
-                        len(_SANDBOX_CREATE_RETRY_DELAYS),
-                        message,
-                    )
-                    await asyncio.sleep(delay)
+        # to_thread 不会随调用方取消而停止。等领取结果返回并销毁，避免孤儿实例。
+        allocation = asyncio.create_task(asyncio.to_thread(allocate))
+        try:
+            sandbox, pooled = await asyncio.shield(allocation)
+        except asyncio.CancelledError:
+
+            async def dispose_allocation():
+                try:
+                    abandoned, _ = await allocation
+                    await asyncio.to_thread(abandoned.destroy)
+                except Exception:
+                    logger.warning("清理取消请求领取的沙箱失败", exc_info=True)
+
+            await _finish_cleanup(asyncio.create_task(dispose_allocation()))
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"无法为任务 {thread_id} 创建 OpenSandbox：{exc}"
+            ) from exc
 
         handle = _SandboxHandle(
             sandbox=sandbox,
@@ -644,18 +737,42 @@ class SandboxManager:
             network_enabled=network_enabled,
         )
         try:
-            await self._ensure_directories(handle, {"/workspace"})
-            handle.base_distributions = await self._capture_base_distributions(
-                handle
-            )
+            if pooled:
+                await asyncio.to_thread(
+                    sandbox.patch_metadata,
+                    {
+                        **self._sandbox_metadata(thread_id, component, network_enabled),
+                        "ddra_ready": "false",
+                    },
+                )
+                result = await handle.backend.aexecute(
+                    "cat " + shlex.quote(BASELINE_PATH)
+                )
+                values = json.loads(result.output.strip())
+                if (
+                    result.exit_code not in {None, 0}
+                    or not isinstance(values, list)
+                    or not all(isinstance(value, str) for value in values)
+                ):
+                    raise RuntimeError("预热沙箱基础依赖记录无效")
+                handle.base_distributions = frozenset(values)
+            else:
+                await self._ensure_directories(handle, {"/workspace"})
+                handle.base_distributions = await self._capture_base_distributions(
+                    handle
+                )
             await self.restore_workspace(
                 thread_id,
                 handle,
                 component=component,
             )
-        except Exception:
+            if pooled:
+                await asyncio.to_thread(sandbox.patch_metadata, {"ddra_ready": "true"})
+        except BaseException:
             # Creation succeeded but initialization failed; avoid leaking a container.
-            await asyncio.to_thread(sandbox.destroy)
+            await _finish_cleanup(
+                asyncio.create_task(asyncio.to_thread(sandbox.destroy))
+            )
             raise
         return handle
 
@@ -670,7 +787,8 @@ class SandboxManager:
         thread_id: str,
         *,
         component: str = "crawl-worker",
-        network_enabled: bool = False,
+        network_enabled: bool = True,
+        create: bool = True,
         user_id: str | None = None,
     ) -> OpensandboxBackend:
         """Create, renew, or replace the sandbox for a task."""
@@ -681,7 +799,10 @@ class SandboxManager:
             if not self._coordination_enabled:
                 handle = self._handles.get(key)
                 if handle is not None:
-                    healthy = await asyncio.to_thread(handle.sandbox.is_healthy)
+                    healthy = (
+                        handle.network_enabled == network_enabled
+                        and await asyncio.to_thread(handle.sandbox.is_healthy)
+                    )
                     if healthy:
                         try:
                             await asyncio.to_thread(
@@ -696,6 +817,8 @@ class SandboxManager:
                         return handle.backend
                     self._handles.pop(key, None)
                     await asyncio.to_thread(handle.sandbox.close)
+                if not create:
+                    raise SandboxNotInitializedError(thread_id)
                 handle = await self._create_handle(
                     thread_id, component, network_enabled
                 )
@@ -726,12 +849,17 @@ class SandboxManager:
 
                     handle = self._handles.get(key)
                     if handle is not None:
-                        healthy = await asyncio.to_thread(handle.sandbox.is_healthy)
+                        healthy = (
+                            handle.network_enabled == network_enabled
+                            and await asyncio.to_thread(handle.sandbox.is_healthy)
+                        )
                         if healthy:
                             try:
                                 await asyncio.to_thread(
                                     handle.sandbox.renew,
-                                    timedelta(seconds=settings.open_sandbox_timeout_seconds),
+                                    timedelta(
+                                        seconds=settings.open_sandbox_timeout_seconds
+                                    ),
                                 )
                             except SandboxException:
                                 healthy = False
@@ -826,6 +954,16 @@ class SandboxManager:
                     adopted: _SandboxHandle | None = None
                     duplicate_ids: list[str] = []
                     for candidate in candidates:
+                        labels = getattr(candidate, "metadata", None) or {}
+                        # 不接管初始化中断或网络配置已失效的实例。
+                        if labels.get("ddra_ready") == "false" or (
+                            labels.get("ddra_config")
+                            and labels["ddra_config"] != expected_fingerprint
+                        ):
+                            await asyncio.to_thread(
+                                self._kill_sandbox_sync, candidate.id
+                            )
+                            continue
                         try:
                             sandbox = await asyncio.to_thread(
                                 self._connect_sandbox_sync, candidate.id
@@ -846,17 +984,27 @@ class SandboxManager:
                                 component=component,
                                 network_enabled=network_enabled,
                             )
-                            adopted.base_distributions = (
-                                await self._capture_base_distributions(adopted)
-                            )
+                            if labels.get("ddra_pool"):
+                                baseline = await self._read_marker(
+                                    adopted, BASELINE_PATH
+                                )
+                                values = json.loads(baseline or "null")
+                                if not isinstance(values, list) or not all(
+                                    isinstance(v, str) for v in values
+                                ):
+                                    await asyncio.to_thread(sandbox.close)
+                                    raise RuntimeError("无法恢复预热沙箱基础依赖记录")
+                                adopted.base_distributions = frozenset(values)
+                            else:
+                                adopted.base_distributions = (
+                                    await self._capture_base_distributions(adopted)
+                                )
                         else:
                             sandbox.close()
                             duplicate_ids.append(candidate.id)
                     for sandbox_id in duplicate_ids:
                         try:
-                            await asyncio.to_thread(
-                                self._kill_sandbox_sync, sandbox_id
-                            )
+                            await asyncio.to_thread(self._kill_sandbox_sync, sandbox_id)
                         except Exception:
                             logger.warning(
                                 "清理重复 Sandbox 失败：%s", sandbox_id, exc_info=True
@@ -867,6 +1015,8 @@ class SandboxManager:
                         await self._write_registry(registry_key, component, adopted)
                         return adopted.backend
 
+                    if not create:
+                        raise SandboxNotInitializedError(thread_id)
                     handle = await self._create_handle(
                         thread_id, component, network_enabled
                     )
@@ -877,12 +1027,18 @@ class SandboxManager:
                             registry_key, component, handle
                         )
                         lease.ensure_owned()
-                    except Exception:
-                        if encoded is not None:
-                            await self._remove_registry_value(
-                                registry_key, component, encoded
+                    except BaseException:
+                        try:
+                            if encoded is not None:
+                                await self._remove_registry_value(
+                                    registry_key, component, encoded
+                                )
+                        finally:
+                            await _finish_cleanup(
+                                asyncio.create_task(
+                                    asyncio.to_thread(handle.sandbox.destroy)
+                                )
                             )
-                        await asyncio.to_thread(handle.sandbox.destroy)
                         raise
                     self._handles[key] = handle
                     _add_trace_metadata(
@@ -891,6 +1047,164 @@ class SandboxManager:
                         image=settings.open_sandbox_image,
                     )
                     return handle.backend
+
+    async def prepare(self, runtime: Any, *, component: str) -> OpensandboxBackend:
+        """Materialize inputs and Skills only at an actual sandbox access boundary."""
+
+        thread_id = thread_id_from_runtime(runtime)
+        owner = user_identity(runtime)
+        await self.ensure(thread_id, component=component, user_id=owner)
+        async with self.workspace_lock(thread_id, user_id=owner):
+            handle = self._get_handle(thread_id, component)
+            await self._sync_inputs(thread_id, handle)
+            store = getattr(runtime, "store", None)
+            if store is not None:
+                agents = (
+                    ("supervisor", "data-analyst")
+                    if component == "supervisor"
+                    else ("crawl-worker",)
+                )
+                for agent in agents:
+                    for namespace, root in (
+                        (public_skill_namespace(agent), public_skill_root(agent)),
+                        (
+                            assigned_skill_namespace(runtime, agent),
+                            user_skill_root(agent),
+                        ),
+                    ):
+                        files = []
+                        offset = 0
+                        while True:
+                            page = await store.asearch(
+                                namespace, limit=100, offset=offset
+                            )
+                            files.extend(
+                                (
+                                    item.key.removeprefix("/active/"),
+                                    stored_file_content(item.value),
+                                )
+                                for item in page
+                                if item.key.startswith("/active/")
+                            )
+                            if len(page) < 100:
+                                break
+                            offset += 100
+                        digest = self._files_digest(files)
+                        marker = (
+                            "/tmp/.ddra-internal/skill-"
+                            + hashlib.sha256(root.encode()).hexdigest()
+                            + ".json"
+                        )
+                        if await self._read_marker(handle, marker) != digest:
+                            await self.replace_directory_files(
+                                thread_id, root, files, component=component
+                            )
+                            await self._write_marker(handle, marker, digest)
+            return handle.backend
+
+    @staticmethod
+    def _files_digest(files: list[tuple[str, bytes]]) -> str:
+        # 长度前缀消除路径/内容边界歧义；顺序不影响同步版本。
+        digest = hashlib.sha256()
+        for path, content in sorted(files):
+            for part in (path.encode(), content):
+                digest.update(len(part).to_bytes(8, "big"))
+                digest.update(part)
+        return digest.hexdigest()
+
+    @staticmethod
+    async def _read_marker(handle: _SandboxHandle, path: str) -> str | None:
+        responses = await handle.backend.adownload_files([path])
+        if not responses or responses[0].error or responses[0].content is None:
+            return None
+        return responses[0].content.decode("utf-8")
+
+    async def _write_marker(
+        self, handle: _SandboxHandle, path: str, value: str
+    ) -> None:
+        await self._ensure_directories(handle, {str(PurePosixPath(path).parent)})
+        responses = await handle.backend.aupload_files([(path, value.encode())])
+        if not responses or any(item.error for item in responses):
+            raise RuntimeError("沙箱同步标记写入失败")
+
+    async def _sync_inputs(self, thread_id: str, handle: _SandboxHandle) -> None:
+        scope = self.workspace_scope(thread_id, handle.component)
+        objects = await self.workspace_store.list(scope, prefix="input")
+        # OSS ETag 与本地版本标记可避免每个工具调用都重新下载整份附件。
+        files = None
+        if all(item.etag for item in objects):
+            digest = self._files_digest(
+                [
+                    (item.path, json.dumps([item.size, item.etag]).encode())
+                    for item in objects
+                ]
+            )
+        else:
+            files = [
+                (item.path, await self.workspace_store.read(scope, item.path))
+                for item in objects
+            ]
+            digest = self._files_digest(files)
+        marker = "/tmp/.ddra-internal/inputs.json"
+        if await self._read_marker(handle, marker) == digest:
+            return
+        if files is None:
+            files = [
+                (item.path, await self.workspace_store.read(scope, item.path))
+                for item in objects
+            ]
+        await self._ensure_directories(handle, {"/workspace/input"})
+        # 不依赖旧 manifest 删除附件：接管历史容器时也清理持久化存储中已删除的输入。
+        names = [PurePosixPath(path).name for path, _ in files]
+        code = (
+            "from pathlib import Path; "
+            "root=Path('/workspace/input'); "
+            f"keep=set({names!r}); "
+            "[p.unlink() for p in root.iterdir() if (p.is_file() or p.is_symlink()) and p.name not in keep]"
+        )
+        result = await handle.backend.aexecute("python -c " + shlex.quote(code))
+        if result.exit_code not in {None, 0}:
+            raise RuntimeError("同步沙箱输入附件失败")
+        if files:
+            responses = await handle.backend.aupload_files(files)
+            if any(item.error for item in responses):
+                raise RuntimeError("同步沙箱输入附件失败")
+        await self._write_marker(handle, marker, digest)
+
+    async def export_existing_workspace(
+        self,
+        thread_id: str,
+        *,
+        component: str = "crawl-worker",
+        user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Reconnect for export when needed, but never allocate on the finish path."""
+
+        if not all(
+            (
+                self._settings.open_sandbox_domain,
+                self._settings.open_sandbox_api_key,
+                self._settings.open_sandbox_image,
+            )
+        ):
+            return []
+        key = self._key(thread_id, component, user_id)
+        if key not in self._handles:
+            if not self._coordination_enabled:
+                return []
+            await initialize_redis()
+            _, registry_key, _ = self._sandbox_keys(key[0], thread_id)
+            if not await get_redis().hget(registry_key, component):
+                # 未使用过的会话无需访问沙箱服务；实际工具访问会先走完整恢复流程。
+                return []
+        try:
+            await self.ensure(
+                thread_id, component=component, user_id=user_id, create=False
+            )
+        except SandboxNotInitializedError:
+            return []
+        async with self.workspace_lock(thread_id, user_id=user_id):
+            return await self.export_workspace(thread_id, component=component)
 
     def get_backend(
         self,
@@ -905,7 +1219,7 @@ class SandboxManager:
         handle = self._handles.get(self._key(thread_id, component, user_id))
         if handle is None:
             raise SandboxNotInitializedError(
-                f"任务 {thread_id} 的沙箱尚未初始化，请先执行 ensure_sandbox"
+                f"任务 {thread_id} 的沙箱尚未初始化，请先通过 prepare 按需获取"
             )
         return handle.backend
 
@@ -957,10 +1271,7 @@ class SandboxManager:
             for item in objects
         ]
 
-        directories = {
-            str(PurePosixPath(path).parent)
-            for path, _content in files
-        }
+        directories = {str(PurePosixPath(path).parent) for path, _content in files}
         await self._ensure_directories(active_handle, directories)
         responses = await active_handle.backend.aupload_files(files)
         failures = [response.path for response in responses if response.error]
@@ -1074,16 +1385,16 @@ class SandboxManager:
                         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                             await client.hdel(registry_key, component)
                             continue
-                        targets.setdefault(record.sandbox_id, set()).add(
-                            str(component)
-                        )
+                        targets.setdefault(record.sandbox_id, set()).add(str(component))
 
                     matching_keys = [
                         key
                         for key in self._handles
                         if key[0] == user_id and key[2] == normalized_thread
                     ]
-                    local_by_id: dict[str, tuple[tuple[str, str, str], _SandboxHandle]] = {}
+                    local_by_id: dict[
+                        str, tuple[tuple[str, str, str], _SandboxHandle]
+                    ] = {}
                     for key in matching_keys:
                         handle = self._handles[key]
                         local_by_id[handle.sandbox.id] = (key, handle)
@@ -1171,9 +1482,7 @@ class SandboxManager:
         finally:
             self._forget_thread_state(user_id, normalized_thread)
         if destroy_errors:
-            raise RuntimeError(
-                "销毁任务沙箱失败：" + "；".join(destroy_errors)
-            )
+            raise RuntimeError("销毁任务沙箱失败：" + "；".join(destroy_errors))
 
     @traceable(
         name="sandbox.skills.sync",
@@ -1269,6 +1578,9 @@ class SandboxManager:
             if info.get("is_dir"):
                 continue
             relative = _workspace_relative(info["path"])
+            # 输入附件的权威副本在持久化存储；导出旧副本会复活已删除的文件。
+            if relative.parts[0] == "input":
+                continue
             paths.append((_sandbox_path(relative), relative))
 
         if not paths:

@@ -285,7 +285,7 @@ def test_registered_responses_capabilities_are_model_specific() -> None:
         "https://api.openai.com/v1", "GPT-5.4-mini"
     )
     deepseek = model_profiles.resolve_model_provider(
-        "https://api.deepseek.com", "deepseek-v4-flash"
+        "https://api.deepseek.com", "deepseek-flash"
     )
 
     assert openai.capabilities.max_input_tokens == 400_000
@@ -425,7 +425,7 @@ def test_deepseek_responses_does_not_send_unsupported_include(monkeypatch) -> No
         ),
     )
     provider = _resolved_provider(
-        "https://api.deepseek.com", "deepseek-v4-flash"
+        "https://api.deepseek.com", "deepseek-flash"
     )
 
     built = provider_models._build_model(
@@ -462,7 +462,7 @@ async def test_deepseek_provider_test_calls_responses_without_include(
                 "object": "response",
                 "created_at": 1,
                 "status": "completed",
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-flash",
                 "output": [
                     {
                         "type": "reasoning",
@@ -506,7 +506,7 @@ async def test_deepseek_provider_test_calls_responses_without_include(
         ),
     )
     provider = _resolved_provider(
-        "https://api.deepseek.com", "deepseek-v4-flash"
+        "https://api.deepseek.com", "deepseek-flash"
     )
 
     message = await provider_models.test_provider_model(provider)

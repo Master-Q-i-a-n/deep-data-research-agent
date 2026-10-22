@@ -21,6 +21,9 @@ async def test_persist_result_writes_manifest_pages_and_content(
     uploaded: list[tuple[str, bytes]] = []
 
     class FakeManager:
+        async def prepare(self, runtime, *, component):
+            assert component == "crawl-worker"
+
         async def upload_workspace_files(self, thread_id, files) -> None:
             assert thread_id == "thread-1"
             uploaded.extend(files)

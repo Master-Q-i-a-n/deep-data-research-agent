@@ -14,7 +14,6 @@ from deep_data_research_agent.agents.contracts import (
     SubagentModelCallLimitMiddleware,
 )
 from deep_data_research_agent.agents.middleware.skills import (
-    MongoSkillsRestoreMiddleware,
     ReloadableSkillsMiddleware,
     SandboxLifecycleMiddleware,
     SkillToolErrorMiddleware,
@@ -97,10 +96,6 @@ graph = create_deep_agent(
                     backend=SUPERVISOR_BACKEND,
                     sources=[USER_MEMORY_PATH, agent_memory_path("data-analyst")],
                 ),
-                MongoSkillsRestoreMiddleware(
-                    component="supervisor",
-                    agent_name="data-analyst",
-                ),
                 FailureReviewMiddleware(
                     agent_name="data-analyst",
                     reviewable_tools={tool.name for tool in DATABASE_TOOLS},
@@ -150,18 +145,12 @@ graph = create_deep_agent(
         TodoListMiddleware(),
         SandboxLifecycleMiddleware(
             component="supervisor",
-            # Skill 的下载与依赖测试需要联网，supervisor 沙箱打开网络。
-            network_enabled=True,
         ),
         # Directly configure DeepAgents' memory middleware with a read-only
         # prompt, while refreshing checkpoint-cached contents every run.
         MemoryRefreshMiddleware(
             backend=SUPERVISOR_BACKEND,
             sources=[USER_MEMORY_PATH, agent_memory_path("supervisor")],
-        ),
-        MongoSkillsRestoreMiddleware(
-            component="supervisor",
-            agent_name="supervisor",
         ),
         SkillToolErrorMiddleware(
             tool_names={tool.name for tool in ASSIGN_SKILL_TOOL},

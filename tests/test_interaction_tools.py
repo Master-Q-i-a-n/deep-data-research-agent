@@ -92,7 +92,7 @@ def _patch_email_workspace(monkeypatch, root: Path) -> None:
     def local_workspace_path(*_args, **_kwargs):
         return root
 
-    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "ensure", ensure)
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "prepare", ensure)
     monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "export_workspace", export)
     monkeypatch.setattr(
         sandbox_manager.SANDBOX_MANAGER,
@@ -117,15 +117,15 @@ async def test_request_report_download_exports_after_approval(monkeypatch) -> No
     export_calls: list[tuple[str, str]] = []
 
     async def ensure(*args, **kwargs):
-        assert args == ("thread-a",)
-        assert kwargs["user_id"] == "user-a"
+        assert sandbox_manager.thread_id_from_runtime(args[0]) == "thread-a"
+        assert kwargs == {"component": "supervisor"}
         return backend
 
     async def export(thread_id: str, *, component: str):
         export_calls.append((thread_id, component))
         return [{"path": "/workspace/final_report.md", "size": 8}]
 
-    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "ensure", ensure)
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "prepare", ensure)
     monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "export_workspace", export)
 
     result = await interaction_tools.request_report_download.coroutine(
@@ -152,7 +152,7 @@ async def test_request_report_download_rejects_path_outside_workspace(monkeypatc
 
     monkeypatch.setattr(
         sandbox_manager.SANDBOX_MANAGER,
-        "ensure",
+        "prepare",
         unexpected_ensure,
     )
 
@@ -374,7 +374,7 @@ async def test_send_report_email_disabled_does_not_touch_sandbox(monkeypatch) ->
     async def unexpected_ensure(*_args, **_kwargs):
         raise AssertionError("未启用 SMTP 时不应访问沙箱")
 
-    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "ensure", unexpected_ensure)
+    monkeypatch.setattr(sandbox_manager.SANDBOX_MANAGER, "prepare", unexpected_ensure)
 
     result = await interaction_tools.send_report_email.coroutine(
         recipient="reader@example.com",

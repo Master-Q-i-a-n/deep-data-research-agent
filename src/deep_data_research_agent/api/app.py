@@ -365,34 +365,30 @@ async def _upload_to_supervisor_workspace(
     user_id: str,
     prepared: list[tuple[str, bytes]],
 ) -> None:
-    """Upload validated files and persist the exact bytes without tracing content."""
+    """Persist inputs without creating a sandbox; materialize at actual use."""
 
-    await sandbox_manager.SANDBOX_MANAGER.ensure(
-        thread_id,
-        component="supervisor",
-        network_enabled=True,
-        user_id=user_id,
-    )
+    manager = sandbox_manager.SANDBOX_MANAGER
+    scope = manager.workspace_scope(thread_id, "supervisor", user_id=user_id)
     paths = [(f"/workspace/input/{name}", content) for name, content in prepared]
-    try:
-        await sandbox_manager.SANDBOX_MANAGER.upload_workspace_files(
-            thread_id,
-            paths,
-            component="supervisor",
-            persist=True,
-        )
-    except Exception:
-        # A multi-file backend call may partially succeed. Remove all batch paths.
-        for path, _content in paths:
-            try:
-                await sandbox_manager.SANDBOX_MANAGER.delete_workspace_file(
-                    thread_id,
-                    path,
-                    component="supervisor",
-                )
-            except Exception:
-                logger.warning("回滚沙箱上传文件失败：%s", path, exc_info=True)
-        raise
+    async with manager.workspace_lock(thread_id, user_id=user_id):
+        # 锁内再次校验，避免并发上传绕过重名、数量与总大小限制。
+        existing = await _uploaded_files(scope)
+        names = {str(item["name"]).casefold() for item in existing}
+        if any(name.casefold() in names for name, _ in prepared):
+            raise HTTPException(status_code=409, detail="文件已存在")
+        if len(existing) + len(paths) > _MAX_UPLOAD_FILES:
+            raise HTTPException(status_code=400, detail="当前会话最多保留 5 个上传文件")
+        if sum(int(item["size"]) for item in existing) + sum(len(data) for _, data in paths) > _MAX_UPLOAD_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="当前会话上传文件总计不能超过 100 MB")
+        try:
+            await manager.workspace_store.write_many(scope, paths)
+        except BaseException:
+            for path, _content in paths:
+                try:
+                    await manager.workspace_store.delete_file(scope, path)
+                except Exception:
+                    logger.warning("回滚附件上传失败", exc_info=True)
+            raise
 
 
 async def _download_object(scope: WorkspaceScope, virtual_path: str):
@@ -448,6 +444,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         await database.ensure_schema()
         await redis_limits.initialize_redis()
+        await sandbox_manager.SANDBOX_MANAGER.start_pool()
         # Loopback Agent Protocol calls query checkpoints and child runs without
         # creating a Supervisor model run.
         agent_client = get_client(url=None, api_key=None)
@@ -458,6 +455,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await agent_client.aclose()
         await skill_management.close_skill_management_client()
         await MEMORY_QUEUE.close()
+        await sandbox_manager.SANDBOX_MANAGER.close_pool()
         await sandbox_manager.SANDBOX_MANAGER.workspace_store.close()
         await close_mongodb_health_client()
         await redis_limits.close_redis()
@@ -1092,7 +1090,7 @@ async def upload_files(
     files: Annotated[list[UploadFile], File(description="待分析的表格文件")],
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
-    """Upload a validated batch into the owned Supervisor sandbox."""
+    """Persist a validated input batch for the owned Supervisor workspace."""
 
     user_id = await _authenticated_user_id(authorization)
     await _require_owned_supervisor_thread(
@@ -1134,13 +1132,15 @@ async def upload_files(
         raise HTTPException(status_code=413, detail="当前会话上传文件总计不能超过 100 MB")
     try:
         await _upload_to_supervisor_workspace(thread_id, user_id, prepared)
+    except HTTPException:
+        raise
     except (DistributedLockLost, DistributedLockUnavailable, RedisError) as exc:
         raise HTTPException(
             status_code=503,
             detail="Sandbox 协调服务暂不可用，请稍后重试",
         ) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"文件写入沙箱失败：{exc}") from exc
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
 
     return {
         "files": [
@@ -1189,24 +1189,15 @@ async def delete_uploaded_file(
     if path not in {str(item["path"]) for item in existing}:
         raise HTTPException(status_code=404, detail="上传文件不存在")
     try:
-        await sandbox_manager.SANDBOX_MANAGER.ensure(
-            thread_id,
-            component="supervisor",
-            network_enabled=True,
-            user_id=user_id,
-        )
-        await sandbox_manager.SANDBOX_MANAGER.delete_workspace_file(
-            thread_id,
-            path,
-            component="supervisor",
-        )
+        async with sandbox_manager.SANDBOX_MANAGER.workspace_lock(thread_id, user_id=user_id):
+            await sandbox_manager.SANDBOX_MANAGER.workspace_store.delete_file(scope, relative)
     except (DistributedLockLost, DistributedLockUnavailable, RedisError) as exc:
         raise HTTPException(
             status_code=503,
             detail="Sandbox 协调服务暂不可用，请稍后重试",
         ) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"删除上传文件失败：{exc}") from exc
+    except WorkspaceStorageError as exc:
+        raise HTTPException(status_code=503, detail="文件存储暂不可用，请稍后重试") from exc
     return {"status": "deleted", "path": path}
 
 
